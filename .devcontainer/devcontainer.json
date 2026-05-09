@@ -1,0 +1,10 @@
+{
+  "name": "matcha",
+  "build": { "dockerfile": "Dockerfile" },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/matcha,type=bind",
+  "workspaceFolder": "/workspaces/matcha",
+  "postCreateCommand": "cd /workspaces/matcha && nimble build -y",
+  "customizations": {
+    "vscode": { "extensions": ["nim-lang.nimlang"] }
+  }
+}

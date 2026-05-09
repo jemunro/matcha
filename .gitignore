@@ -1,0 +1,19 @@
+# Build artifacts
+/matcha
+/nimcache/
+/tests/nimcache/
+*.exe
+
+# Compiled test binaries (Nim leaves these next to the .nim source after `nim c -r`)
+/tests/test_intervals
+/tests/test_match
+/tests/test_preproc
+
+# Generated test fixtures (regenerate with `python3 tests/generate_fixtures.py`)
+/tests/fixtures/fixtureA.*
+/tests/fixtures/fixtureB.*
+/tests/fixtures/expected/
+
+# Editor / OS
+.DS_Store
+*.swp
