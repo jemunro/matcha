@@ -1,10 +1,8 @@
-## intervals.nim — pure interval overlap and window computation for SV matching.
+## intervals.nim — pure interval overlap math for SV matching.
 ##
 ## Interval convention: [POS, END) half-open where length = END - POS.
 ## END is the value from INFO/END (1-based in VCF, treated here as exclusive
 ## upper bound so that length = END - POS = abs(SVLEN) for canonical SVs).
-
-import std/math
 
 proc reciprocalOverlap*(posA, endA, posB, endB: int64): float64 =
   ## Reciprocal overlap = overlap / max(lenA, lenB).
@@ -38,12 +36,3 @@ proc jaccard*(posA, endA, posB, endB: int64): float64 =
   if unionLen <= 0:
     return 0.0
   result = float64(overlap) / float64(unionLen)
-
-proc queryWindow*(svlen: int64, threshold: float64): int64 =
-  ## Half-width of the candidate query window.
-  ## window = ceil(svlen * (1.0 - threshold))
-  ## svlen must be non-negative (callers pass abs(SVLEN)).
-  ## Returns 0 if svlen <= 0 or threshold >= 1.0.
-  if svlen <= 0 or threshold >= 1.0:
-    return 0
-  result = int64(ceil(float64(svlen) * (1.0 - threshold)))

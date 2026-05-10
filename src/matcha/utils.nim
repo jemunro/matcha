@@ -23,8 +23,10 @@ type
     svtype*:   SvType
     overlap*:  float64
     jaccard*:  float64
-    aOffset*:  int64    ## BGZF virtual offset of A's source record (0 if unknown)
-    bOffset*:  int64    ## BGZF virtual offset of B's source record (0 if unknown)
+    aOffset*:  int64    ## BGZF virtual offset of A's source record (0 if unknown).
+                        ## Populated for milestone-2 anno/merge/collapse;
+                        ## not emitted in match TSV output.
+    bOffset*:  int64    ## Same as aOffset, for B.
 
   MatchConfig* = object
     minOverlap*:      float64
@@ -36,6 +38,8 @@ type
     outputPath*:      string
     callsetA*:        string
     callsetB*:        string
+    selfMode*:        bool   ## When true, match callsetA against itself.
+                             ## callsetB is empty; pair dedup uses MATCHA_BOFF.
 
 const SupportedSvTypes* = {svDEL, svDUP, svINV}
 

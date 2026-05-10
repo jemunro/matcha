@@ -57,19 +57,3 @@ timed("I11", "jaccard: large A=[17000,22000) small B=[17000,18000) = 1000/5000 =
   # overlap=1000, union=5000 → 0.2
   let jac = jaccard(17000, 22000, 17000, 18000)
   doAssert abs(jac - 0.2) < 1e-9, "expected 0.2, got " & $jac
-
-# I12 — queryWindow: threshold=0.5, svlen=1000
-timed("I12", "queryWindow: svlen=1000, threshold=0.5 returns 500"):
-  doAssert queryWindow(1000, 0.5) == 500
-
-# I13 — queryWindow: threshold=0.0 returns svlen (full span)
-timed("I13", "queryWindow: threshold=0.0 returns svlen"):
-  doAssert queryWindow(1000, 0.0) == 1000
-
-# I14 — queryWindow: threshold=1.0 returns 0
-timed("I14", "queryWindow: threshold=1.0 returns 0"):
-  doAssert queryWindow(1000, 1.0) == 0
-
-# I15 — queryWindow: svlen=0 returns 0
-timed("I15", "queryWindow: svlen=0 returns 0"):
-  doAssert queryWindow(0, 0.5) == 0

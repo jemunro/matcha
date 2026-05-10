@@ -38,13 +38,17 @@ proc usage(code: int = 1) =
 
 proc matchUsage(code: int = 1) =
   let f = if code == 0: stdout else: stderr
-  f.writeLine "Usage: matcha match [options] callsetA callsetB"
+  f.writeLine "Usage:"
+  f.writeLine "  matcha match [options] callsetA callsetB   # match A against B"
+  f.writeLine "  matcha match --self [options] INPUT        # match INPUT against itself"
   f.writeLine ""
   f.writeLine "Inputs may be VCF.gz (.vcf.gz) or BCF (.bcf); format is detected automatically."
   f.writeLine ""
   f.writeLine "Options:"
   f.writeLine "  --min-overlap FLOAT             minimum reciprocal overlap (0.0-1.0)"
   f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
+  f.writeLine "  --self                          match a single input against itself"
+  f.writeLine "                                  (each pair emitted once; no self-self)"
   f.writeLine "  --threads INT                   number of worker threads (default: 1)"
   f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
   f.writeLine "  --output PATH                   output file (default: stdout)"
@@ -94,6 +98,8 @@ proc runMatch(rawArgs: seq[string]) =
         cfg.tmpDir = nextVal(p, "tmp-dir")
       of "output":
         cfg.outputPath = nextVal(p, "output")
+      of "self":
+        cfg.selfMode = true
       of "v", "verbose":
         setVerbose(true)
       of "h", "help":
@@ -107,17 +113,20 @@ proc runMatch(rawArgs: seq[string]) =
   if not cfg.minOverlapSet and not cfg.minJaccardSet:
     stderr.writeLine "error: at least one of --min-overlap or --min-jaccard is required"
     matchUsage()
-  if positionals.len != 2:
-    stderr.writeLine "error: expected 2 input files, got " & $positionals.len
+  let expected = if cfg.selfMode: 1 else: 2
+  if positionals.len != expected:
+    let what = if cfg.selfMode: "1 input file (--self mode)" else: "2 input files"
+    stderr.writeLine "error: expected " & what & ", got " & $positionals.len
     matchUsage()
 
   cfg.callsetA = positionals[0]
-  cfg.callsetB = positionals[1]
+  if not cfg.selfMode:
+    cfg.callsetB = positionals[1]
 
   if not fileExists(cfg.callsetA):
     stderr.writeLine "error: input file not found: " & cfg.callsetA
     quit(1)
-  if not fileExists(cfg.callsetB):
+  if not cfg.selfMode and not fileExists(cfg.callsetB):
     stderr.writeLine "error: input file not found: " & cfg.callsetB
     quit(1)
 

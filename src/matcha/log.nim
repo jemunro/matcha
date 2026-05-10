@@ -12,9 +12,6 @@ let gStart = epochTime()
 proc setVerbose*(b: bool) =
   gVerbose = b
 
-proc verbose*(): bool =
-  gVerbose
-
 proc logV*(msg: string) =
   if not gVerbose: return
   let el = epochTime() - gStart

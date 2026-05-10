@@ -14,9 +14,9 @@
 ## loads lazily, and evicts tiles once A has advanced far enough that no
 ## future A record can need them.
 
-import std/[bitops, sets, tables]
+import std/[bitops, sequtils, sets, tables]
 
-const BinZeroUpper* = 1024'i64
+const BinZeroUpper = 1024'i64
 
 proc binIndexFor*(svlen: int64): int =
   ## Assign a bin index to a normalised (positive) SVLEN.
@@ -72,9 +72,12 @@ proc getCandidates*(buf: var TiledBuffer, posA, queryEnd: int64,
                    ): seq[BufferedRec] =
   ## Return all BufferedRecs that could overlap [posA, queryEnd) from
   ## the B bin this buffer tracks. Loads tiles lazily via fetchTile.
-  ## queryStart (left edge of the query window) = posA - tileWidth
-  ## because B records up to tileWidth before posA can still extend
-  ## rightward to overlap A.
+  ##
+  ## queryStart (left edge of the query window) = posA - tileWidth.
+  ## tileWidth equals the upper bound of this bin's size range, which is
+  ## the maximum SVLEN any cached B record can have — so a B record
+  ## starting earlier than posA - tileWidth cannot extend far enough
+  ## rightward to reach posA.
   if buf.tileWidth <= 0 or queryEnd <= posA:
     return
 
@@ -99,10 +102,7 @@ proc evict*(buf: var TiledBuffer, posA: int64) =
   if buf.tileWidth <= 0:
     return
   let limit = int(posA div buf.tileWidth) - 1
-  var toDelete: seq[int]
-  for k in buf.fetched:
+  for k in toSeq(buf.fetched):
     if k < limit:
-      toDelete.add(k)
-  for k in toDelete:
-    buf.fetched.excl(k)
-    buf.tiles.del(k)
+      buf.fetched.excl(k)
+      buf.tiles.del(k)

@@ -87,6 +87,19 @@ RECORDS_A = [
     {"chrom": "chr1", "pos": 43000, "id": "DEL_A_17_inconsistent", "ref": "N",
      "alt": "<DEL>", "info": "SVTYPE=DEL;SVLEN=-1500;END=44000",
      "svtype": "DEL", "svlen": -1000, "end": 44000},
+    # TC18 — self-mode cluster: three DELs that overlap each other (chr1).
+    # Pairwise reciprocal overlaps at threshold 0.5 (all kept):
+    #   (18a, 18b): 900/1000 = 0.90
+    #   (18a, 18c): 950/1000 = 0.95
+    #   (18b, 18c): 950/1000 = 0.95
+    # No B-fixture counterparts → invisible in cross-callset tests.
+    normal("chr1", 50000, "DEL_A_18a", "N", "<DEL>", "DEL", -1000, 51000),
+    normal("chr1", 50100, "DEL_A_18b", "N", "<DEL>", "DEL", -1000, 51100),
+    normal("chr1", 50050, "DEL_A_18c", "N", "<DEL>", "DEL", -1000, 51050),
+    # TC19 — self-mode pair on chr2 (different chrom, different svtype).
+    # (19a, 19b): 1500/2000 = 0.75.
+    normal("chr2", 5000, "DUP_A_19a", "N", "<DUP>", "DUP", 2000, 7000),
+    normal("chr2", 5500, "DUP_A_19b", "N", "<DUP>", "DUP", 2000, 7500),
 ]
 
 RECORDS_B = [
@@ -208,6 +221,43 @@ def compute_expected(records_a, records_b, min_recip=0.0, min_jac=0.0):
     return rows
 
 
+def compute_self_expected(records, min_recip=0.0, min_jac=0.0):
+    """Like compute_expected but matches a single callset against itself.
+
+    Each unordered pair (i, j) with i < j is reported once. Records must
+    share chrom and svtype to pair. Self-self pairs (i, i) are excluded.
+    Output order matches matcha's: per-chrom (header order), per-svtype,
+    then by source position. After bcftools sort, same-chrom records keep
+    their relative position order, so iterating sorted-by-position within
+    each (chrom, svtype) group corresponds to matcha's aOff-ordered
+    iteration.
+    """
+    def matchable(r):
+        return r["svtype"] is not None and r["svlen"] is not None and r["end"] is not None
+
+    by_key = {}
+    for rec in records:
+        if not matchable(rec):
+            continue
+        by_key.setdefault((rec["chrom"], rec["svtype"]), []).append(rec)
+
+    rows = []
+    for (chrom, svtype), recs in by_key.items():
+        recs_sorted = sorted(recs, key=lambda r: r["pos"])
+        for i in range(len(recs_sorted)):
+            for j in range(i + 1, len(recs_sorted)):
+                a, b = recs_sorted[i], recs_sorted[j]
+                ro = recip_overlap(a["pos"], a["end"], b["pos"], b["end"])
+                jac = jaccard(a["pos"], a["end"], b["pos"], b["end"])
+                if ro >= min_recip and jac >= min_jac:
+                    rows.append([
+                        chrom, str(a["pos"]), str(a["end"]), a["id"],
+                        str(b["pos"]), str(b["end"]), b["id"],
+                        svtype, f"{ro:.6f}", f"{jac:.6f}",
+                    ])
+    return rows
+
+
 def write_expected_tsv(rows, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
@@ -247,6 +297,12 @@ def main():
         tsv_path = os.path.join(out, "expected", f"expected_{name}.tsv")
         write_expected_tsv(rows, tsv_path)
         print(f"  {tsv_path}: {len(rows)} rows (min_recip={min_recip}, min_jac={min_jac})")
+
+    # Self-mode expected output: --self --min-overlap 0.5 fixtureA.
+    self_rows = compute_self_expected(RECORDS_A, min_recip=0.5, min_jac=0.0)
+    self_path = os.path.join(out, "expected", "expected_self.tsv")
+    write_expected_tsv(self_rows, self_path)
+    print(f"  {self_path}: {len(self_rows)} rows (--self, min_recip=0.5)")
 
     print("Done.")
 

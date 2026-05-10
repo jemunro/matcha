@@ -117,7 +117,10 @@ proc symbolicAltSvtype(alt: string): SvType =
   parseSvType(alt[1 .. ^2])
 
 proc resolveSvtype(v: Variant, infoBuf: var string): SvType =
-  ## Priority: INFO/SVTYPE preferred, but symbolic ALT wins on conflict.
+  ## Resolve SVTYPE. Symbolic ALT (when present and parseable as a known
+  ## SvType) takes priority; INFO/SVTYPE is the fallback. Returns svUNKNOWN
+  ## if neither resolves. The "ALT wins" precedence matches the contract
+  ## documented in CLAUDE.md.
   let infoOk = v.info().get("SVTYPE", infoBuf) == Status.OK and infoBuf.len > 0
   let infoSv =
     if infoOk: parseSvType($cast[cstring](addr infoBuf[0]))
@@ -364,8 +367,13 @@ proc buildWorkQueue*(a, b: PreprocOutput, cfg: MatchConfig): seq[MatchJob] =
     let adj = adjacentBins(binA, threshold, b.populatedBins[svt])
     if adj.len == 0: continue
 
+    # In self mode, A and B are the same callset. Restrict binsB to
+    # binB >= binA so each cross-bin pair (binA, binB) is processed once
+    # rather than twice — same-bin pairs still need result-level dedup
+    # via aOff < bOff, but cross-bin pairs are naturally one-way here.
     var binsB: Table[int, string]
     for binB in adj:
+      if cfg.selfMode and binB < binA: continue
       let bKey: SvtypeBin = (svt, binB)
       if bKey in b.paths:
         binsB[binB] = b.paths[bKey]

@@ -3,7 +3,7 @@
 ## Run from project root: nim c --hints:off -r tests/test_match.nim
 echo "--------------- Test Match ---------------"
 
-import std/[algorithm, os, osproc, strutils]
+import std/[algorithm, os, osproc, sequtils, sets, strutils]
 import test_utils
 
 const BinPath  = "./matcha"
@@ -191,3 +191,77 @@ timed("M15", ".bcf inputs: same output as .vcf.gz inputs"):
   let vSorted = vOut.strip.splitLines.sorted.join("\n")
   let bSorted = bOut.strip.splitLines.sorted.join("\n")
   doAssert vSorted == bSorted, "BCF output differs from VCF output"
+
+# ---------------------------------------------------------------------------
+# Self-mode tests (S-prefix)
+# ---------------------------------------------------------------------------
+
+const ExpectedSelf = "tests/fixtures/expected/expected_self.tsv"
+
+# S01 — --self emits exactly the expected pair set against fixtureA.
+timed("S01", "--self matches expected_self.tsv pair set"):
+  doAssert fileExists(ExpectedSelf), "fixture missing: " & ExpectedSelf
+  let (outp, code) = run("match --self --min-overlap 0.5 " & FixtureA)
+  doAssert code == 0, "exit " & $code & ": " & outp
+  let actual = outp.strip.splitLines.filterIt(it.len > 0 and it[0] != '#').sorted.join("\n")
+  let expected = readFile(ExpectedSelf).strip.splitLines.sorted.join("\n")
+  doAssert actual == expected,
+    "self-mode output differs from expected\n--- actual ---\n" & actual &
+    "\n--- expected ---\n" & expected
+
+# S02 — --self never emits a self-self pair (ID_A == ID_B)
+timed("S02", "--self: no row has ID_A == ID_B"):
+  let (outp, code) = run("match --self --min-overlap 0.5 " & FixtureA)
+  doAssert code == 0
+  for row in parseTsv(outp):
+    if row.len >= 10:
+      doAssert row[3] != row[6], "self-self pair leaked: " & row.join("\t")
+
+# S03 — --self emits each unordered (X,Y) pair at most once
+timed("S03", "--self: no duplicate symmetric pairs"):
+  let (outp, code) = run("match --self --min-overlap 0.5 " & FixtureA)
+  doAssert code == 0
+  var seen: HashSet[string]
+  for row in parseTsv(outp):
+    if row.len >= 10:
+      # canonical pair key: lexicographically min/max of the two IDs
+      let key = (if row[3] < row[6]: row[3] & "|" & row[6]
+                 else: row[6] & "|" & row[3])
+      doAssert key notin seen, "duplicate pair: " & key
+      seen.incl(key)
+
+# S04 — --self with one positional input succeeds
+timed("S04", "--self: 1 positional arg is accepted"):
+  let (outp, code) = run("match --self --min-overlap 0.5 " & FixtureA)
+  doAssert code == 0, "expected exit 0, got " & $code & ": " & outp
+
+# S05 — --self with 0 or 2 positionals is an error mentioning --self
+timed("S05", "--self: 0 or 2 positionals errors out, mentions --self"):
+  block:
+    let (outp, code) = runMerged("match --self --min-overlap 0.5")
+    doAssert code != 0, "expected non-zero exit with 0 positionals"
+    doAssert "--self" in outp, "error message should mention --self: " & outp
+  block:
+    let (outp, code) = runMerged(
+      "match --self --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+    doAssert code != 0, "expected non-zero exit with 2 positionals in --self"
+    doAssert "--self" in outp, "error message should mention --self: " & outp
+
+# S06 — --self --threads 2 is a permutation of --threads 1 output
+timed("S06", "--self --threads 2 produces same output as --threads 1"):
+  let (out1, c1) = run("match --self --min-overlap 0.5 --threads 1 " & FixtureA)
+  let (out2, c2) = run("match --self --min-overlap 0.5 --threads 2 " & FixtureA)
+  doAssert c1 == 0 and c2 == 0, "exits: " & $c1 & ", " & $c2
+  let s1 = out1.strip.splitLines.sorted.join("\n")
+  let s2 = out2.strip.splitLines.sorted.join("\n")
+  doAssert s1 == s2, "multi-thread self output differs from single-thread"
+
+# S07 — .bcf input parity in --self mode
+timed("S07", "--self: .bcf input matches .vcf.gz input"):
+  const FixtureA_bcf = "tests/fixtures/fixtureA.bcf"
+  let (vOut, vc) = run("match --self --min-overlap 0.5 " & FixtureA)
+  let (bOut, bc) = run("match --self --min-overlap 0.5 " & FixtureA_bcf)
+  doAssert vc == 0 and bc == 0
+  let vs = vOut.strip.splitLines.sorted.join("\n")
+  let bs = bOut.strip.splitLines.sorted.join("\n")
+  doAssert vs == bs, "BCF self-mode output differs from VCF"

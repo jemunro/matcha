@@ -86,6 +86,12 @@ proc runMatchJob*(job: MatchJob, cfg: MatchConfig): seq[MatchResult] =
       let cands = buffers[b].getCandidates(posA, endA,
         proc(ti: int): seq[BufferedRec] = fetchTile(b, ti))
       for cand in cands:
+        # Self mode: dedup symmetric pairs and drop self-self comparisons.
+        # Both offsets index the same source file, so aOff < bOff is a
+        # total order that keeps each unordered pair exactly once and
+        # excludes the trivial X-vs-X case (aOff == bOff).
+        if cfg.selfMode and aOff >= cand.bOffset:
+          continue
         let ovl = reciprocalOverlap(posA, endA, cand.pos, cand.endPos)
         let jac = jaccard(posA, endA, cand.pos, cand.endPos)
         let passOverlap = (not cfg.minOverlapSet) or (ovl >= cfg.minOverlap)
@@ -159,7 +165,11 @@ proc runMatch*(cfg: MatchConfig) =
        " threads=" & $cfg.nThreads & " tmp=" & cfg.tmpDir)
 
   var filesA, filesB: PreprocOutput
-  if cfg.nThreads >= 2:
+  if cfg.selfMode:
+    logV("self mode: preprocessing single input")
+    filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A")
+    filesB = filesA   # same paths, bins, chroms — dedup happens later
+  elif cfg.nThreads >= 2:
     logV("preprocessing A and B in parallel")
     gPpInputs[0] = (cfg.callsetA, cfg.tmpDir, "A")
     gPpInputs[1] = (cfg.callsetB, cfg.tmpDir, "B")
@@ -218,9 +228,11 @@ proc runMatch*(cfg: MatchConfig) =
        (if cfg.outputPath != "": " to " & cfg.outputPath else: " to stdout"))
 
   # Clean up temp BCFs (per-(svtype, bin) files for both callsets).
+  # In self mode, filesB aliases filesA — skip the second loop.
   for path in filesA.paths.values:
     if fileExists(path):     removeFile(path)
     if fileExists(path & ".csi"): removeFile(path & ".csi")
-  for path in filesB.paths.values:
-    if fileExists(path):     removeFile(path)
-    if fileExists(path & ".csi"): removeFile(path & ".csi")
+  if not cfg.selfMode:
+    for path in filesB.paths.values:
+      if fileExists(path):     removeFile(path)
+      if fileExists(path & ".csi"): removeFile(path & ".csi")
