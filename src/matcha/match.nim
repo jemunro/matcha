@@ -1,6 +1,6 @@
 ## match.nim — per-job matching logic, thread pool, and output assembly.
 
-import std/[algorithm, atomics, os, strutils, tables]
+import std/[algorithm, atomics, os, tables]
 import hts
 import utils, intervals, preproc, log
 
@@ -8,17 +8,25 @@ import utils, intervals, preproc, log
 # Per-job matching
 # ---------------------------------------------------------------------------
 
-proc processJob*(job: MatchJob, cfg: MatchConfig): int {.discardable.} =
+proc readBoff(v: Variant, scratch: var seq[int32]): int64 =
+  ## Decode INFO/MATCHA_BOFF (Number=2 Integer: high32, low32) into an int64.
+  ## Returns 0 if the field is absent. The mask on the low half avoids sign-
+  ## extension when the int32 has its high bit set.
+  if v.info().get("MATCHA_BOFF", scratch) != Status.OK or scratch.len < 2:
+    return 0
+  result = (int64(scratch[0]) shl 32) or (int64(scratch[1]) and 0xFFFFFFFF'i64)
+
+proc runMatchJob*(job: MatchJob, cfg: MatchConfig): seq[MatchResult] =
   ## Stream A records for this (chrom, svtype), query the B index for
-  ## candidates, compute metrics, and write matching rows to job.outTsv.
-  ## Returns the number of matches written.
+  ## candidates, compute metrics, and return matching pairs (with both A's
+  ## and B's MATCHA_BOFF source-file offsets carried through for downstream
+  ## modes). The match subcommand formats these as TSV; future modes consume
+  ## them directly.
   var vcfA, vcfB: VCF
   if not open(vcfA, job.pathA):
     raise newException(IOError, "cannot open A BCF: " & job.pathA)
   if not open(vcfB, job.pathB):
     raise newException(IOError, "cannot open B BCF: " & job.pathB)
-
-  var outFile = open(job.outTsv, fmWrite)
 
   let effectiveThreshold =
     if cfg.minOverlapSet and cfg.minJaccardSet: max(cfg.minOverlap, cfg.minJaccard)
@@ -27,6 +35,7 @@ proc processJob*(job: MatchJob, cfg: MatchConfig): int {.discardable.} =
 
   var svlenData: seq[int32]
   var endData:   seq[int32]
+  var boffData:  seq[int32]
 
   for va in vcfA.query(job.chrom):
     let hasEnd  = va.info().get("END",   endData)   == Status.OK and endData.len   > 0
@@ -40,8 +49,9 @@ proc processJob*(job: MatchJob, cfg: MatchConfig): int {.discardable.} =
     else:
       continue
 
-    let endA = if hasEnd: int64(endData[0]) else: va.POS + svlenA
-    let win  = queryWindow(svlenA, effectiveThreshold)
+    let endA    = if hasEnd: int64(endData[0]) else: va.POS + svlenA
+    let aOff    = readBoff(va, boffData)
+    let win     = queryWindow(svlenA, effectiveThreshold)
     let regionStr = $va.CHROM & ":" & $max(1'i64, va.POS - win) & "-" & $(endA + win)
 
     for vb in vcfB.query(regionStr):
@@ -57,6 +67,7 @@ proc processJob*(job: MatchJob, cfg: MatchConfig): int {.discardable.} =
         continue
 
       let endB = if hasEndB: int64(endData[0]) else: vb.POS + svlenB
+      let bOff = readBoff(vb, boffData)
 
       let ovl = reciprocalOverlap(va.POS, endA, vb.POS, endB)
       let jac = jaccard(va.POS, endA, vb.POS, endB)
@@ -65,7 +76,7 @@ proc processJob*(job: MatchJob, cfg: MatchConfig): int {.discardable.} =
       let passJaccard = (not cfg.minJaccardSet) or (jac >= cfg.minJaccard)
 
       if passOverlap and passJaccard:
-        outFile.writeLine(formatMatchResult(MatchResult(
+        result.add(MatchResult(
           chrom:    $va.CHROM,
           posA:     va.POS,
           endA:     endA,
@@ -76,20 +87,21 @@ proc processJob*(job: MatchJob, cfg: MatchConfig): int {.discardable.} =
           svtype:   job.svtype,
           overlap:  ovl,
           jaccard:  jac,
-        )))
-        inc result
+          aOffset:  aOff,
+          bOffset:  bOff,
+        ))
 
-  outFile.close()
   vcfA.close()
   vcfB.close()
 
 # ---------------------------------------------------------------------------
-# Thread pool (global state + atomic counter)
+# Thread pool (global state + atomic counter + per-slot results)
 # ---------------------------------------------------------------------------
 
-var gJobs:    seq[MatchJob]
-var gCfg:     MatchConfig
-var gNextJob: Atomic[int]
+var gJobs:        seq[MatchJob]
+var gCfg:         MatchConfig
+var gNextJob:     Atomic[int]
+var gJobResults:  seq[seq[MatchResult]]   # disjoint slot per job index
 
 proc threadWorker(dummy: int) {.thread.} =
   {.cast(gcsafe).}:
@@ -97,9 +109,9 @@ proc threadWorker(dummy: int) {.thread.} =
       let idx = gNextJob.fetchAdd(1, moRelaxed)
       if idx >= gJobs.len:
         break
-      let n = processJob(gJobs[idx], gCfg)
+      gJobResults[idx] = runMatchJob(gJobs[idx], gCfg)
       logV("job " & gJobs[idx].chrom & "/" & $gJobs[idx].svtype &
-           ": " & $n & " matches")
+           ": " & $gJobResults[idx].len & " matches")
 
 # ---------------------------------------------------------------------------
 # Parallel preprocessing (used when nThreads >= 2)
@@ -150,23 +162,27 @@ proc runMatch*(cfg: MatchConfig) =
     if a.chrom != b.chrom: cmp(a.chrom, b.chrom)
     else: cmp($a.svtype, $b.svtype)
 
+  var jobResults = newSeq[seq[MatchResult]](jobs.len)
   if cfg.nThreads == 1:
-    for job in jobs:
-      let n = processJob(job, cfg)
-      logV("job " & job.chrom & "/" & $job.svtype & ": " & $n & " matches")
+    for i, job in jobs.pairs:
+      jobResults[i] = runMatchJob(job, cfg)
+      logV("job " & job.chrom & "/" & $job.svtype &
+           ": " & $jobResults[i].len & " matches")
   else:
     logV("starting " & $cfg.nThreads & " worker thread(s)")
     gJobs = jobs
     gCfg  = cfg
+    gJobResults = newSeq[seq[MatchResult]](jobs.len)
     gNextJob.store(0, moRelaxed)
     var threads = newSeq[Thread[int]](cfg.nThreads)
     for i in 0 ..< cfg.nThreads:
       createThread(threads[i], threadWorker, i)
     for i in 0 ..< cfg.nThreads:
       joinThread(threads[i])
+    jobResults = gJobResults
     logV("workers complete")
 
-  # Concatenate per-job TSVs in sorted order, prefixed with a header line.
+  # Write the header line plus all matches in deterministic (job-sorted) order.
   let outFile =
     if cfg.outputPath == "": stdout
     else: open(cfg.outputPath, fmWrite)
@@ -174,13 +190,10 @@ proc runMatch*(cfg: MatchConfig) =
   outFile.writeLine(OutputHeader)
 
   var totalMatches = 0
-  for job in jobs:
-    if fileExists(job.outTsv):
-      let content = readFile(job.outTsv)
-      if content.len > 0:
-        outFile.write(content)
-        totalMatches += content.count('\n')
-      removeFile(job.outTsv)
+  for jrs in jobResults:
+    for mr in jrs:
+      outFile.writeLine(formatMatchResult(mr))
+      inc totalMatches
 
   if cfg.outputPath != "":
     outFile.close()

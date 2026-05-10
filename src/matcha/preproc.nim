@@ -20,8 +20,21 @@
 
 import std/[os, sets, strutils, tables]
 import hts
-import hts/private/hts_concat  # BCF_ERR_CTG_UNDEF
+import hts/private/hts_concat  # BCF_ERR_CTG_UNDEF, BGZF, htsFile, bgzf_tell
 import utils, log
+
+# hts-nim's VCF type keeps the underlying htsFile* private. We need access to
+# it (specifically vcf.hts.fp.bgzf) so we can call bgzf_tell to record each
+# record's source-file BGZF virtual offset during preprocessing. Rather than
+# patching vendored hts-nim, mirror enough of VCF's prefix to cast across.
+# Both inherit RootObj, so the type-info slot lines up; the very next slot is
+# `hts: ptr htsFile`. Layout is documented at vendor/hts-nim/src/hts/vcf.nim:19-26.
+type
+  VcfPriv = ref object of RootObj
+    hts: ptr htsFile
+
+proc bgzfHandle(v: VCF): ptr BGZF {.inline.} =
+  cast[VcfPriv](v).hts.fp.bgzf
 
 type
   PreprocOutput* = object
@@ -33,7 +46,6 @@ type
     svtype*:  SvType
     pathA*:   string
     pathB*:   string
-    outTsv*:  string
 
   SkipReason = enum
     skUnsupportedSvtype
@@ -52,17 +64,19 @@ type
     cap:          int
     callset:      string
 
-const KeepInfo = ["SVTYPE", "SVLEN", "END", "CHR2", "END2", "POS2"]
+const KeepInfo = ["SVTYPE", "SVLEN", "END", "CHR2", "END2", "POS2", "MATCHA_BOFF"]
 
 # Standard SV INFO definitions to backfill when the input header omits them.
 # Without these, info.set() at write time fails because hts-nim resolves
 # the field's type via the (reader's) header.
 const SvInfoDefs = [
-  ("SVTYPE", "1", "String",  "Type of structural variant"),
-  ("SVLEN",  "1", "Integer", "Length of the SV (absolute value, positive)"),
-  ("END",    "1", "Integer", "End position of the SV (1-based, inclusive)"),
-  ("CHR2",   "1", "String",  "Chromosome of mate breakend (BND/TRA)"),
-  ("POS2",   "1", "Integer", "Position of mate breakend (BND/TRA)"),
+  ("SVTYPE",      "1", "String",  "Type of structural variant"),
+  ("SVLEN",       "1", "Integer", "Length of the SV (absolute value, positive)"),
+  ("END",         "1", "Integer", "End position of the SV (1-based, inclusive)"),
+  ("CHR2",        "1", "String",  "Chromosome of mate breakend (BND/TRA)"),
+  ("POS2",        "1", "Integer", "Position of mate breakend (BND/TRA)"),
+  ("MATCHA_BOFF", "2", "Integer",
+   "matcha-internal: source-file BGZF virtual offset (high32, low32)"),
 ]
 
 proc reasonStr(r: SkipReason): string =
@@ -172,86 +186,109 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string): PreprocOutput =
   var svtypeStr: string
   var endData, svlenData: seq[int32]
 
+  # Capture the source-file BGZF virtual offset for each record.
+  # `bgzf_tell` at the bottom of the loop body returns the position of the
+  # *next* record (because the iterator's bcf_read for record N has already
+  # advanced past it before yielding). So we prime with one tell before the
+  # loop, then update unconditionally at the bottom. The `block recordBody`
+  # makes every skip path flow through that final update.
+  var nextOffset = int64(bgzf_tell(bgzfHandle(vcf)))
+
   for v in vcf:
+    let recordOffset = nextOffset
     inc lineno
     inc ws.nRead
 
-    if v.c.errcode == BCF_ERR_CTG_UNDEF:
-      warnSkip(skUnknownContig, ws, $v.CHROM, v.POS, $v.ID, "BCF_ERR_CTG_UNDEF")
-      continue
+    block recordBody:
+      if v.c.errcode == BCF_ERR_CTG_UNDEF:
+        warnSkip(skUnknownContig, ws, $v.CHROM, v.POS, $v.ID,
+                 "BCF_ERR_CTG_UNDEF")
+        break recordBody
 
-    let svt = resolveSvtype(v, svtypeStr)
-    if svt == svUNKNOWN:
-      warnSkip(skUnresolvableSvtype, ws, $v.CHROM, v.POS, $v.ID,
-               "no INFO/SVTYPE and no symbolic ALT")
-      continue
-    if svt notin SupportedSvTypes:
-      inc ws.skipped[skUnsupportedSvtype]
-      continue
+      let svt = resolveSvtype(v, svtypeStr)
+      if svt == svUNKNOWN:
+        warnSkip(skUnresolvableSvtype, ws, $v.CHROM, v.POS, $v.ID,
+                 "no INFO/SVTYPE and no symbolic ALT")
+        break recordBody
+      if svt notin SupportedSvTypes:
+        inc ws.skipped[skUnsupportedSvtype]
+        break recordBody
 
-    let (eOk, endPos, endFromInfo) = resolveEnd(v, endData, svlenData)
-    if not eOk:
-      warnSkip(skUnresolvableEnd, ws, $v.CHROM, v.POS, $v.ID,
-               "missing both INFO/END and INFO/SVLEN")
-      continue
+      let (eOk, endPos, endFromInfo) = resolveEnd(v, endData, svlenData)
+      if not eOk:
+        warnSkip(skUnresolvableEnd, ws, $v.CHROM, v.POS, $v.ID,
+                 "missing both INFO/END and INFO/SVLEN")
+        break recordBody
 
-    if endPos <= v.POS:
-      warnSkip(skEndLePos, ws, $v.CHROM, v.POS, $v.ID,
-               "END=" & $endPos & " <= POS=" & $v.POS)
-      continue
+      if endPos <= v.POS:
+        warnSkip(skEndLePos, ws, $v.CHROM, v.POS, $v.ID,
+                 "END=" & $endPos & " <= POS=" & $v.POS)
+        break recordBody
 
-    let (sOk, svlenInit, svlenFromInfo) = resolveSvlen(v, endPos, svlenData)
-    if not sOk:
-      warnSkip(skUnresolvableEnd, ws, $v.CHROM, v.POS, $v.ID,
-               "could not resolve SVLEN")
-      continue
+      let (sOk, svlenInit, svlenFromInfo) = resolveSvlen(v, endPos, svlenData)
+      if not sOk:
+        warnSkip(skUnresolvableEnd, ws, $v.CHROM, v.POS, $v.ID,
+                 "could not resolve SVLEN")
+        break recordBody
 
-    let endDerived = endPos - v.POS
-    var svlen = svlenInit
-    if endFromInfo and svlenFromInfo and
-       inconsistencyExceedsTenPct(svlen, endDerived):
-      warnInconsistency(ws, $v.CHROM, v.POS, $v.ID,
-                        "INFO/SVLEN=" & $svlen & " vs END-POS=" & $endDerived)
-      svlen = endDerived
+      let endDerived = endPos - v.POS
+      var svlen = svlenInit
+      if endFromInfo and svlenFromInfo and
+         inconsistencyExceedsTenPct(svlen, endDerived):
+        warnInconsistency(ws, $v.CHROM, v.POS, $v.ID,
+                          "INFO/SVLEN=" & $svlen & " vs END-POS=" & $endDerived)
+        svlen = endDerived
 
-    # Synthesize ID if missing
-    let curId = $v.ID
-    if curId.len == 0 or curId == ".":
-      v.ID = synthesizeId($v.CHROM, v.POS, svt, lineno)
-      inc ws.syntheticId
+      # Synthesize ID if missing
+      let curId = $v.ID
+      if curId.len == 0 or curId == ".":
+        v.ID = synthesizeId($v.CHROM, v.POS, svt, lineno)
+        inc ws.syntheticId
 
-    # Slim INFO: drop everything outside the keep-set (two-phase to avoid
-    # iterator invalidation as we delete).
-    var toDelete: seq[string]
-    for fld in v.info.fields:
-      if fld.name notin KeepInfo:
-        toDelete.add(fld.name)
-    for name in toDelete:
-      discard v.info.delete(name)
+      # Slim INFO: drop everything outside the keep-set (two-phase to avoid
+      # iterator invalidation as we delete).
+      var toDelete: seq[string]
+      for fld in v.info.fields:
+        if fld.name notin KeepInfo:
+          toDelete.add(fld.name)
+      for name in toDelete:
+        discard v.info.delete(name)
 
-    # Authoritative writes (overwrite whatever was there with normalized values)
-    var svtStr = $svt
-    discard v.info.set("SVTYPE", svtStr)
-    var svlenI32 = svlen.int32
-    discard v.info.set("SVLEN", svlenI32)
-    var endI32 = endPos.int32
-    discard v.info.set("END", endI32)
+      # Authoritative writes (overwrite whatever was there with normalized values)
+      var svtStr = $svt
+      discard v.info.set("SVTYPE", svtStr)
+      var svlenI32 = svlen.int32
+      discard v.info.set("SVLEN", svlenI32)
+      var endI32 = endPos.int32
+      discard v.info.set("END", endI32)
 
-    # Lazily open per-SVTYPE writer
-    if svt notin writers:
-      let path = tempBcfPath(tmpDir, prefix, $svt)
-      var wtr: VCF
-      if not open(wtr, path, mode = "wb"):
-        raise newException(IOError, "cannot create temp BCF: " & path)
-      wtr.copy_header(vcf.header)
-      discard wtr.write_header()
-      writers[svt] = wtr
-      result.paths[svt] = path
-      result.chromsBySvtype[svt] = initHashSet[string]()
+      # Encode the source-file offset as INFO/MATCHA_BOFF (Number=2, Integer)
+      var boffPair: seq[int32] = @[
+        int32((recordOffset shr 32) and 0xFFFFFFFF'i64),
+        int32(recordOffset and 0xFFFFFFFF'i64),
+      ]
+      discard v.info.set("MATCHA_BOFF", boffPair)
 
-    discard writers[svt].write_variant(v)
-    result.chromsBySvtype[svt].incl($v.CHROM)
-    inc ws.nKept
+      # Lazily open per-SVTYPE writer
+      if svt notin writers:
+        let path = tempBcfPath(tmpDir, prefix, $svt)
+        var wtr: VCF
+        if not open(wtr, path, mode = "wb"):
+          raise newException(IOError, "cannot create temp BCF: " & path)
+        wtr.copy_header(vcf.header)
+        discard wtr.write_header()
+        writers[svt] = wtr
+        result.paths[svt] = path
+        result.chromsBySvtype[svt] = initHashSet[string]()
+
+      discard writers[svt].write_variant(v)
+      result.chromsBySvtype[svt].incl($v.CHROM)
+      inc ws.nKept
+
+    # Position is now at the start of the next record; capture it for the
+    # next iteration. Runs unconditionally — every continue path inside the
+    # body uses `break recordBody` so we always reach this update.
+    nextOffset = int64(bgzf_tell(bgzfHandle(vcf)))
 
   vcf.close()
 
@@ -270,20 +307,15 @@ proc buildWorkQueue*(
   ## Return one MatchJob for every (chrom, svtype) pair present in both
   ## callsets. Both jobs share the per-SVTYPE BCF path; the worker uses
   ## the chrom field to do a region query against the consolidated file.
-  var jobIdx = 0
   for svt, pathA in a.paths:
     if svt notin b.paths: continue
     let chromsA = a.chromsBySvtype[svt]
     let chromsB = b.chromsBySvtype[svt]
     for chrom in chromsA:
       if chrom notin chromsB: continue
-      let tsvPath = tmpDir / "matcha_" & $getCurrentProcessId() &
-                    "_job_" & $jobIdx & ".tsv"
       result.add(MatchJob(
         chrom:  chrom,
         svtype: svt,
         pathA:  pathA,
         pathB:  b.paths[svt],
-        outTsv: tsvPath,
       ))
-      inc jobIdx

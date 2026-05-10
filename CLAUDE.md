@@ -93,26 +93,31 @@ Each record is resolved, validated, and slimmed before it lands in the per-SVTYP
 | **SVLEN** | Prefer `INFO/SVLEN` (stored as `abs`). Fall back to `END − POS`. | Neither → warn + skip. If both `INFO/END` and `INFO/SVLEN` were independently provided and they disagree by >10%, warn (no skip) and use `END − POS` as authoritative. |
 | **ID** | Synthesize `CHROM_POS_SVTYPE_LINENUMBER` (1-based input order) when absent or `.`. | Always succeeds. |
 | **Contig** | `BCF_ERR_CTG_UNDEF` from hts-nim → warn + skip (`unknown_contig`). | — |
+| **MATCHA_BOFF** | *Added* (not preserved): the BGZF virtual offset of the source-file record (`(block_address << 16) \| block_offset`), encoded as `Number=2 Type=Integer` (high32, low32). matcha-internal — points back into the *original* input file. | Always succeeds. |
 
-The output BCF carries only the **keep-set** INFO fields: `SVTYPE`, `SVLEN`, `END`, `CHR2`, `END2`, `POS2`. All others (DP, AF, AC, FORMAT data, samples, etc.) are dropped. The header still defines other lines that came in via `copy_header` (slimming the writer header would require `bcf_translate`, which hts-nim does not bind), but record bodies are minimal.
+The output BCF carries only the **keep-set** INFO fields: `SVTYPE`, `SVLEN`, `END`, `CHR2`, `END2`, `POS2`, `MATCHA_BOFF`. All others (DP, AF, AC, FORMAT data, samples, etc.) are dropped. The header still defines other lines that came in via `copy_header` (slimming the writer header would require `bcf_translate`, which hts-nim does not bind), but record bodies are minimal.
 
 Warnings are emitted to stderr with the prefix `[matcha preproc WARN]`. Per-record warnings are throttled at 5 per reason per callset (override with `MATCHA_WARN_CAP`); an end-of-callset summary always emits, listing read/kept/skipped counts, per-reason counters, inconsistencies, and synthesized IDs.
 
 ### Matching
 
-A thread pool of size `--threads` pulls jobs from the work queue. Each job:
+A thread pool of size `--threads` pulls jobs from the work queue. Each job (`runMatchJob`):
 
 1. Streams records from the A BCF restricted to its chromosome (`vcfA.query(job.chrom)`)
 2. For each record, computes the query window from SVLEN
 3. Queries the B BCF index for candidates in `[POS - window, END + window]`
 4. Computes reciprocal overlap and Jaccard for each candidate
-5. Writes matches to a per-job temp TSV
+5. Returns a `seq[MatchResult]` of pairs that pass the thresholds (carrying both A's and B's `MATCHA_BOFF` source-file offsets).
 
-The thread pool uses a single shared atomic counter; workers `fetchAdd` to claim the next job index. With `--threads 1` the pool is bypassed and jobs run inline on the main thread.
+The thread pool uses a single shared atomic counter; workers `fetchAdd` to claim the next job index and write their result into a disjoint slot in `gJobResults: seq[seq[MatchResult]]`. With `--threads 1` the pool is bypassed and jobs run inline on the main thread.
 
 ### Output assembly
 
-Main thread concatenates per-job TSVs in a consistent order (sorted by CHROM then SVTYPE) to the output destination, then removes the temp TSVs and BCFs.
+Main thread iterates the per-job result slots in sorted order (CHROM then SVTYPE) and writes formatted rows to the output destination, prefixed by the `#`-header line. Temp BCFs and CSI indexes are removed at the end of the run.
+
+### Source-record retrieval (anno / merge / collapse)
+
+Preprocessing records each surviving record's `bgzf_tell` virtual offset into `INFO/MATCHA_BOFF` on the slim BCF. Downstream modes that need to read the original record (e.g. `anno` transferring user INFO fields) collect offsets from the match results, sort them ascending, then `bgzf_seek` + `bcf_read` in order. Sorted seeks decompress each touched BGZF block at most once — same amortisation as a region query, and strictly better for sparse retrievals. `bgzf_seek` itself is one extra binding (not present in vendored hts-nim, will be added locally when the first consumer lands).
 
 ---
 
@@ -140,8 +145,7 @@ matcha/
     test_preproc.nim
     test_match.nim
   vendor/
-    hts-nim/           # vendored
-    blocky/
+    hts-nim/           # git submodule, pinned to v0.3.31
 ```
 
 ---
@@ -179,7 +183,7 @@ Each test prints `<ID>\tPASS\t<elapsed>\t<desc>` or `<ID>\tFAIL\t…`. Per-test 
 
 ## Dependencies
 
-- [`hts-nim`](vendor/hts-nim/) — VCF/BCF reading, index querying *(vendored)*
+- [`hts-nim`](vendor/hts-nim/) — VCF/BCF reading, index querying *(git submodule under `vendor/`, pinned to v0.3.31)*
 - `bcftools` (test fixture generation only)
 - Standard library: `os`, `parseopt`, `strutils`, `tables`, `atomics`, `algorithm`, `times`
 

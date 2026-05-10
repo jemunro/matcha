@@ -5,12 +5,25 @@ echo "--------------- Test Preproc ---------------"
 
 import std/[os, sets, strutils, tables, tempfiles]
 import hts
+import hts/private/hts_concat
 import test_utils
 import matcha/utils
 import matcha/preproc
 
 const FixtureA = "tests/fixtures/fixtureA.vcf.gz"
 const FixtureB = "tests/fixtures/fixtureB.vcf.gz"
+
+# Local bindings for the P15 round-trip test. bgzf_seek is not bound by
+# vendored hts-nim; the parallel struct mirrors hts-nim's VCF prefix so we
+# can reach its private htsFile* / BGZF* without patching the vendored copy.
+proc bgzf_seek(fp: ptr BGZF, pos: int64, whence: cint): int64
+  {.cdecl, importc: "bgzf_seek", dynlib: "libhts.so".}
+
+type VcfPrivT = ref object of RootObj
+  hts: ptr htsFile
+
+proc rawHts(v: VCF): ptr htsFile {.inline.} = cast[VcfPrivT](v).hts
+proc rawBgzf(v: VCF): ptr BGZF {.inline.} = cast[VcfPrivT](v).hts.fp.bgzf
 
 # P01 — preprocessVcf produces the expected SVTYPE keys with the right chroms
 timed("P01", "preprocessVcf: SVTYPE keys + chromsBySvtype populated for A"):
@@ -136,7 +149,8 @@ timed("P08", "preprocessVcf: temp BCF records have only keep-set INFO fields"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
-  let allowed = ["SVTYPE", "SVLEN", "END", "CHR2", "END2", "POS2"].toHashSet
+  let allowed = ["SVTYPE", "SVLEN", "END", "CHR2", "END2", "POS2",
+                 "MATCHA_BOFF"].toHashSet
   for path in pp.paths.values:
     for rec in readRecords(path):
       for name in rec.infoNames:
@@ -222,3 +236,56 @@ timed("P14", "preprocessVcf: inconsistent END/SVLEN → SVLEN := END-POS (TC17)"
       found = true
       break
   doAssert found, "DEL_A_17_inconsistent missing from DEL BCF"
+
+# P15 — MATCHA_BOFF round-trip: pull the offset from a slim record, seek into
+# the original file, decode the record there, confirm CHROM/POS/ID match.
+timed("P15", "MATCHA_BOFF: bgzf_seek round-trip into original input"):
+  let tmpDir = createTempDir("matcha_test_", "")
+  defer: removeDir(tmpDir)
+  let pp = preprocessVcf(FixtureA, tmpDir, "A")
+
+  # Find DEL_A_01 in the slim DEL BCF and read its MATCHA_BOFF.
+  var slim: VCF
+  doAssert open(slim, pp.paths[svDEL]), "cannot open slim DEL BCF"
+  var boffData: seq[int32]
+  var slimChrom: string
+  var slimPos: int64
+  var slimId: string
+  var found = false
+  for v in slim:
+    if $v.ID == "DEL_A_01":
+      doAssert v.info.get("MATCHA_BOFF", boffData) == Status.OK,
+        "MATCHA_BOFF missing on slim DEL_A_01"
+      doAssert boffData.len == 2,
+        "MATCHA_BOFF should be Number=2, got len=" & $boffData.len
+      slimChrom = $v.CHROM
+      slimPos = v.POS
+      slimId = $v.ID
+      found = true
+      break
+  slim.close()
+  doAssert found, "DEL_A_01 missing from slim DEL BCF"
+
+  let offset = (int64(boffData[0]) shl 32) or
+               (int64(boffData[1]) and 0xFFFFFFFF'i64)
+  doAssert offset > 0, "decoded MATCHA_BOFF should be positive, got " & $offset
+
+  # Seek into the ORIGINAL file at that offset and read one record.
+  var orig: VCF
+  doAssert open(orig, FixtureA), "cannot open original fixture"
+  doAssert bgzf_seek(rawBgzf(orig), offset, 0.cint) >= 0,
+    "bgzf_seek failed for offset " & $offset
+
+  var rec = newVariant()
+  rec.vcf = orig
+  doAssert bcf_read(rawHts(orig), orig.header.hdr, rec.c) >= 0,
+    "bcf_read at offset " & $offset & " failed"
+  discard bcf_unpack(rec.c, BCF_UN_STR.cint)
+
+  doAssert $rec.CHROM == slimChrom,
+    "CHROM mismatch: slim=" & slimChrom & " orig=" & $rec.CHROM
+  doAssert rec.POS == slimPos,
+    "POS mismatch: slim=" & $slimPos & " orig=" & $rec.POS
+  doAssert $rec.ID == slimId,
+    "ID mismatch: slim=" & slimId & " orig=" & $rec.ID
+  orig.close()

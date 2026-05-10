@@ -1,0 +1,3 @@
+[submodule "vendor/hts-nim"]
+	path = vendor/hts-nim
+	url = https://github.com/brentp/hts-nim.git

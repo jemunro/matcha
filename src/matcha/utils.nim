@@ -23,6 +23,8 @@ type
     svtype*:   SvType
     overlap*:  float64
     jaccard*:  float64
+    aOffset*:  int64    ## BGZF virtual offset of A's source record (0 if unknown)
+    bOffset*:  int64    ## BGZF virtual offset of B's source record (0 if unknown)
 
   MatchConfig* = object
     minOverlap*:      float64
