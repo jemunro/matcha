@@ -123,7 +123,7 @@ def recip_overlap(pA, eA, pB, eB):
     ovl = min(eA, eB) - max(pA, pB)
     if ovl <= 0:
         return 0.0
-    return ovl / min(eA - pA, eB - pB)
+    return ovl / max(eA - pA, eB - pB)
 
 
 def jaccard(pA, eA, pB, eB):

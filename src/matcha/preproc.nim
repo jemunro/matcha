@@ -1,4 +1,4 @@
-## preproc.nim — VCF/BCF normalization, slimming, and per-SVTYPE BCF output.
+## preproc.nim — VCF/BCF normalization, slimming, and per-(SVTYPE, bin) BCF output.
 ##
 ## For each input record we:
 ##   * Resolve SVTYPE (INFO/SVTYPE; symbolic ALT fallback; ALT wins on conflict).
@@ -6,8 +6,10 @@
 ##   * Resolve SVLEN (INFO/SVLEN abs; END-POS fallback; warn+normalize on >10%
 ##     disagreement when both INFO fields were independently provided).
 ##   * Synthesize ID if absent ("." or empty) → CHROM_POS_SVTYPE_LINENUMBER.
-##   * Slim INFO to the keep-set (SVTYPE, SVLEN, END, CHR2, END2, POS2).
-##   * Write to a per-SVTYPE BCF (all chroms in one file), CSI-indexed.
+##   * Slim INFO to the keep-set (SVTYPE, SVLEN, END, CHR2, END2, POS2,
+##     MATCHA_BOFF).
+##   * Compute size-bin via bins.binIndexFor(SVLEN).
+##   * Write to a per-(SVTYPE, bin) BCF spanning all chroms; CSI-indexed.
 ##
 ## Skip categories (counted; final summary always emitted):
 ##   skUnsupportedSvtype  - BND/INS/TRA (count only, awaiting later milestone)
@@ -18,10 +20,10 @@
 ##
 ## Per-record warnings are throttled at MATCHA_WARN_CAP (default 5) per reason.
 
-import std/[os, sets, strutils, tables]
+import std/[algorithm, os, sets, strutils, tables]
 import hts
 import hts/private/hts_concat  # BCF_ERR_CTG_UNDEF, BGZF, htsFile, bgzf_tell
-import utils, log
+import utils, log, bins
 
 # hts-nim's VCF type keeps the underlying htsFile* private. We need access to
 # it (specifically vcf.hts.fp.bgzf) so we can call bgzf_tell to record each
@@ -37,15 +39,20 @@ proc bgzfHandle(v: VCF): ptr BGZF {.inline.} =
   cast[VcfPriv](v).hts.fp.bgzf
 
 type
+  SvtypeBin* = tuple[svtype: SvType, bin: int]
+
   PreprocOutput* = object
-    paths*:          Table[SvType, string]            ## svtype → BCF path
+    paths*:          Table[SvtypeBin, string]         ## (svtype, bin) → BCF path
+    populatedBins*:  Table[SvType, set[uint8]]        ## svtype → set of bin indexes
     chromsBySvtype*: Table[SvType, HashSet[string]]   ## svtype → chroms seen
+    chromOrder*:     seq[string]                      ## chroms in input header order
 
   MatchJob* = object
     chrom*:   string
     svtype*:  SvType
+    binA*:    int
     pathA*:   string
-    pathB*:   string
+    binsB*:   Table[int, string]                      ## binB → B's path
 
   SkipReason = enum
     skUnsupportedSvtype
@@ -167,8 +174,18 @@ proc emitSummary(ws: WarnState) =
           " END/SVLEN >10% (END used as authoritative)")
   logWarn("  ids synthesized: " & $ws.syntheticId)
 
-proc tempBcfPath(tmpDir, prefix, svtype: string): string =
-  tmpDir / "matcha_" & $getCurrentProcessId() & "_" & prefix & "_" & svtype & ".bcf"
+proc tempBcfPath(tmpDir, prefix, svtype: string, binIdx: int): string =
+  tmpDir / "matcha_" & $getCurrentProcessId() & "_" & prefix & "_" &
+           svtype & "_b" & $binIdx & ".bcf"
+
+proc captureChromOrder(h: vcf.Header): seq[string] =
+  ## Return contig IDs in the order they appear in the VCF header.
+  var n: cint = 0
+  let names = bcf_hdr_seqnames(h.hdr, n.addr)
+  if names == nil: return
+  for i in 0 ..< n.int:
+    result.add($names[i])
+  free(names)   # free the array but not the underlying strings (per htslib docs)
 
 proc preprocessVcf*(vcfPath, tmpDir, prefix: string): PreprocOutput =
   ## Stream vcfPath, normalize each record, and write per-SVTYPE BCFs.
@@ -180,11 +197,13 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string): PreprocOutput =
   vcf.set_samples(@["^"])
   ensureSvInfoDefs(vcf.header)
 
-  var writers: Table[SvType, VCF]
+  var writers: Table[SvtypeBin, VCF]
   var ws = WarnState(cap: warnCap(), callset: "callset" & prefix)
   var lineno = 0
   var svtypeStr: string
   var endData, svlenData: seq[int32]
+
+  result.chromOrder = captureChromOrder(vcf.header)
 
   # Capture the source-file BGZF virtual offset for each record.
   # `bgzf_tell` at the bottom of the loop body returns the position of the
@@ -269,19 +288,25 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string): PreprocOutput =
       ]
       discard v.info.set("MATCHA_BOFF", boffPair)
 
-      # Lazily open per-SVTYPE writer
-      if svt notin writers:
-        let path = tempBcfPath(tmpDir, prefix, $svt)
+      # Compute bin and lazily open per-(svtype, bin) writer.
+      let binIdx = binIndexFor(svlen)
+      let key: SvtypeBin = (svt, binIdx)
+      if key notin writers:
+        let path = tempBcfPath(tmpDir, prefix, $svt, binIdx)
         var wtr: VCF
         if not open(wtr, path, mode = "wb"):
           raise newException(IOError, "cannot create temp BCF: " & path)
         wtr.copy_header(vcf.header)
         discard wtr.write_header()
-        writers[svt] = wtr
-        result.paths[svt] = path
+        writers[key] = wtr
+        result.paths[key] = path
+      if svt notin result.chromsBySvtype:
         result.chromsBySvtype[svt] = initHashSet[string]()
+      if svt notin result.populatedBins:
+        result.populatedBins[svt] = {}
+      result.populatedBins[svt].incl(uint8(binIdx))
 
-      discard writers[svt].write_variant(v)
+      discard writers[key].write_variant(v)
       result.chromsBySvtype[svt].incl($v.CHROM)
       inc ws.nKept
 
@@ -292,30 +317,77 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string): PreprocOutput =
 
   vcf.close()
 
-  for svt, wtr in writers.mpairs:
+  for key, wtr in writers.mpairs:
     wtr.close()
-    let path = result.paths[svt]
+    let path = result.paths[key]
     bcfBuildIndex(path, path & ".csi", csi = true, threads = 1)
 
-  logV("[" & prefix & "] indexed " & $result.paths.len & " temp BCFs")
+  logV("[" & prefix & "] indexed " & $result.paths.len &
+       " temp BCFs ((svtype, bin) groups)")
   emitSummary(ws)
 
-proc buildWorkQueue*(
-    a, b: PreprocOutput,
-    tmpDir: string,
-): seq[MatchJob] =
-  ## Return one MatchJob for every (chrom, svtype) pair present in both
-  ## callsets. Both jobs share the per-SVTYPE BCF path; the worker uses
-  ## the chrom field to do a region query against the consolidated file.
-  for svt, pathA in a.paths:
-    if svt notin b.paths: continue
+proc buildWorkQueue*(a, b: PreprocOutput, cfg: MatchConfig): seq[MatchJob] =
+  ## Emit one MatchJob per (chrom, svtype, binA) where:
+  ##   - chrom is in both A and B for this svtype
+  ##   - binA exists in A
+  ##   - at least one populated B bin is adjacent to binA under the binding
+  ##     threshold (max of the supplied --min-overlap / --min-jaccard values).
+  ##
+  ## Each job carries the path of A's per-(svtype, binA) BCF plus a table
+  ## mapping each adjacent populated B bin → B's per-(svtype, binB) BCF path.
+  ##
+  ## Job order: chrom in input header order, then svtype string, then binA.
+
+  # Binding threshold for size-bin adjacency: the stricter of the two.
+  # (Both metrics share the [lenA*t, lenA/t] size constraint, and a higher
+  # threshold yields a smaller adjacent set.)
+  let threshold =
+    if cfg.minOverlapSet and cfg.minJaccardSet:
+      max(cfg.minOverlap, cfg.minJaccard)
+    elif cfg.minOverlapSet:
+      cfg.minOverlap
+    else:
+      cfg.minJaccard
+
+  # Index of chrom → header order for sorting. Use A's chromOrder; fall back
+  # to alphabetical for any chrom not in A's header (shouldn't happen since
+  # A is always the source we group by).
+  var chromIdx: Table[string, int]
+  for i, c in a.chromOrder:
+    chromIdx[c] = i
+
+  var jobs: seq[MatchJob]
+  for key, pathA in a.paths:
+    let (svt, binA) = key
+    if svt notin b.populatedBins: continue
+
+    let adj = adjacentBins(binA, threshold, b.populatedBins[svt])
+    if adj.len == 0: continue
+
+    var binsB: Table[int, string]
+    for binB in adj:
+      let bKey: SvtypeBin = (svt, binB)
+      if bKey in b.paths:
+        binsB[binB] = b.paths[bKey]
+    if binsB.len == 0: continue
+
     let chromsA = a.chromsBySvtype[svt]
     let chromsB = b.chromsBySvtype[svt]
     for chrom in chromsA:
       if chrom notin chromsB: continue
-      result.add(MatchJob(
-        chrom:  chrom,
-        svtype: svt,
-        pathA:  pathA,
-        pathB:  b.paths[svt],
+      jobs.add(MatchJob(
+        chrom:  chrom, svtype: svt, binA: binA,
+        pathA:  pathA, binsB: binsB,
       ))
+
+  # Stable sort: chrom (header order), then svtype string, then binA.
+  proc cmpJobs(x, y: MatchJob): int =
+    let xi = chromIdx.getOrDefault(x.chrom, high(int))
+    let yi = chromIdx.getOrDefault(y.chrom, high(int))
+    if xi != yi: return cmp(xi, yi)
+    let s = cmp($x.svtype, $y.svtype)
+    if s != 0: return s
+    cmp(x.binA, y.binA)
+
+  jobs.sort(cmpJobs)
+  result = jobs

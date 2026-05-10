@@ -1,8 +1,9 @@
-## match.nim — per-job matching logic, thread pool, and output assembly.
+## match.nim — per-job matching with size bins + tiled B buffers, thread pool,
+## and output assembly.
 
-import std/[algorithm, atomics, os, tables]
+import std/[algorithm, atomics, os, sequtils, tables]
 import hts
-import utils, intervals, preproc, log
+import utils, intervals, preproc, log, bins
 
 # ---------------------------------------------------------------------------
 # Per-job matching
@@ -16,83 +17,103 @@ proc readBoff(v: Variant, scratch: var seq[int32]): int64 =
     return 0
   result = (int64(scratch[0]) shl 32) or (int64(scratch[1]) and 0xFFFFFFFF'i64)
 
+proc extractEnd(v: Variant, endData, svlenData: var seq[int32];
+                outEnd: var int64): bool =
+  ## Resolve END for a slim record. After preproc, END is always written
+  ## authoritatively, so this is a fast path; SVLEN fallback is defensive.
+  if v.info().get("END", endData) == Status.OK and endData.len > 0:
+    outEnd = int64(endData[0]); return true
+  if v.info().get("SVLEN", svlenData) == Status.OK and svlenData.len > 0:
+    outEnd = v.POS + abs(int64(svlenData[0])); return true
+  false
+
 proc runMatchJob*(job: MatchJob, cfg: MatchConfig): seq[MatchResult] =
-  ## Stream A records for this (chrom, svtype), query the B index for
-  ## candidates, compute metrics, and return matching pairs (with both A's
-  ## and B's MATCHA_BOFF source-file offsets carried through for downstream
-  ## modes). The match subcommand formats these as TSV; future modes consume
-  ## them directly.
-  var vcfA, vcfB: VCF
+  ## Stream A records from the per-(svtype, binA) BCF restricted to job.chrom.
+  ## For each A record, query each adjacent populated B bin via the per-binB
+  ## TiledBuffer. Apply the metric filter; emit MatchResults carrying both
+  ## sides' MATCHA_BOFF source-file offsets for downstream modes.
+  var vcfA: VCF
   if not open(vcfA, job.pathA):
     raise newException(IOError, "cannot open A BCF: " & job.pathA)
-  if not open(vcfB, job.pathB):
-    raise newException(IOError, "cannot open B BCF: " & job.pathB)
 
-  let effectiveThreshold =
-    if cfg.minOverlapSet and cfg.minJaccardSet: max(cfg.minOverlap, cfg.minJaccard)
-    elif cfg.minOverlapSet: cfg.minOverlap
-    else: cfg.minJaccard
+  # Lazily-opened per-binB readers + tiled buffers. Sorted bin order so the
+  # output is deterministic regardless of hash-table iteration order.
+  var vcfsB: Table[int, VCF]
+  var buffers: Table[int, TiledBuffer]
+  var sortedBinsB = toSeq(job.binsB.keys)
+  sortedBinsB.sort()
+  for binB in sortedBinsB:
+    buffers[binB] = initTiledBuffer(binRange(binB).hi, job.chrom)
 
-  var svlenData: seq[int32]
-  var endData:   seq[int32]
-  var boffData:  seq[int32]
+  # Scratch buffers for INFO field decodes.
+  var endData, svlenData, boffData: seq[int32]
+
+  # Region-query one tile from the per-binB slim BCF. Lazily opens the reader
+  # on first call for each binB. CSI queries return records whose [POS, END)
+  # overlaps the region, so a record straddling a tile boundary appears in both
+  # adjacent fetches; filter by POS to assign each record to exactly one tile.
+  proc fetchTile(binB, tileIdx: int): seq[BufferedRec] =
+    if binB notin vcfsB:
+      var v: VCF
+      if not open(v, job.binsB[binB]):
+        raise newException(IOError, "cannot open B BCF: " & job.binsB[binB])
+      vcfsB[binB] = v
+    let W = binRange(binB).hi
+    let regStart = max(1'i64, tileIdx.int64 * W)
+    let regEnd   = (tileIdx.int64 + 1) * W - 1
+    let region   = job.chrom & ":" & $regStart & "-" & $regEnd
+    for vb in vcfsB[binB].query(region):
+      if int(vb.POS div W) != tileIdx: continue
+      var endB: int64
+      if not extractEnd(vb, endData, svlenData, endB): continue
+      result.add(BufferedRec(
+        pos: vb.POS, endPos: endB,
+        id: $vb.ID,
+        bOffset: readBoff(vb, boffData),
+      ))
 
   for va in vcfA.query(job.chrom):
-    let hasEnd  = va.info().get("END",   endData)   == Status.OK and endData.len   > 0
-    let hasSvln = va.info().get("SVLEN", svlenData) == Status.OK and svlenData.len > 0
+    var endA: int64
+    if not extractEnd(va, endData, svlenData, endA): continue
+    let posA = va.POS
+    let aOff = readBoff(va, boffData)
 
-    var svlenA: int64
-    if hasSvln:
-      svlenA = abs(int64(svlenData[0]))
-    elif hasEnd:
-      svlenA = int64(endData[0]) - va.POS
-    else:
-      continue
+    for binB in sortedBinsB:
+      # Position window [posA - U, posA + svlenA = endA). Asymmetric: a B
+      # record up to U bp left of posA can extend rightward into A, while
+      # B records at posA + svlenA or later cannot overlap.
+      let b = binB  # owned copy — lent iterator vars can't be captured in closures
+      let cands = buffers[b].getCandidates(posA, endA,
+        proc(ti: int): seq[BufferedRec] = fetchTile(b, ti))
+      for cand in cands:
+        let ovl = reciprocalOverlap(posA, endA, cand.pos, cand.endPos)
+        let jac = jaccard(posA, endA, cand.pos, cand.endPos)
+        let passOverlap = (not cfg.minOverlapSet) or (ovl >= cfg.minOverlap)
+        let passJaccard = (not cfg.minJaccardSet) or (jac >= cfg.minJaccard)
+        if passOverlap and passJaccard:
+          result.add(MatchResult(
+            chrom:   $va.CHROM,
+            posA:    posA,
+            endA:    endA,
+            idA:     $va.ID,
+            posB:    cand.pos,
+            endB:    cand.endPos,
+            idB:     cand.id,
+            svtype:  job.svtype,
+            overlap: ovl,
+            jaccard: jac,
+            aOffset: aOff,
+            bOffset: cand.bOffset,
+          ))
 
-    let endA    = if hasEnd: int64(endData[0]) else: va.POS + svlenA
-    let aOff    = readBoff(va, boffData)
-    let win     = queryWindow(svlenA, effectiveThreshold)
-    let regionStr = $va.CHROM & ":" & $max(1'i64, va.POS - win) & "-" & $(endA + win)
-
-    for vb in vcfB.query(regionStr):
-      let hasEndB  = vb.info().get("END",   endData)   == Status.OK and endData.len   > 0
-      let hasSvlnB = vb.info().get("SVLEN", svlenData) == Status.OK and svlenData.len > 0
-
-      var svlenB: int64
-      if hasSvlnB:
-        svlenB = abs(int64(svlenData[0]))
-      elif hasEndB:
-        svlenB = int64(endData[0]) - vb.POS
-      else:
-        continue
-
-      let endB = if hasEndB: int64(endData[0]) else: vb.POS + svlenB
-      let bOff = readBoff(vb, boffData)
-
-      let ovl = reciprocalOverlap(va.POS, endA, vb.POS, endB)
-      let jac = jaccard(va.POS, endA, vb.POS, endB)
-
-      let passOverlap = (not cfg.minOverlapSet) or (ovl >= cfg.minOverlap)
-      let passJaccard = (not cfg.minJaccardSet) or (jac >= cfg.minJaccard)
-
-      if passOverlap and passJaccard:
-        result.add(MatchResult(
-          chrom:    $va.CHROM,
-          posA:     va.POS,
-          endA:     endA,
-          idA:      $va.ID,
-          posB:     vb.POS,
-          endB:     endB,
-          idB:      $vb.ID,
-          svtype:   job.svtype,
-          overlap:  ovl,
-          jaccard:  jac,
-          aOffset:  aOff,
-          bOffset:  bOff,
-        ))
+    # Evict tiles no future A record can need (A is position-sorted within
+    # this chrom-restricted stream).
+    for binB, buf in buffers.mpairs:
+      buf.evict(posA)
 
   vcfA.close()
-  vcfB.close()
+  for v in vcfsB.mvalues:
+    v.close()
 
 # ---------------------------------------------------------------------------
 # Thread pool (global state + atomic counter + per-slot results)
@@ -111,6 +132,7 @@ proc threadWorker(dummy: int) {.thread.} =
         break
       gJobResults[idx] = runMatchJob(gJobs[idx], gCfg)
       logV("job " & gJobs[idx].chrom & "/" & $gJobs[idx].svtype &
+           "/bin" & $gJobs[idx].binA &
            ": " & $gJobResults[idx].len & " matches")
 
 # ---------------------------------------------------------------------------
@@ -152,21 +174,16 @@ proc runMatch*(cfg: MatchConfig) =
     filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A")
     filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B")
 
-  var jobs = buildWorkQueue(filesA, filesB, cfg.tmpDir)
-  logV("work queue: " & $jobs.len & " (chrom,svtype) job(s)")
+  var jobs = buildWorkQueue(filesA, filesB, cfg)
+  logV("work queue: " & $jobs.len & " (chrom, svtype, binA) job(s)")
   if jobs.len == 0:
     return
-
-  # Sort for deterministic output order (chrom then svtype string)
-  jobs.sort do (a, b: MatchJob) -> int:
-    if a.chrom != b.chrom: cmp(a.chrom, b.chrom)
-    else: cmp($a.svtype, $b.svtype)
 
   var jobResults = newSeq[seq[MatchResult]](jobs.len)
   if cfg.nThreads == 1:
     for i, job in jobs.pairs:
       jobResults[i] = runMatchJob(job, cfg)
-      logV("job " & job.chrom & "/" & $job.svtype &
+      logV("job " & job.chrom & "/" & $job.svtype & "/bin" & $job.binA &
            ": " & $jobResults[i].len & " matches")
   else:
     logV("starting " & $cfg.nThreads & " worker thread(s)")
@@ -200,7 +217,7 @@ proc runMatch*(cfg: MatchConfig) =
   logV("wrote " & $totalMatches & " match(es)" &
        (if cfg.outputPath != "": " to " & cfg.outputPath else: " to stdout"))
 
-  # Clean up temp BCFs
+  # Clean up temp BCFs (per-(svtype, bin) files for both callsets).
   for path in filesA.paths.values:
     if fileExists(path):     removeFile(path)
     if fileExists(path & ".csi"): removeFile(path & ".csi")

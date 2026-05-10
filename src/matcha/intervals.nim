@@ -7,7 +7,9 @@
 import std/math
 
 proc reciprocalOverlap*(posA, endA, posB, endB: int64): float64 =
-  ## Reciprocal overlap = overlap / min(lenA, lenB).
+  ## Reciprocal overlap = overlap / max(lenA, lenB).
+  ## Equivalent to requiring overlap/lenA >= t AND overlap/lenB >= t
+  ## simultaneously (the standard definition used by truvari/bedtools).
   ## Returns 0.0 if intervals do not overlap or either has degenerate length.
   let lenA = endA - posA
   let lenB = endB - posB
@@ -18,7 +20,7 @@ proc reciprocalOverlap*(posA, endA, posB, endB: int64): float64 =
   let overlap = overlapEnd - overlapStart
   if overlap <= 0:
     return 0.0
-  result = float64(overlap) / float64(min(lenA, lenB))
+  result = float64(overlap) / float64(max(lenA, lenB))
 
 proc jaccard*(posA, endA, posB, endB: int64): float64 =
   ## Jaccard index = overlap / union.

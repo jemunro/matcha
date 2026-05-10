@@ -47,10 +47,10 @@ timed("I09", "jaccard: adjacent intervals return 0.0"):
   doAssert jaccard(1000, 2000, 2000, 3000) == 0.0
 
 # I10 — reciprocalOverlap: size asymmetry — large A, small B fully inside A
-timed("I10", "reciprocalOverlap: large A=[17000,22000) small B=[17000,18000) = 1.0"):
-  # overlap=1000, min_len=min(5000,1000)=1000 → 1.0
+timed("I10", "reciprocalOverlap: large A=[17000,22000) small B=[17000,18000) = 0.2"):
+  # overlap=1000, max_len=max(5000,1000)=5000 → 0.2
   let ro = reciprocalOverlap(17000, 22000, 17000, 18000)
-  doAssert abs(ro - 1.0) < 1e-9, "expected 1.0, got " & $ro
+  doAssert abs(ro - 0.2) < 1e-9, "expected 0.2, got " & $ro
 
 # I11 — jaccard: size asymmetry — large A, small B
 timed("I11", "jaccard: large A=[17000,22000) small B=[17000,18000) = 1000/5000 = 0.2"):

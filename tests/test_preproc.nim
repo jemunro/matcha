@@ -9,6 +9,11 @@ import hts/private/hts_concat
 import test_utils
 import matcha/utils
 import matcha/preproc
+import matcha/log
+
+# Silence the `[matcha preproc WARN] ...` lines that would otherwise interleave
+# with PASS/FAIL output for every test that exercises preprocessing.
+setQuiet(true)
 
 const FixtureA = "tests/fixtures/fixtureA.vcf.gz"
 const FixtureB = "tests/fixtures/fixtureB.vcf.gz"
@@ -25,19 +30,29 @@ type VcfPrivT = ref object of RootObj
 proc rawHts(v: VCF): ptr htsFile {.inline.} = cast[VcfPrivT](v).hts
 proc rawBgzf(v: VCF): ptr BGZF {.inline.} = cast[VcfPrivT](v).hts.fp.bgzf
 
-# P01 — preprocessVcf produces the expected SVTYPE keys with the right chroms
-timed("P01", "preprocessVcf: SVTYPE keys + chromsBySvtype populated for A"):
+# Convenience: paths key for "this svtype, bin 0" — the bin all the 1000bp
+# fixture records land in.
+template delBin0(pp: PreprocOutput): string = pp.paths[(svDEL, 0)]
+
+# A MatchConfig with --min-overlap 0.5 (same as smoke tests). buildWorkQueue
+# uses the threshold for adjacent-bin pruning.
+proc baseCfg(): MatchConfig =
+  MatchConfig(minOverlap: 0.5, minOverlapSet: true, nThreads: 1)
+
+# P01 — preprocessVcf produces the expected (svtype, bin) keys + chroms
+timed("P01", "preprocessVcf: (svtype, bin) keys + chromsBySvtype + populatedBins"):
   doAssert fileExists(FixtureA), "fixture missing: " & FixtureA
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
-  doAssert svDEL in pp.paths, "missing DEL"
-  doAssert svDUP in pp.paths, "missing DUP"
-  doAssert svINV in pp.paths, "missing INV"
+  doAssert (svDEL, 0) in pp.paths, "missing (DEL, bin 0)"
+  doAssert (svDUP, 1) in pp.paths, "missing (DUP, bin 1)"
+  doAssert (svINV, 1) in pp.paths, "missing (INV, bin 1)"
+  doAssert 0'u8 in pp.populatedBins[svDEL], "DEL bin 0 not in populatedBins"
+  doAssert 1'u8 in pp.populatedBins[svDUP], "DUP bin 1 not in populatedBins"
+  doAssert 1'u8 in pp.populatedBins[svINV], "INV bin 1 not in populatedBins"
   doAssert "chr1" in pp.chromsBySvtype[svDEL], "DEL should include chr1"
-  doAssert "chr1" in pp.chromsBySvtype[svDUP], "DUP should include chr1"
   doAssert "chr2" in pp.chromsBySvtype[svDUP], "DUP should include chr2"
-  doAssert "chr1" in pp.chromsBySvtype[svINV], "INV should include chr1"
   doAssert "chrX" in pp.chromsBySvtype[svINV], "INV should include chrX"
 
 # P02 — BND and INS records are excluded
@@ -45,15 +60,17 @@ timed("P02", "preprocessVcf: BND and INS excluded from paths"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
-  doAssert svBND notin pp.paths, "BND should be excluded"
-  doAssert svINS notin pp.paths, "INS should be excluded"
+  for key in pp.paths.keys:
+    doAssert key.svtype != svBND, "BND should be excluded"
+    doAssert key.svtype != svINS, "INS should be excluded"
+    doAssert key.svtype != svTRA, "TRA should be excluded"
 
 # P03 — extracted fields are correct (POS, END, ID)
 timed("P03", "preprocessVcf: DEL_A_01 has correct POS=1000, END=2000"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
-  let path = pp.paths[svDEL]
+  let path = pp.delBin0
   var vcf: VCF
   doAssert open(vcf, path), "cannot open temp BCF: " & path
   var found = false
@@ -73,41 +90,47 @@ timed("P04", "preprocessVcf: every temp BCF has a .csi index file"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
-  for svt, path in pp.paths:
+  for key, path in pp.paths:
     doAssert fileExists(path & ".csi"),
-      "missing CSI index for " & $svt & ": " & path
+      "missing CSI index for " & $key.svtype & "/bin" & $key.bin & ": " & path
 
-# P05 — work queue keys are a subset of both A and B
-timed("P05", "buildWorkQueue: every job (chrom,svtype) is in both A and B"):
+# P05 — every emitted job key is in both A and B
+timed("P05", "buildWorkQueue: every job (chrom, svtype, binA) is reachable in both"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let ppA = preprocessVcf(FixtureA, tmpDir, "A")
   let ppB = preprocessVcf(FixtureB, tmpDir, "B")
-  let jobs = buildWorkQueue(ppA, ppB, tmpDir)
+  let jobs = buildWorkQueue(ppA, ppB, baseCfg())
   doAssert jobs.len > 0, "expected at least one job"
   for job in jobs:
-    doAssert job.svtype in ppA.paths, "svtype not in A: " & $job.svtype
-    doAssert job.svtype in ppB.paths, "svtype not in B: " & $job.svtype
+    doAssert (job.svtype, job.binA) in ppA.paths,
+      "job's (svtype, binA) not in A: " & $job.svtype & "/bin" & $job.binA
     doAssert job.chrom in ppA.chromsBySvtype[job.svtype],
       "chrom not in A's set: " & job.chrom & "/" & $job.svtype
     doAssert job.chrom in ppB.chromsBySvtype[job.svtype],
       "chrom not in B's set: " & job.chrom & "/" & $job.svtype
+    doAssert job.binsB.len > 0, "job has no adjacent B bins"
+    for binB in job.binsB.keys:
+      doAssert (job.svtype, binB) in ppB.paths,
+        "job binB references missing B path"
 
-# P06 — job count equals number of (chrom,svtype) pairs in both A and B
-timed("P06", "buildWorkQueue: job count equals |intersection of (chrom,svtype)|"):
+# P06 — chrom order in jobs respects A's input header order
+timed("P06", "buildWorkQueue: jobs ordered by VCF header chrom order"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let ppA = preprocessVcf(FixtureA, tmpDir, "A")
   let ppB = preprocessVcf(FixtureB, tmpDir, "B")
-  let jobs = buildWorkQueue(ppA, ppB, tmpDir)
-  var inBoth = 0
-  for svt, chromsA in ppA.chromsBySvtype:
-    if svt notin ppB.chromsBySvtype: continue
-    for chrom in chromsA:
-      if chrom in ppB.chromsBySvtype[svt]:
-        inc inBoth
-  doAssert jobs.len == inBoth,
-    "expected " & $inBoth & " jobs, got " & $jobs.len
+  let jobs = buildWorkQueue(ppA, ppB, baseCfg())
+  # Map chrom → index in A's header order; jobs' chroms must be monotonic.
+  var idx: Table[string, int]
+  for i, c in ppA.chromOrder: idx[c] = i
+  var prev = -1
+  for job in jobs:
+    let cur = idx.getOrDefault(job.chrom, high(int))
+    doAssert cur >= prev,
+      "chrom order regressed at job " & job.chrom &
+      " (prev=" & $prev & " cur=" & $cur & ")"
+    prev = cur
 
 # P07 — preprocessVcf works on .bcf inputs
 timed("P07", "preprocessVcf: accepts .bcf input"):
@@ -116,10 +139,10 @@ timed("P07", "preprocessVcf: accepts .bcf input"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA_bcf, tmpDir, "A_bcf")
-  doAssert svDEL in pp.paths, "missing DEL from .bcf input"
+  doAssert (svDEL, 0) in pp.paths, "missing (DEL, bin 0) from .bcf input"
   doAssert "chr1" in pp.chromsBySvtype[svDEL], "DEL/chr1 should be present"
 
-# Helper: collect every record in a per-SVTYPE BCF as (id, pos, end, svtype, infoNames)
+# Helper: collect every record in a per-(svtype, bin) BCF.
 proc readRecords(path: string): seq[tuple[id: string, pos: int64, endPos: int64,
                                           svtype: string, infoNames: seq[string],
                                           svlen: int64]] =
@@ -163,26 +186,26 @@ timed("P09", "preprocessVcf: missing ID is synthesized"):
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
   var found = false
-  for rec in readRecords(pp.paths[svDEL]):
+  for rec in readRecords(pp.delBin0):
     # TC14 record sits at chr1:37000 in the input; synthetic ID format is
     # CHROM_POS_SVTYPE_LINENUMBER. The lineno is the 1-based input order.
     if rec.id.startsWith("chr1_37000_DEL_"):
       found = true
       break
-  doAssert found, "expected synthesized ID prefix chr1_37000_DEL_<lineno> in DEL BCF"
+  doAssert found, "expected synthesized ID prefix chr1_37000_DEL_<lineno>"
 
 # P10 — symbolic ALT only (no INFO/SVTYPE) is routed to the right SVTYPE BCF
-timed("P10", "preprocessVcf: ALT-symbolic SVTYPE (TC12) routed to DEL BCF"):
+timed("P10", "preprocessVcf: ALT-symbolic SVTYPE (TC12) routed to (DEL, 0)"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
   var found = false
-  for rec in readRecords(pp.paths[svDEL]):
+  for rec in readRecords(pp.delBin0):
     if rec.id == "DEL_A_12_alt_only":
       doAssert rec.svtype == "DEL", "expected SVTYPE=DEL, got " & rec.svtype
       found = true
       break
-  doAssert found, "DEL_A_12_alt_only missing from DEL BCF"
+  doAssert found, "DEL_A_12_alt_only missing from (DEL, 0) BCF"
 
 # P11 — SVTYPE conflict (INFO=DUP, ALT=<DEL>) → ALT wins; record lands in DEL BCF
 timed("P11", "preprocessVcf: ALT wins on SVTYPE conflict (TC13)"):
@@ -190,15 +213,16 @@ timed("P11", "preprocessVcf: ALT wins on SVTYPE conflict (TC13)"):
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
   var inDel = false
-  for rec in readRecords(pp.paths[svDEL]):
+  for rec in readRecords(pp.delBin0):
     if rec.id == "DEL_A_13_conflict":
       doAssert rec.svtype == "DEL", "SVTYPE should be DEL after ALT wins"
       inDel = true
       break
-  doAssert inDel, "DEL_A_13_conflict should be in DEL BCF (ALT=<DEL>)"
-  if svDUP in pp.paths:
-    for rec in readRecords(pp.paths[svDUP]):
-      doAssert rec.id != "DEL_A_13_conflict", "should not be in DUP BCF"
+  doAssert inDel, "DEL_A_13_conflict should be in (DEL, 0) BCF"
+  for key, path in pp.paths:
+    if key.svtype == svDUP:
+      for rec in readRecords(path):
+        doAssert rec.id != "DEL_A_13_conflict", "should not be in any DUP bin"
 
 # P12 — record with neither END nor SVLEN is skipped
 timed("P12", "preprocessVcf: missing END and SVLEN → skipped (TC15)"):
@@ -226,7 +250,7 @@ timed("P14", "preprocessVcf: inconsistent END/SVLEN → SVLEN := END-POS (TC17)"
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
   var found = false
-  for rec in readRecords(pp.paths[svDEL]):
+  for rec in readRecords(pp.delBin0):
     if rec.id == "DEL_A_17_inconsistent":
       # Input: POS=43000, END=44000, INFO/SVLEN=-1500. END-POS=1000.
       # |1500-1000|/1500 = 33% > 10% → END wins, SVLEN normalized to 1000.
@@ -235,18 +259,16 @@ timed("P14", "preprocessVcf: inconsistent END/SVLEN → SVLEN := END-POS (TC17)"
         "SVLEN should be normalized to 1000 (END-POS), got " & $rec.svlen
       found = true
       break
-  doAssert found, "DEL_A_17_inconsistent missing from DEL BCF"
+  doAssert found, "DEL_A_17_inconsistent missing from (DEL, 0) BCF"
 
-# P15 — MATCHA_BOFF round-trip: pull the offset from a slim record, seek into
-# the original file, decode the record there, confirm CHROM/POS/ID match.
+# P15 — MATCHA_BOFF round-trip via bgzf_seek into the original input
 timed("P15", "MATCHA_BOFF: bgzf_seek round-trip into original input"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
 
-  # Find DEL_A_01 in the slim DEL BCF and read its MATCHA_BOFF.
   var slim: VCF
-  doAssert open(slim, pp.paths[svDEL]), "cannot open slim DEL BCF"
+  doAssert open(slim, pp.delBin0), "cannot open slim DEL BCF"
   var boffData: seq[int32]
   var slimChrom: string
   var slimPos: int64
@@ -270,7 +292,6 @@ timed("P15", "MATCHA_BOFF: bgzf_seek round-trip into original input"):
                (int64(boffData[1]) and 0xFFFFFFFF'i64)
   doAssert offset > 0, "decoded MATCHA_BOFF should be positive, got " & $offset
 
-  # Seek into the ORIGINAL file at that offset and read one record.
   var orig: VCF
   doAssert open(orig, FixtureA), "cannot open original fixture"
   doAssert bgzf_seek(rawBgzf(orig), offset, 0.cint) >= 0,
@@ -289,3 +310,25 @@ timed("P15", "MATCHA_BOFF: bgzf_seek round-trip into original input"):
   doAssert $rec.ID == slimId,
     "ID mismatch: slim=" & slimId & " orig=" & $rec.ID
   orig.close()
+
+# P16 — large SV lands in a non-zero bin (DEL_A_08 = 5000bp → bin 3)
+timed("P16", "preprocessVcf: 5000bp DEL_A_08 lands in (DEL, bin 3)"):
+  let tmpDir = createTempDir("matcha_test_", "")
+  defer: removeDir(tmpDir)
+  let pp = preprocessVcf(FixtureA, tmpDir, "A")
+  doAssert (svDEL, 3) in pp.paths,
+    "expected (DEL, bin 3) populated for DEL_A_08"
+  doAssert 3'u8 in pp.populatedBins[svDEL],
+    "bin 3 should be in populatedBins[DEL]"
+  var foundLarge = false
+  for rec in readRecords(pp.paths[(svDEL, 3)]):
+    if rec.id == "DEL_A_08":
+      doAssert rec.pos == 17000, "DEL_A_08 POS"
+      doAssert rec.endPos == 22000, "DEL_A_08 END"
+      doAssert rec.svlen == 5000, "DEL_A_08 SVLEN should be normalized to 5000"
+      foundLarge = true
+      break
+  doAssert foundLarge, "DEL_A_08 missing from (DEL, 3) BCF"
+  # And it should NOT be in (DEL, 0).
+  for rec in readRecords(pp.delBin0):
+    doAssert rec.id != "DEL_A_08", "DEL_A_08 should not be in (DEL, 0)"

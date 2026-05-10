@@ -23,5 +23,6 @@ task test, "Run all tests":
   exec "nimble build -y"
   exec "rm -rf nimcache/tests"
   exec "nim c --hints:off -r tests/test_intervals.nim"
+  exec "nim c --hints:off -r tests/test_bins.nim"
   exec "nim c --hints:off -r tests/test_preproc.nim"
   exec "nim c --hints:off -r tests/test_match.nim"

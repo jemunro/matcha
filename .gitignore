@@ -6,6 +6,7 @@
 
 # Compiled test binaries (Nim leaves these next to the .nim source after `nim c -r`)
 /tests/test_intervals
+/tests/test_bins
 /tests/test_match
 /tests/test_preproc
 

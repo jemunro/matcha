@@ -22,8 +22,17 @@ proc logV*(msg: string) =
 
 const PreprocWarnPrefix* = "[matcha preproc WARN] "
 
+var gQuiet = false
+
+proc setQuiet*(b: bool) =
+  ## When set, logWarn becomes a no-op. Used by tests to keep PASS/FAIL
+  ## output uncluttered. Production code never calls this.
+  gQuiet = b
+
 proc logWarn*(msg: string) =
-  ## Emit a warning unconditionally to stderr (independent of -v/--verbose).
+  ## Emit a warning to stderr (independent of -v/--verbose). Suppressed
+  ## when setQuiet(true) has been called (test runs).
+  if gQuiet: return
   stderr.writeLine(PreprocWarnPrefix & msg)
 
 proc warnCap*(): int =
