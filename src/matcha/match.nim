@@ -1,125 +1,36 @@
-## match.nim — per-job matching with size bins + tiled B buffers, thread pool,
-## and output assembly.
+## match.nim — match-mode driver: per-job matching adapter over matchcore,
+## thread pool, and output assembly.
 
-import std/[algorithm, atomics, os, sequtils, tables]
+import std/[atomics, os, tables]
 import hts
-import utils, intervals, preproc, log, bins
+import utils, preproc, log, bins, matchcore
 
 # ---------------------------------------------------------------------------
-# Per-job matching
+# Per-job matching (adapter over the shared streamJobPairs)
 # ---------------------------------------------------------------------------
-
-proc readBoff(v: Variant, scratch: var seq[int32]): int64 =
-  ## Decode INFO/MATCHA_BOFF (Number=2 Integer: high32, low32) into an int64.
-  ## Returns 0 if the field is absent. The mask on the low half avoids sign-
-  ## extension when the int32 has its high bit set.
-  if v.info().get("MATCHA_BOFF", scratch) != Status.OK or scratch.len < 2:
-    return 0
-  result = (int64(scratch[0]) shl 32) or (int64(scratch[1]) and 0xFFFFFFFF'i64)
-
-proc extractEnd(v: Variant, endData, svlenData: var seq[int32];
-                outEnd: var int64): bool =
-  ## Resolve END for a slim record. After preproc, END is always written
-  ## authoritatively, so this is a fast path; SVLEN fallback is defensive.
-  if v.info().get("END", endData) == Status.OK and endData.len > 0:
-    outEnd = int64(endData[0]); return true
-  if v.info().get("SVLEN", svlenData) == Status.OK and svlenData.len > 0:
-    outEnd = v.POS + abs(int64(svlenData[0])); return true
-  false
 
 proc runMatchJob*(job: MatchJob, cfg: MatchConfig): seq[MatchResult] =
-  ## Stream A records from the per-(svtype, binA) BCF restricted to job.chrom.
-  ## For each A record, query each adjacent populated B bin via the per-binB
-  ## TiledBuffer. Apply the metric filter; emit MatchResults carrying both
-  ## sides' MATCHA_BOFF source-file offsets for downstream modes.
-  var vcfA: VCF
-  if not open(vcfA, job.pathA):
-    raise newException(IOError, "cannot open A BCF: " & job.pathA)
-
-  # Lazily-opened per-binB readers + tiled buffers. Sorted bin order so the
-  # output is deterministic regardless of hash-table iteration order.
-  var vcfsB: Table[int, VCF]
-  var buffers: Table[int, TiledBuffer]
-  var sortedBinsB = toSeq(job.binsB.keys)
-  sortedBinsB.sort()
-  for binB in sortedBinsB:
-    buffers[binB] = initTiledBuffer(binRange(binB).hi, job.chrom)
-
-  # Scratch buffers for INFO field decodes.
-  var endData, svlenData, boffData: seq[int32]
-
-  # Region-query one tile from the per-binB slim BCF. Lazily opens the reader
-  # on first call for each binB. CSI queries return records whose [POS, END)
-  # overlaps the region, so a record straddling a tile boundary appears in both
-  # adjacent fetches; filter by POS to assign each record to exactly one tile.
-  proc fetchTile(binB, tileIdx: int): seq[BufferedRec] =
-    if binB notin vcfsB:
-      var v: VCF
-      if not open(v, job.binsB[binB]):
-        raise newException(IOError, "cannot open B BCF: " & job.binsB[binB])
-      vcfsB[binB] = v
-    let W = binRange(binB).hi
-    let regStart = max(1'i64, tileIdx.int64 * W)
-    let regEnd   = (tileIdx.int64 + 1) * W - 1
-    let region   = job.chrom & ":" & $regStart & "-" & $regEnd
-    for vb in vcfsB[binB].query(region):
-      if int(vb.POS div W) != tileIdx: continue
-      var endB: int64
-      if not extractEnd(vb, endData, svlenData, endB): continue
-      result.add(BufferedRec(
-        pos: vb.POS, endPos: endB,
-        id: $vb.ID,
-        bOffset: readBoff(vb, boffData),
-      ))
-
-  for va in vcfA.query(job.chrom):
-    var endA: int64
-    if not extractEnd(va, endData, svlenData, endA): continue
-    let posA = va.POS
-    let aOff = readBoff(va, boffData)
-
-    for binB in sortedBinsB:
-      # Position window [posA - U, posA + svlenA = endA). Asymmetric: a B
-      # record up to U bp left of posA can extend rightward into A, while
-      # B records at posA + svlenA or later cannot overlap.
-      let b = binB  # owned copy — lent iterator vars can't be captured in closures
-      let cands = buffers[b].getCandidates(posA, endA,
-        proc(ti: int): seq[BufferedRec] = fetchTile(b, ti))
-      for cand in cands:
-        # Self mode: dedup symmetric pairs and drop self-self comparisons.
-        # Both offsets index the same source file, so aOff < bOff is a
-        # total order that keeps each unordered pair exactly once and
-        # excludes the trivial X-vs-X case (aOff == bOff).
-        if cfg.selfMode and aOff >= cand.bOffset:
-          continue
-        let ovl = reciprocalOverlap(posA, endA, cand.pos, cand.endPos)
-        let jac = jaccard(posA, endA, cand.pos, cand.endPos)
-        let passOverlap = (not cfg.minOverlapSet) or (ovl >= cfg.minOverlap)
-        let passJaccard = (not cfg.minJaccardSet) or (jac >= cfg.minJaccard)
-        if passOverlap and passJaccard:
-          result.add(MatchResult(
-            chrom:   $va.CHROM,
-            posA:    posA,
-            endA:    endA,
-            idA:     $va.ID,
-            posB:    cand.pos,
-            endB:    cand.endPos,
-            idB:     cand.id,
-            svtype:  job.svtype,
-            overlap: ovl,
-            jaccard: jac,
-            aOffset: aOff,
-            bOffset: cand.bOffset,
-          ))
-
-    # Evict tiles no future A record can need (A is position-sorted within
-    # this chrom-restricted stream).
-    for binB, buf in buffers.mpairs:
-      buf.evict(posA)
-
-  vcfA.close()
-  for v in vcfsB.mvalues:
-    v.close()
+  ## Stream A records, query each adjacent populated B bin via TiledBuffers,
+  ## apply the metric filter, and emit MatchResults. Self-mode dedup happens
+  ## in the emit callback: aOff < bOff selects one copy of each symmetric
+  ## pair and excludes the trivial X-vs-X case.
+  let selfMode = cfg.selfMode
+  let svtype = job.svtype
+  streamJobPairs[bool, MatchResult](job, cfg,
+    extract = proc(v: Variant): bool = false,
+    emit = proc(va: Variant; posA, endA, aOff: int64;
+                cand: BufferedRec; bExtra: bool;
+                ovl, jac: float64): PairResult[MatchResult] =
+      if selfMode and aOff >= cand.bOffset:
+        return PairResult[MatchResult](keep: false)
+      PairResult[MatchResult](keep: true, item: MatchResult(
+        chrom:   $va.CHROM,
+        posA:    posA, endA: endA, idA: $va.ID,
+        posB:    cand.pos, endB: cand.endPos, idB: cand.id,
+        svtype:  svtype,
+        overlap: ovl, jaccard: jac,
+        aOffset: aOff, bOffset: cand.bOffset,
+      )))
 
 # ---------------------------------------------------------------------------
 # Thread pool (global state + atomic counter + per-slot results)

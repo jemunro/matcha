@@ -13,6 +13,7 @@
 # Generated test fixtures (regenerate with `python3 tests/generate_fixtures.py`)
 /tests/fixtures/fixtureA.*
 /tests/fixtures/fixtureB.*
+/tests/fixtures/fixtureDB.*
 /tests/fixtures/expected/
 
 # Editor / OS

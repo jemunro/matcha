@@ -26,3 +26,4 @@ task test, "Run all tests":
   exec "nim c --hints:off -r tests/test_bins.nim"
   exec "nim c --hints:off -r tests/test_preproc.nim"
   exec "nim c --hints:off -r tests/test_match.nim"
+  exec "nim c --hints:off -r tests/test_anno.nim"

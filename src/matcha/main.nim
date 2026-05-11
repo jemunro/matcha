@@ -2,7 +2,7 @@
 ## Entry point is src/matcha.nim which includes this file.
 
 import std/[os, parseopt, strutils]
-import utils, match, log
+import utils, match, anno, log
 
 const NimblePkgVersion {.strdefine.} = "dev"
 const VERSION = NimblePkgVersion
@@ -27,6 +27,7 @@ proc usage(code: int = 1) =
   f.writeLine ""
   f.writeLine "Subcommands:"
   f.writeLine "  match    Find pairwise matches between two SV callsets"
+  f.writeLine "  anno     Annotate a callset with INFO fields from a database VCF"
   f.writeLine ""
   f.writeLine "Flags:"
   f.writeLine "  --version       show version"
@@ -135,6 +136,199 @@ proc runMatch(rawArgs: seq[string]) =
 
   runMatch(cfg)
 
+proc annoUsage(code: int = 1) =
+  ## Short usage shown on error paths. Lists synopsis, options, and one
+  ## example call so the user can see how -a expressions are constructed
+  ## without scrolling through the full docs. `--help` calls annoHelp() for
+  ## the long-form aggregation-function and implicit-variable reference.
+  let f = if code == 0: stdout else: stderr
+  f.writeLine "Usage:"
+  f.writeLine "  matcha anno [options] input database"
+  f.writeLine ""
+  f.writeLine "Options:"
+  f.writeLine "  -a OUTFIELD=FUNC(SRCFIELD)      annotation expression (repeatable, >=1 required)"
+  f.writeLine "  -o PATH                         output (.vcf | .vcf.gz | .bcf); default stdout VCF"
+  f.writeLine "  --min-overlap FLOAT             minimum reciprocal overlap (0.0-1.0)"
+  f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
+  f.writeLine "  --best-metric jaccard|overlap   metric used by best() (default: jaccard)"
+  f.writeLine "  --overwrite                     replace OUTFIELDs already in input header"
+  f.writeLine "  --threads INT                   number of worker threads (default: 1)"
+  f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
+  f.writeLine "  -v, --verbose                   verbose logging to stderr"
+  f.writeLine "  -h, --help                      show full help (functions, MATCHA_* variables)"
+  f.writeLine ""
+  f.writeLine "At least one of --min-overlap or --min-jaccard is required."
+  f.writeLine ""
+  f.writeLine "Example:"
+  f.writeLine "  matcha anno --min-overlap 0.7 \\"
+  f.writeLine "    -a AF_DB=max(AF) \\"
+  f.writeLine "    -a CALLERS=unique(CALLERS) \\"
+  f.writeLine "    -a N=first(MATCHA_COUNT) \\"
+  f.writeLine "    -o annotated.vcf.gz input.vcf.gz gnomad_sv.vcf.gz"
+  f.writeLine ""
+  f.writeLine "Run 'matcha anno --help' for aggregation functions and MATCHA_* variables."
+  quit(code)
+
+proc annoHelp() =
+  ## Full --help: synopsis + options + complete reference for annotation
+  ## expressions, aggregation functions, and implicit MATCHA_* variables.
+  let f = stdout
+  f.writeLine "Usage:"
+  f.writeLine "  matcha anno [options] input database"
+  f.writeLine ""
+  f.writeLine "Annotate input VCF/BCF with INFO fields aggregated from a database VCF/BCF,"
+  f.writeLine "based on SV matches under the same coordinate+size criteria as `matcha match`."
+  f.writeLine "Inputs may be VCF.gz (.vcf.gz) or BCF (.bcf); format is detected automatically."
+  f.writeLine ""
+  f.writeLine "Options:"
+  f.writeLine "  -a OUTFIELD=FUNC(SRCFIELD)      annotation expression (repeatable, >=1 required)"
+  f.writeLine "  -o PATH                         output file; format from extension:"
+  f.writeLine "                                    .vcf     → uncompressed VCF"
+  f.writeLine "                                    .vcf.gz  → bgzipped VCF (+ .csi index)"
+  f.writeLine "                                    .bcf     → BCF (+ .csi index)"
+  f.writeLine "                                  Default: uncompressed VCF to stdout."
+  f.writeLine "  --min-overlap FLOAT             minimum reciprocal overlap (0.0-1.0)"
+  f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
+  f.writeLine "  --best-metric jaccard|overlap   metric used by best() (default: jaccard)"
+  f.writeLine "  --overwrite                     replace OUTFIELDs that already exist in input header"
+  f.writeLine "  --threads INT                   number of worker threads (default: 1)"
+  f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
+  f.writeLine "  -v, --verbose                   verbose logging to stderr"
+  f.writeLine "  -h, --help                      show this help"
+  f.writeLine ""
+  f.writeLine "At least one of --min-overlap or --min-jaccard is required."
+  f.writeLine ""
+  f.writeLine "Annotation expressions"
+  f.writeLine "  Form:  -a OUTFIELD=FUNC(SRCFIELD)"
+  f.writeLine "    OUTFIELD   name of the INFO field to emit on the output."
+  f.writeLine "               Must be unique across all -a expressions in a single run."
+  f.writeLine "               If already present in the input header, --overwrite is required."
+  f.writeLine "    FUNC       aggregation function applied across all matching database records"
+  f.writeLine "               for each input record (see below)."
+  f.writeLine "    SRCFIELD   an INFO field name in the database VCF, or an implicit MATCHA_*"
+  f.writeLine "               variable (see below)."
+  f.writeLine ""
+  f.writeLine "  Examples:"
+  f.writeLine "    -a AF_DB=max(AF)                  highest AF seen across matches"
+  f.writeLine "    -a CALLERS=unique(CALLERS)        deduped flattened list of caller IDs"
+  f.writeLine "    -a TOP_CALLER=best(CALLER)        CALLER on the best-scoring match"
+  f.writeLine "    -a N_MATCH=first(MATCHA_COUNT)    number of database matches (0 if none)"
+  f.writeLine "    -a TOP_JAC=max(MATCHA_JACCARD)    highest jaccard across matches"
+  f.writeLine ""
+  f.writeLine "Aggregation functions"
+  f.writeLine "  max | min | mean    numeric.  Pool all values across matches, then aggregate."
+  f.writeLine "                      'mean' always emits Float (integer source coerces)."
+  f.writeLine "  first | last        any.       Value from the earliest / latest match by"
+  f.writeLine "                                 database-record position."
+  f.writeLine "  best                any.       Value from the match with the highest"
+  f.writeLine "                                 --best-metric score; ties broken by earliest"
+  f.writeLine "                                 position."
+  f.writeLine "  all                 any.       All values, comma-separated. Output Number=."
+  f.writeLine "  unique              any.       Deduplicated values, comma-separated."
+  f.writeLine "                                 Output Number=."
+  f.writeLine ""
+  f.writeLine "  List-valued database INFO fields (Number=. or N>1) are flattened across all"
+  f.writeLine "  matching records before the aggregation function runs."
+  f.writeLine ""
+  f.writeLine "Implicit MATCHA_* variables"
+  f.writeLine "  Available as SRCFIELD in any -a expression without needing a database header"
+  f.writeLine "  declaration:"
+  f.writeLine "    MATCHA_COUNT      Integer (scalar).  Number of database matches for the"
+  f.writeLine "                      input record. On unmatched records, expressions wrapping"
+  f.writeLine "                      MATCHA_COUNT emit 0; other expressions leave their"
+  f.writeLine "                      OUTFIELD absent."
+  f.writeLine "    MATCHA_JACCARD    Float (vector).  Per-match jaccard scores."
+  f.writeLine "    MATCHA_OVERLAP    Float (vector).  Per-match reciprocal-overlap scores."
+  f.writeLine ""
+  f.writeLine "  Note: best(MATCHA_JACCARD) returns the jaccard of the best-by-metric match,"
+  f.writeLine "  which equals max(MATCHA_JACCARD) only when --best-metric jaccard (the default)."
+  quit(0)
+
+proc runAnnoCli(rawArgs: seq[string]) =
+  var cfg = AnnoConfig(nThreads: 1, bestMetric: bmJaccard)
+  var positionals: seq[string]
+  var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
+  while true:
+    p.next()
+    case p.kind
+    of cmdEnd: break
+    of cmdShortOption, cmdLongOption:
+      case p.key
+      of "a":
+        let raw = nextVal(p, "a")
+        try:
+          cfg.exprs.add(parseAnnoExpr(raw))
+        except ValueError as e:
+          stderr.writeLine "error: " & e.msg
+          quit(1)
+      of "o", "output":
+        cfg.outputPath = nextVal(p, "o")
+      of "min-overlap":
+        let v = nextVal(p, "min-overlap")
+        try: cfg.minOverlap = parseFloat(v)
+        except ValueError:
+          stderr.writeLine "error: --min-overlap must be a float, got: " & v
+          quit(1)
+        cfg.minOverlapSet = true
+      of "min-jaccard":
+        let v = nextVal(p, "min-jaccard")
+        try: cfg.minJaccard = parseFloat(v)
+        except ValueError:
+          stderr.writeLine "error: --min-jaccard must be a float, got: " & v
+          quit(1)
+        cfg.minJaccardSet = true
+      of "best-metric":
+        let v = nextVal(p, "best-metric").toLowerAscii
+        cfg.bestMetric =
+          case v
+          of "jaccard": bmJaccard
+          of "overlap": bmOverlap
+          else:
+            stderr.writeLine "error: --best-metric must be 'jaccard' or 'overlap', got: " & v
+            quit(1)
+      of "overwrite":
+        cfg.overwrite = true
+      of "threads":
+        let v = nextVal(p, "threads")
+        try: cfg.nThreads = parseInt(v)
+        except ValueError:
+          stderr.writeLine "error: --threads must be an integer, got: " & v
+          quit(1)
+        if cfg.nThreads < 1:
+          stderr.writeLine "error: --threads must be >= 1"
+          quit(1)
+      of "tmp-dir":
+        cfg.tmpDir = nextVal(p, "tmp-dir")
+      of "v", "verbose":
+        setVerbose(true)
+      of "h", "help":
+        annoHelp()
+      else:
+        stderr.writeLine "error: unknown option: --" & p.key
+        annoUsage()
+    of cmdArgument:
+      positionals.add(p.key)
+
+  if not cfg.minOverlapSet and not cfg.minJaccardSet:
+    stderr.writeLine "error: at least one of --min-overlap or --min-jaccard is required"
+    annoUsage()
+  if positionals.len != 2:
+    stderr.writeLine "error: expected 2 input files (input database), got " &
+      $positionals.len
+    annoUsage()
+  cfg.callsetA = positionals[0]
+  cfg.callsetB = positionals[1]
+  if not fileExists(cfg.callsetA):
+    stderr.writeLine "error: input file not found: " & cfg.callsetA
+    quit(1)
+  if not fileExists(cfg.callsetB):
+    stderr.writeLine "error: database file not found: " & cfg.callsetB
+    quit(1)
+  if cfg.tmpDir == "":
+    cfg.tmpDir = getTempDir()
+
+  runAnno(cfg)
+
 proc mainEntry*() =
   var args = commandLineParams()
   while args.len > 0 and (args[0] == "-v" or args[0] == "--verbose"):
@@ -145,6 +339,8 @@ proc mainEntry*() =
   case args[0]
   of "match":
     runMatch(args[1 .. ^1])
+  of "anno":
+    runAnnoCli(args[1 .. ^1])
   of "--version":
     echo "matcha v" & VERSION
   of "--help", "-h":

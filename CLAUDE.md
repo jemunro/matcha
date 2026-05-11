@@ -5,15 +5,15 @@
 matcha is a compiled, efficient structural variant (SV) matching and annotation tool written in Nim using hts-nim. It has four planned modes:
 
 - `matcha match` — find all pairwise matches between two SV callsets — **implemented (milestone 1)**
-- `matcha anno` — annotate a query callset against a population database VCF, transferring arbitrary INFO fields — *planned*
+- `matcha anno` — annotate a query callset against a population database VCF, transferring arbitrary INFO fields — **implemented (milestone 2)**
 - `matcha collapse` — merge SVs from multiple callers within a single sample into a consensus callset — *planned*
 - `matcha merge` — merge SVs across multiple samples into a cohort-level pVCF — *planned*
 
-The core matching engine is shared across all modes. All matching is coordinate and size based; sequence similarity and genotypes are out of scope.
+The core matching engine is shared across all modes. Matching for DEL/DUP/INV is coordinate and size based only; genotypes are out of scope. INS matching (planned) will additionally use sequence similarity via vendored [edlib](https://github.com/Martinsos/edlib) (added as a git submodule under `vendor/edlib/` when implemented), since coordinate+size alone is too weak a signal for insertions.
 
 ## Status
 
-**Milestone 1 (`matcha match`)** — complete.
+**Milestones 1–2 (`matcha match`, `matcha anno`)** — complete.
 
 Build: `nimble build` → `./matcha`. Test: `nimble test`. Regenerate fixtures: `python3 tests/generate_fixtures.py` (needs `bcftools`).
 
@@ -67,6 +67,46 @@ Options:
 - One of `--min-overlap` or `--min-jaccard` is required.
 - `-v` / `--verbose` is accepted at the top level (`matcha -v match …`) or after the subcommand.
 - `--self` requires exactly one positional input; passing two is an error.
+
+---
+
+## matcha anno — Overview
+
+`matcha anno input.bcf database.bcf` transfers INFO fields from a database VCF onto an input VCF based on SV matches. Each `-a OUTFIELD=FUNC(SRCFIELD)` declares one annotation to emit; multiple may be passed.
+
+### Aggregation functions
+
+`max | min | mean | first | last | best | all | unique`. `mean` always emits Float (integer source coerces). `all` / `unique` emit `Number=.` lists; the others emit `Number=1` scalars. `best` picks the match with the highest `--best-metric` (jaccard by default, `--best-metric overlap` to switch) — ties break by earliest `posB`. List-valued source fields are flattened across all matches before the function runs.
+
+### Implicit MATCHA_* variables
+
+Available as SRCFIELDs in any expression without needing to be in the database header:
+
+- `MATCHA_COUNT` — Integer scalar, the number of database matches for the input record. On unmatched records, any expression wrapping `MATCHA_COUNT` emits `0`; other expressions leave their OUTFIELD absent.
+- `MATCHA_JACCARD` / `MATCHA_OVERLAP` — Float vectors parallel to the match set.
+
+### Pipeline
+
+1. **Preproc** A (default keep-set) and B (default keep-set + user-referenced DB SRCFIELDs). Both go through the shared `preprocessVcf` with an `extraKeepInfo` parameter.
+2. **Match** via `matchcore.streamJobPairs` — the same generic loop that drives `matcha match`. Anno's `extract` callback pulls user-requested INFO values off each B candidate during the same tile-fetch pass.
+3. **Output assembly**: matches are grouped into an in-memory `Table[aOffset, seq[AnnoMatch]]`. The *original* input file is reopened and streamed; each record's `bgzf_tell` offset is the join key. Annotations are applied to the variant and written to `.vcf` / `.vcf.gz` / `.bcf` (auto-detected from `-o` extension, or stdout VCF when `-o` is omitted). Bgzipped outputs get a `.csi` index.
+
+### CLI
+
+```
+matcha anno [options] input database
+
+  -a OUTFIELD=FUNC(SRCFIELD)      annotation expression (repeatable, ≥1 required)
+  -o PATH                         output (.vcf | .vcf.gz | .bcf); default stdout VCF
+  --min-overlap FLOAT             (one of these two is required)
+  --min-jaccard FLOAT
+  --best-metric jaccard|overlap   default: jaccard
+  --overwrite                     allow replacing INFO fields already in input header
+  --threads INT                   default 1
+  --tmp-dir PATH
+  -v, --verbose
+  -h, --help
+```
 
 ---
 
@@ -138,8 +178,10 @@ Sources under [src/matcha/](src/matcha/):
 - `utils.nim` — shared types: `SvType`, `MatchResult`, `MatchConfig`
 - `intervals.nim` — `reciprocalOverlap`, `jaccard`
 - `bins.nim` — log2 size-bin assignment, `adjacentBins`, `TiledBuffer`
-- `preproc.nim` — VCF/BCF normalize → per-(svtype, bin) BCF + work queue
-- `match.nim` — per-job matching, thread pool, output assembly
+- `preproc.nim` — VCF/BCF normalize → per-(svtype, bin) BCF + work queue. Accepts `extraKeepInfo` so anno can carry user-requested DB fields through preproc.
+- `matchcore.nim` — generic `streamJobPairs[B, R]` driving the shared per-job loop (tiled-buffer fetch, threshold filter, callback dispatch). Both match and anno are thin adapters over this.
+- `match.nim` — match-mode adapter: builds MatchResults, applies self-mode dedup, thread pool, TSV output.
+- `anno.nim` — anno-mode: expression parser, aggregation kernel (`applyAggFunc`), B-side INFO extraction (threaded through `streamJobPairs`'s extract callback), phase-3 streaming + output VCF/BCF assembly.
 - `log.nim` — verbose logging (stderr, timestamped)
 
 Tests under [tests/](tests/) mirror the module names; `test_utils.nim` provides the `timed` template + watchdog timeout. Vendored hts-nim lives in `vendor/hts-nim/` (submodule, pinned v0.3.31).

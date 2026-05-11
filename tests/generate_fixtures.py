@@ -20,6 +20,23 @@ HEADER = """\
 ##contig=<ID=chrX,length=156040895>
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"""
 
+# DB fixture uses an augmented header carrying annotation INFO fields.
+# Match tests don't touch this; anno tests pull values off these records.
+DB_HEADER = """\
+##fileformat=VCFv4.2
+##FILTER=<ID=PASS,Description="All filters passed">
+##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">
+##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="Difference in length between REF and ALT alleles">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant">
+##INFO=<ID=AF,Number=1,Type=Float,Description="Allele frequency in the database cohort">
+##INFO=<ID=AC,Number=1,Type=Integer,Description="Allele count in the database cohort">
+##INFO=<ID=CALLER,Number=1,Type=String,Description="Single primary caller">
+##INFO=<ID=CALLERS,Number=.,Type=String,Description="All callers reporting this SV">
+##contig=<ID=chr1,length=248956422>
+##contig=<ID=chr2,length=242193529>
+##contig=<ID=chrX,length=156040895>
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"""
+
 # Records are dicts so edge cases (missing fields, conflicting fields, missing IDs)
 # can be expressed without contorting a fixed tuple shape. Each dict carries:
 #   - VCF columns: chrom, pos, id, ref, alt, info (preformatted INFO string)
@@ -147,8 +164,41 @@ def jaccard(pA, eA, pB, eB):
     return ovl / union
 
 
-def records_to_vcf(records):
-    lines = [HEADER]
+def db(chrom, pos, rid, alt, svtype, svlen, end, af, ac, caller, callers):
+    """Build a DB-style record with anno INFO fields baked into the info string."""
+    info = (
+        f"SVTYPE={svtype};SVLEN={svlen};END={end};"
+        f"AF={af};AC={ac};CALLER={caller};CALLERS={callers}"
+    )
+    return {
+        "chrom": chrom, "pos": pos, "id": rid, "ref": "N", "alt": alt,
+        "info": info,
+        "svtype": svtype, "svlen": svlen, "end": end,
+    }
+
+
+# DB fixture records, each carrying AF/AC/CALLER/CALLERS. Designed so that
+# specific A records have predictable annotation outputs:
+#   DEL_A_01 (chr1:1000-2000) -> one match (DEL_DB_01)
+#   DEL_A_02 (chr1:3000-4000) -> one match (DEL_DB_02)  (partial overlap)
+#   DEL_A_06 (chr1:13000-14000) -> two matches (DEL_DB_06a, DEL_DB_06b)
+#   DEL_A_07 (chr1:15000-16000) -> zero matches (no nearby DB record)
+RECORDS_DB = [
+    db("chr1", 1000,  "DEL_DB_01",  "<DEL>", "DEL", -1000, 2000,
+       0.10, 5,  "manta", "manta,delly"),
+    db("chr1", 3000,  "DEL_DB_02",  "<DEL>", "DEL", -1000, 4000,
+       0.50, 25, "delly", "delly"),
+    # Two matches for DEL_A_06; B 06b is at smaller POS, so it sorts first
+    # in posB order — first()/last() should be deterministic on that ordering.
+    db("chr1", 12950, "DEL_DB_06b", "<DEL>", "DEL", -1000, 13950,
+       0.30, 15, "delly", "delly,gatk"),
+    db("chr1", 13050, "DEL_DB_06a", "<DEL>", "DEL", -1000, 14050,
+       0.20, 10, "manta", "manta"),
+]
+
+
+def records_to_vcf(records, header=HEADER):
+    lines = [header]
     for r in records:
         lines.append(
             f"{r['chrom']}\t{r['pos']}\t{r['id']}\t{r['ref']}\t{r['alt']}"
@@ -157,8 +207,8 @@ def records_to_vcf(records):
     return "\n".join(lines) + "\n"
 
 
-def write_vcf_gz(records, path):
-    vcf_text = records_to_vcf(records)
+def write_vcf_gz(records, path, header=HEADER):
+    vcf_text = records_to_vcf(records, header)
     # bcftools sort bgzips and sorts in one step
     subprocess.run(
         ["bcftools", "sort", "-O", "z", "-o", path, "-"],
@@ -285,6 +335,11 @@ def main():
 
     print("Writing fixtureB.bcf ...", flush=True)
     write_bcf(os.path.join(out, "fixtureB.vcf.gz"), os.path.join(out, "fixtureB.bcf"))
+
+    print("Writing fixtureDB.vcf.gz ...", flush=True)
+    write_vcf_gz(RECORDS_DB, os.path.join(out, "fixtureDB.vcf.gz"), header=DB_HEADER)
+    print("Writing fixtureDB.bcf ...", flush=True)
+    write_bcf(os.path.join(out, "fixtureDB.vcf.gz"), os.path.join(out, "fixtureDB.bcf"))
 
     # Expected TSVs for three threshold scenarios
     scenarios = [

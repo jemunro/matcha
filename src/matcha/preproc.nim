@@ -35,7 +35,7 @@ type
   VcfPriv = ref object of RootObj
     hts: ptr htsFile
 
-proc bgzfHandle(v: VCF): ptr BGZF {.inline.} =
+proc bgzfHandle*(v: VCF): ptr BGZF {.inline.} =
   cast[VcfPriv](v).hts.fp.bgzf
 
 type
@@ -190,15 +190,26 @@ proc captureChromOrder(h: vcf.Header): seq[string] =
     result.add($names[i])
   free(names)   # free the array but not the underlying strings (per htslib docs)
 
-proc preprocessVcf*(vcfPath, tmpDir, prefix: string): PreprocOutput =
+proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
+                    extraKeepInfo: openArray[string] = []): PreprocOutput =
   ## Stream vcfPath, normalize each record, and write per-SVTYPE BCFs.
   ## All temp BCFs are CSI-indexed on return. Inputs may be VCF.gz or BCF.
+  ##
+  ## extraKeepInfo: additional INFO field names that survive the slim step.
+  ## Used by `matcha anno` to carry user-requested DB fields into the
+  ## per-(svtype, bin) BCFs alongside the default keep-set.
   logV("[" & prefix & "] reading " & vcfPath)
   var vcf: VCF
   if not open(vcf, vcfPath):
     raise newException(IOError, "cannot open VCF/BCF: " & vcfPath)
   vcf.set_samples(@["^"])
   ensureSvInfoDefs(vcf.header)
+
+  # Build the effective keep-set once. HashSet membership check is O(1) and
+  # avoids re-scanning extraKeepInfo for every INFO field on every record.
+  var keepSet = initHashSet[string]()
+  for n in KeepInfo: keepSet.incl(n)
+  for n in extraKeepInfo: keepSet.incl(n)
 
   var writers: Table[SvtypeBin, VCF]
   var ws = WarnState(cap: warnCap(), callset: "callset" & prefix)
@@ -271,7 +282,7 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string): PreprocOutput =
       # iterator invalidation as we delete).
       var toDelete: seq[string]
       for fld in v.info.fields:
-        if fld.name notin KeepInfo:
+        if fld.name notin keepSet:
           toDelete.add(fld.name)
       for name in toDelete:
         discard v.info.delete(name)
