@@ -297,8 +297,8 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
 
       # Encode the source-file offset as INFO/MATCHA_BOFF (Number=2, Integer)
       var boffPair: seq[int32] = @[
-        int32((recordOffset shr 32) and 0xFFFFFFFF'i64),
-        int32(recordOffset and 0xFFFFFFFF'i64),
+        cast[int32]((recordOffset shr 32) and 0xFFFFFFFF'i64),
+        cast[int32](recordOffset and 0xFFFFFFFF'i64),
       ]
       discard v.info.set("MATCHA_BOFF", boffPair)
 
