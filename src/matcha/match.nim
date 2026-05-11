@@ -53,21 +53,6 @@ proc threadWorker(dummy: int) {.thread.} =
            ": " & $gJobResults[idx].len & " matches")
 
 # ---------------------------------------------------------------------------
-# Parallel preprocessing (used when nThreads >= 2)
-# ---------------------------------------------------------------------------
-# A and B preprocessing are independent: they read different inputs and write
-# to different temp paths (distinct "A"/"B" prefixes). Two threads, each
-# running preprocessVcf, are joined before the work queue is built.
-
-var gPpInputs:  array[2, tuple[path, tmpDir, prefix: string]]
-var gPpOutputs: array[2, PreprocOutput]
-
-proc preprocWorker(idx: int) {.thread.} =
-  {.cast(gcsafe).}:
-    let s = gPpInputs[idx]
-    gPpOutputs[idx] = preprocessVcf(s.path, s.tmpDir, s.prefix)
-
-# ---------------------------------------------------------------------------
 # Top-level entry point
 # ---------------------------------------------------------------------------
 
@@ -78,19 +63,14 @@ proc runMatch*(cfg: MatchConfig) =
   var filesA, filesB: PreprocOutput
   if cfg.selfMode:
     logV("self mode: preprocessing single input")
-    filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A")
+    filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A",
+                           ioThreads = if cfg.nThreads >= 2: 2 else: 0)
     filesB = filesA   # same paths, bins, chroms — dedup happens later
   elif cfg.nThreads >= 2:
     logV("preprocessing A and B in parallel")
-    gPpInputs[0] = (cfg.callsetA, cfg.tmpDir, "A")
-    gPpInputs[1] = (cfg.callsetB, cfg.tmpDir, "B")
-    var thA, thB: Thread[int]
-    createThread(thA, preprocWorker, 0)
-    createThread(thB, preprocWorker, 1)
-    joinThread(thA)
-    joinThread(thB)
-    filesA = gPpOutputs[0]
-    filesB = gPpOutputs[1]
+    (filesA, filesB) = runParallelPreproc(
+      PreprocInput(path: cfg.callsetA, tmpDir: cfg.tmpDir, prefix: "A", ioThreads: 2),
+      PreprocInput(path: cfg.callsetB, tmpDir: cfg.tmpDir, prefix: "B", ioThreads: 2))
   else:
     filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A")
     filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B")

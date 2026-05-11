@@ -451,13 +451,12 @@ proc runAnno*(cfg: var AnnoConfig) =
   # --- Phase 1: preproc -----------------------------------------------------
   var filesA, filesB: PreprocOutput
   if cfg.nThreads >= 2:
-    # Parallel preproc would require duplicating match.nim's preprocWorker
-    # with a `extraKeepInfo` slot. Sequential here keeps anno self-contained
-    # for milestone 2 — preproc is rarely the bottleneck for anno.
-    logV("preprocessing input (A) ...")
-    filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A")
-    logV("preprocessing database (B) with extra fields: " & cfg.dbFields.join(","))
-    filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B", cfg.dbFields)
+    logV("preprocessing A and B in parallel" &
+         (if cfg.dbFields.len > 0: " (B extra: " & cfg.dbFields.join(",") & ")" else: ""))
+    (filesA, filesB) = runParallelPreproc(
+      PreprocInput(path: cfg.callsetA, tmpDir: cfg.tmpDir, prefix: "A", ioThreads: 2),
+      PreprocInput(path: cfg.callsetB, tmpDir: cfg.tmpDir, prefix: "B",
+                   extraKeep: cfg.dbFields, ioThreads: 2))
   else:
     filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A")
     filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B", cfg.dbFields)
@@ -509,7 +508,7 @@ proc runAnno*(cfg: var AnnoConfig) =
 
   # --- Phase 3: stream original A, write annotated output -------------------
   var vcfA: VCF
-  if not open(vcfA, cfg.callsetA):
+  if not open(vcfA, cfg.callsetA, threads = if cfg.nThreads >= 2: 2 else: 0):
     raise newException(IOError, "cannot reopen input: " & cfg.callsetA)
   vcfA.set_samples(@["^"])
   # Register new INFO fields on the SOURCE header. info.set() resolves field
@@ -528,10 +527,24 @@ proc runAnno*(cfg: var AnnoConfig) =
   if not outWriter.write_header():
     raise newException(IOError, "failed to write output header")
 
+  # Enable bgzf compression threads and real-time CSI indexing for compressed
+  # outputs. Plain VCF (stdout or .vcf) is neither compressed nor indexed.
+  let isBgzf = not isStdoutPath(cfg.outputPath) and
+               (outPath.endsWith(".bcf") or outPath.endsWith(".vcf.gz"))
+  if cfg.nThreads >= 2 and isBgzf:
+    discard bgzf_mt(bgzfHandle(outWriter), 2, 128)
+  var outIdx: ptr hts_idx_t = nil
+  if isBgzf:
+    let headerOff = uint64(bgzf_tell(bgzfHandle(outWriter)))
+    outIdx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
+    if outIdx == nil:
+      raise newException(IOError, "cannot create CSI index for: " & outPath)
+
   # bgzf_tell prime + update mirrors preproc's offset capture.
   var nextOffset = int64(bgzf_tell(bgzfHandle(vcfA)))
   var nInput = 0
   var nAnnotated = 0
+  var endBuf: seq[int32]
   for v in vcfA:
     let recOff = nextOffset
     inc nInput
@@ -548,21 +561,30 @@ proc runAnno*(cfg: var AnnoConfig) =
         if e.matchaVar == mvCount:
           var zero: int32 = 0
           discard v.info.set(e.outField, zero)
+    let woff = uint64(bgzf_tell(bgzfHandle(outWriter)))
     if not outWriter.write_variant(v):
       raise newException(IOError, "failed to write variant at " &
         $v.CHROM & ":" & $v.POS)
+    if outIdx != nil:
+      let endPos =
+        if v.info.get("END", endBuf) == Status.OK and endBuf.len > 0:
+          int64(endBuf[0])
+        else:
+          int64(v.c.pos + v.c.rlen)
+      discard hts_idx_push(outIdx, v.c.rid, v.c.pos, endPos, woff, 1)
     nextOffset = int64(bgzf_tell(bgzfHandle(vcfA)))
 
   vcfA.close()
+  if outIdx != nil:
+    let finalOff = uint64(bgzf_tell(bgzfHandle(outWriter)))
+    hts_idx_finish(outIdx, finalOff)
   outWriter.close()
   logV("anno: wrote " & $nInput & " record(s) (" &
        $nAnnotated & " annotated) to " &
        (if isStdoutPath(cfg.outputPath): "stdout" else: cfg.outputPath))
-
-  # Index bgzipped outputs (.vcf.gz, .bcf). Uncompressed .vcf and stdout
-  # don't support seeking and aren't indexed.
-  if cfg.outputPath.endsWith(".vcf.gz") or cfg.outputPath.endsWith(".bcf"):
-    bcfBuildIndex(cfg.outputPath, cfg.outputPath & ".csi", csi = true, threads = 1)
+  if outIdx != nil:
+    hts_idx_save(outIdx, cfg.outputPath.cstring, HTS_FMT_CSI.cint)
+    hts_idx_destroy(outIdx)
     logV("indexed " & cfg.outputPath)
 
   # Clean up temp BCFs (A and B preproc artifacts).

@@ -191,7 +191,8 @@ proc captureChromOrder(h: vcf.Header): seq[string] =
   free(names)   # free the array but not the underlying strings (per htslib docs)
 
 proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
-                    extraKeepInfo: openArray[string] = []): PreprocOutput =
+                    extraKeepInfo: openArray[string] = [],
+                    ioThreads: int = 0): PreprocOutput =
   ## Stream vcfPath, normalize each record, and write per-SVTYPE BCFs.
   ## All temp BCFs are CSI-indexed on return. Inputs may be VCF.gz or BCF.
   ##
@@ -200,7 +201,7 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   ## per-(svtype, bin) BCFs alongside the default keep-set.
   logV("[" & prefix & "] reading " & vcfPath)
   var vcf: VCF
-  if not open(vcf, vcfPath):
+  if not open(vcf, vcfPath, threads = ioThreads):
     raise newException(IOError, "cannot open VCF/BCF: " & vcfPath)
   vcf.set_samples(@["^"])
   ensureSvInfoDefs(vcf.header)
@@ -212,10 +213,13 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   for n in extraKeepInfo: keepSet.incl(n)
 
   var writers: Table[SvtypeBin, VCF]
+  var indexes: Table[SvtypeBin, ptr hts_idx_t]
   var ws = WarnState(cap: warnCap(), callset: "callset" & prefix)
   var lineno = 0
   var svtypeStr: string
   var endData, svlenData: seq[int32]
+  var toDelete: seq[string]
+  var boffPair: seq[int32] = newSeq[int32](2)
 
   result.chromOrder = captureChromOrder(vcf.header)
 
@@ -280,7 +284,7 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
 
       # Slim INFO: drop everything outside the keep-set (two-phase to avoid
       # iterator invalidation as we delete).
-      var toDelete: seq[string]
+      toDelete.setLen(0)
       for fld in v.info.fields:
         if fld.name notin keepSet:
           toDelete.add(fld.name)
@@ -296,10 +300,8 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
       discard v.info.set("END", endI32)
 
       # Encode the source-file offset as INFO/MATCHA_BOFF (Number=2, Integer)
-      var boffPair: seq[int32] = @[
-        cast[int32]((recordOffset shr 32) and 0xFFFFFFFF'i64),
-        cast[int32](recordOffset and 0xFFFFFFFF'i64),
-      ]
+      boffPair[0] = cast[int32]((recordOffset shr 32) and 0xFFFFFFFF'i64)
+      boffPair[1] = cast[int32](recordOffset and 0xFFFFFFFF'i64)
       discard v.info.set("MATCHA_BOFF", boffPair)
 
       # Compute bin and lazily open per-(svtype, bin) writer.
@@ -311,9 +313,15 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
         if not open(wtr, path, mode = "wb"):
           raise newException(IOError, "cannot create temp BCF: " & path)
         wtr.copy_header(vcf.header)
+        wtr.set_samples(@["^"])   # temp BCFs carry no sample columns
         discard wtr.write_header()
+        let headerOff = uint64(bgzf_tell(bgzfHandle(wtr)))
         writers[key] = wtr
         result.paths[key] = path
+        let idx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
+        if idx == nil:
+          raise newException(IOError, "cannot create CSI index for: " & path)
+        indexes[key] = idx
       if svt notin result.chromsBySvtype:
         result.chromsBySvtype[svt] = initHashSet[string]()
       if svt notin result.populatedBins:
@@ -321,6 +329,8 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
       result.populatedBins[svt].incl(uint8(binIdx))
 
       discard writers[key].write_variant(v)
+      let woff = uint64(bgzf_tell(bgzfHandle(writers[key])))
+      discard hts_idx_push(indexes[key], v.c.rid, int64(v.c.pos), endPos, woff, 1)
       result.chromsBySvtype[svt].incl($v.CHROM)
       inc ws.nKept
 
@@ -332,9 +342,12 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   vcf.close()
 
   for key, wtr in writers.mpairs:
+    let finalOff = uint64(bgzf_tell(bgzfHandle(wtr)))
+    hts_idx_finish(indexes[key], finalOff)
     wtr.close()
     let path = result.paths[key]
-    bcfBuildIndex(path, path & ".csi", csi = true, threads = 1)
+    hts_idx_save(indexes[key], path.cstring, HTS_FMT_CSI.cint)
+    hts_idx_destroy(indexes[key])
 
   logV("[" & prefix & "] indexed " & $result.paths.len &
        " temp BCFs ((svtype, bin) groups)")
@@ -410,3 +423,30 @@ proc buildWorkQueue*(a, b: PreprocOutput, cfg: MatchConfig): seq[MatchJob] =
 
   jobs.sort(cmpJobs)
   result = jobs
+
+# ---------------------------------------------------------------------------
+# Parallel preprocessing helper (shared by match and anno)
+# ---------------------------------------------------------------------------
+
+type PreprocInput* = object
+  path*:      string
+  tmpDir*:    string
+  prefix*:    string
+  extraKeep*: seq[string]
+  ioThreads*: int
+
+var gPpIn:  array[2, PreprocInput]
+var gPpOut: array[2, PreprocOutput]
+
+proc ppWorker(idx: int) {.thread.} =
+  {.cast(gcsafe).}:
+    let s = gPpIn[idx]
+    gPpOut[idx] = preprocessVcf(s.path, s.tmpDir, s.prefix, s.extraKeep, s.ioThreads)
+
+proc runParallelPreproc*(a, b: PreprocInput): tuple[a, b: PreprocOutput] =
+  gPpIn[0] = a; gPpIn[1] = b
+  var thA, thB: Thread[int]
+  createThread(thA, ppWorker, 0)
+  createThread(thB, ppWorker, 1)
+  joinThread(thA); joinThread(thB)
+  (gPpOut[0], gPpOut[1])
