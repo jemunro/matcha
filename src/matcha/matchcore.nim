@@ -9,7 +9,7 @@
 ## machinery and invokes the supplied `extract` and `emit` callbacks at the
 ## right points. Per-mode adapters live in match.nim and anno.nim.
 
-import std/[algorithm, sequtils, tables]
+import std/[algorithm, deques, sequtils, tables]
 import hts
 import intervals, preproc, bins, utils
 
@@ -24,6 +24,18 @@ proc readBoff*(v: Variant; scratch: var seq[int32]): int64 =
   if v.info().get("MATCHA_BOFF", scratch) != Status.OK or scratch.len < 2:
     return 0
   result = (int64(scratch[0]) shl 32) or (int64(scratch[1]) and 0xFFFFFFFF'i64)
+
+proc readPos2*(v: Variant; scratch: var seq[int32]): tuple[ok: bool; pos2: int64] =
+  ## Decode INFO/POS2 (Number=1 Integer). Returns ok=false if absent.
+  if v.info().get("POS2", scratch) != Status.OK or scratch.len < 1:
+    return (false, 0'i64)
+  (true, int64(scratch[0]))
+
+proc readChr2*(v: Variant; scratch: var string): tuple[ok: bool; chr2: string] =
+  ## Decode INFO/CHR2 (Number=1 String). Returns ok=false if absent or empty.
+  if v.info().get("CHR2", scratch) != Status.OK or scratch.len == 0:
+    return (false, "")
+  (true, scratch)
 
 proc extractEnd*(v: Variant; endData, svlenData: var seq[int32];
                  outEnd: var int64): bool =
@@ -137,3 +149,127 @@ proc streamJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
   vcfA.close()
   for v in vcfsB.mvalues:
     v.close()
+
+# ---------------------------------------------------------------------------
+# BND streaming (point events; slop-based proximity)
+# ---------------------------------------------------------------------------
+
+type
+  BndPairEmitCb*[B, R] = proc(va: Variant; posA, pos2A, aOff: int64;
+                              cand: BufferedRec; bExtra: B;
+                              sim: float64): PairResult[R] {.closure.}
+
+proc streamBndJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
+                              extract: BExtractCb[B];
+                              emit: BndPairEmitCb[B, R]): seq[R] =
+  ## Per-job BND matching with a sliding cache of B records.
+  ##
+  ## A is streamed in POS order from the per-chrom sorted slim BCF, so the
+  ## per-A window (posA - slop, posA + slop) advances monotonically. We
+  ## maintain a Deque of B records currently in the active window, and on
+  ## each A advance:
+  ##   1. Evict from the front records whose POS dropped out of the window.
+  ##   2. CSI-query *only* the new right-edge slice (cacheEnd .. winHi) we
+  ##      haven't fetched yet, and append the decoded records to the cache.
+  ##   3. Iterate the cache to filter by chr2/pos2 and dispatch `emit`.
+  ##
+  ## Net effect: each B record is fetched, decoded, and `extract()`-ed at
+  ## most once across all A records whose windows include it. When A jumps
+  ## past the cache (gap > 2*slop), the cache empties via eviction and the
+  ## next delta query covers the full window — same cost as the old code.
+  let slop = cfg.bndSlop
+  if slop <= 0: return
+  if 0 notin job.binsB: return            # B has no BND temp BCF
+
+  var vcfA: VCF
+  if not open(vcfA, job.pathA):
+    raise newException(IOError, "cannot open A BND BCF: " & job.pathA)
+  var vcfB: VCF
+  if not open(vcfB, job.binsB[0]):
+    raise newException(IOError, "cannot open B BND BCF: " & job.binsB[0])
+
+  type BndCacheRec = object
+    pos:    int64
+    pos2:   int64
+    bOff:   int64
+    chr2:   string
+    id:     string
+    extra:  B
+
+  var cache = initDeque[BndCacheRec]()
+  ## Exclusive upper bound of the POS range currently covered by the cache
+  ## (or by the union of all queries issued so far on this chrom). Records
+  ## with pos in [cache.peekFirst().pos, cacheEnd) are guaranteed to be
+  ## either in `cache` or to have been evicted because no future A can
+  ## reach them. low(int64) forces a full first-A query.
+  var cacheEnd: int64 = low(int64)
+
+  var boffData, pos2Data: seq[int32]
+  var chr2Data: string
+  let twoSlop = float64(2 * slop)
+
+  for va in vcfA.query(job.chrom):
+    let posA = va.POS
+    let aOff = readBoff(va, boffData)
+    let p2A = readPos2(va, pos2Data)
+    if not p2A.ok: continue
+    let c2A = readChr2(va, chr2Data)
+    if not c2A.ok: continue
+    let pos2A = p2A.pos2
+    let chr2A = c2A.chr2           # value copy; chr2Data scratch is reused below
+
+    # Strict-band window (open both ends): pos must satisfy
+    #   posA - slop < pos < posA + slop
+    # i.e. inclusive integer range [posA - slop + 1, posA + slop - 1].
+    let winLo = posA - slop.int64 + 1
+    let winHi = posA + slop.int64           # exclusive upper bound
+
+    # Evict from the left: records with pos < winLo can't match any current
+    # or future A (A advances monotonically).
+    while cache.len > 0 and cache.peekFirst().pos < winLo:
+      cache.popFirst()
+
+    # Delta query: fetch only the part of the window we don't already cover.
+    let queryLo = max(cacheEnd, winLo)
+    let queryHi = winHi
+    if queryLo < queryHi:
+      let regLo = max(1'i64, queryLo)
+      let regHi = queryHi - 1                ## inclusive upper bound for hts region
+      if regHi >= regLo:
+        let region = job.chrom & ":" & $regLo & "-" & $regHi
+        for vb in vcfB.query(region):
+          let posB = vb.POS
+          # Skip records the previous query already cached (boundary dedup).
+          if posB < queryLo: continue
+          let p2B = readPos2(vb, pos2Data)
+          if not p2B.ok: continue
+          let c2B = readChr2(vb, chr2Data)
+          if not c2B.ok: continue
+          cache.addLast(BndCacheRec(
+            pos: posB, pos2: p2B.pos2, bOff: readBoff(vb, boffData),
+            chr2: c2B.chr2, id: $vb.ID, extra: extract(vb),
+          ))
+      cacheEnd = queryHi
+
+    # Emit: scan the cache (now == the window contents) and dispatch
+    # passing pairs. Indexed iteration avoids a generic-deque `items`
+    # resolution issue when BndCacheRec depends on the proc's type
+    # parameter `B`.
+    for i in 0 ..< cache.len:
+      let cand = cache[i]
+      if cand.chr2 != chr2A: continue
+      let d2 = abs(cand.pos2 - pos2A)
+      if d2 >= slop: continue
+      let d1 = abs(cand.pos - posA)
+      let sim = (twoSlop - float64(d1) - float64(d2)) / twoSlop
+      if sim <= 0: continue                  ## safety net (band check enforces)
+      let buffered = BufferedRec(
+        pos: cand.pos, endPos: cand.pos + 1, id: cand.id, bOffset: cand.bOff,
+        chr2: cand.chr2, pos2: cand.pos2,
+      )
+      let pr = emit(va, posA, pos2A, aOff, buffered, cand.extra, sim)
+      if pr.keep:
+        result.add(pr.item)
+
+  vcfA.close()
+  vcfB.close()

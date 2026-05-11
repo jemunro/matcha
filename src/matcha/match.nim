@@ -16,6 +16,7 @@ proc runMatchJob*(job: MatchJob, cfg: MatchConfig): seq[MatchResult] =
   ## pair and excludes the trivial X-vs-X case.
   let selfMode = cfg.selfMode
   let svtype = job.svtype
+  let useOverlap = cfg.minOverlapSet
   streamJobPairs[bool, MatchResult](job, cfg,
     extract = proc(v: Variant): bool = false,
     emit = proc(va: Variant; posA, endA, aOff: int64;
@@ -24,13 +25,38 @@ proc runMatchJob*(job: MatchJob, cfg: MatchConfig): seq[MatchResult] =
       if selfMode and aOff >= cand.bOffset:
         return PairResult[MatchResult](keep: false)
       PairResult[MatchResult](keep: true, item: MatchResult(
-        chrom:   $va.CHROM,
-        posA:    posA, endA: endA, idA: $va.ID,
-        posB:    cand.pos, endB: cand.endPos, idB: cand.id,
-        svtype:  svtype,
-        overlap: ovl, jaccard: jac,
-        aOffset: aOff, bOffset: cand.bOffset,
+        chrom:      $va.CHROM,
+        posA:       posA, endA: endA, idA: $va.ID,
+        posB:       cand.pos, endB: cand.endPos, idB: cand.id,
+        svtype:     svtype,
+        similarity: (if useOverlap: ovl else: jac),
+        aOffset:    aOff, bOffset: cand.bOffset,
       )))
+
+proc runBndMatchJob*(job: MatchJob, cfg: MatchConfig): seq[MatchResult] =
+  ## BND-mode per-job matcher. Mirrors runMatchJob but uses streamBndJobPairs
+  ## (slop-based proximity, point events). endA/endB are zero sentinels —
+  ## formatMatchResult emits "." for BND rows.
+  let selfMode = cfg.selfMode
+  streamBndJobPairs[bool, MatchResult](job, cfg,
+    extract = proc(v: Variant): bool = false,
+    emit = proc(va: Variant; posA, pos2A, aOff: int64;
+                cand: BufferedRec; bExtra: bool;
+                sim: float64): PairResult[MatchResult] =
+      if selfMode and aOff >= cand.bOffset:
+        return PairResult[MatchResult](keep: false)
+      PairResult[MatchResult](keep: true, item: MatchResult(
+        chrom:      $va.CHROM,
+        posA:       posA, endA: 0, idA: $va.ID,
+        posB:       cand.pos, endB: 0, idB: cand.id,
+        svtype:     svBND,
+        similarity: sim,
+        aOffset:    aOff, bOffset: cand.bOffset,
+      )))
+
+proc dispatchMatchJob(job: MatchJob, cfg: MatchConfig): seq[MatchResult] {.inline.} =
+  if job.svtype == svBND: runBndMatchJob(job, cfg)
+  else:                   runMatchJob(job, cfg)
 
 # ---------------------------------------------------------------------------
 # Thread pool (global state + atomic counter + per-slot results)
@@ -47,7 +73,7 @@ proc threadWorker(dummy: int) {.thread.} =
       let idx = gNextJob.fetchAdd(1, moRelaxed)
       if idx >= gJobs.len:
         break
-      gJobResults[idx] = runMatchJob(gJobs[idx], gCfg)
+      gJobResults[idx] = dispatchMatchJob(gJobs[idx], gCfg)
       logV("job " & gJobs[idx].chrom & "/" & $gJobs[idx].svtype &
            "/bin" & $gJobs[idx].binA &
            ": " & $gJobResults[idx].len & " matches")
@@ -83,7 +109,7 @@ proc runMatch*(cfg: MatchConfig) =
   var jobResults = newSeq[seq[MatchResult]](jobs.len)
   if cfg.nThreads == 1:
     for i, job in jobs.pairs:
-      jobResults[i] = runMatchJob(job, cfg)
+      jobResults[i] = dispatchMatchJob(job, cfg)
       logV("job " & job.chrom & "/" & $job.svtype & "/bin" & $job.binA &
            ": " & $jobResults[i].len & " matches")
   else:
@@ -105,6 +131,8 @@ proc runMatch*(cfg: MatchConfig) =
     if cfg.outputPath == "": stdout
     else: open(cfg.outputPath, fmWrite)
 
+  let metricName = if cfg.minOverlapSet: "overlap" else: "jaccard"
+  outFile.writeLine("##matcha_metric=" & metricName)
   outFile.writeLine(OutputHeader)
 
   var totalMatches = 0

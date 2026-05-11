@@ -42,11 +42,25 @@ DB_HEADER = """\
 #   - VCF columns: chrom, pos, id, ref, alt, info (preformatted INFO string)
 #   - Matching truth: svtype, svlen, end (None if record is intentionally
 #     malformed or unmatchable; compute_expected then skips it)
+#   - For BND records: chr2, pos2 are added so compute_bnd_expected can pair them.
 def normal(chrom, pos, rid, ref, alt, svtype, svlen, end):
     return {
         "chrom": chrom, "pos": pos, "id": rid, "ref": ref, "alt": alt,
         "info": f"SVTYPE={svtype};SVLEN={svlen};END={end}",
         "svtype": svtype, "svlen": svlen, "end": end,
+    }
+
+
+def bnd(chrom, pos, rid, chr2, pos2):
+    """BND record using the t[p[ ALT form. matcha parses the bracket; INFO
+    only carries SVTYPE=BND. svlen=0 / end=pos+1 are sentinels matching
+    matcha's slim-BCF encoding (not used for matching)."""
+    alt = f"N[{chr2}:{pos2}["
+    return {
+        "chrom": chrom, "pos": pos, "id": rid, "ref": "N", "alt": alt,
+        "info": "SVTYPE=BND",
+        "svtype": "BND", "svlen": 0, "end": pos + 1,
+        "chr2": chr2, "pos2": pos2,
     }
 
 
@@ -73,10 +87,8 @@ RECORDS_A = [
     # TC10 all three SVTYPEs on chr1
     normal("chr1", 25000, "DUP_A_10", "N", "<DUP>", "DUP",   2000, 27000),
     normal("chr1", 28000, "INV_A_10", "N", "<INV>", "INV",   2000, 30000),
-    # TC11 BND and INS — silently skipped by matcha (unsupported svtype)
-    {"chrom": "chr1", "pos": 31000, "id": "BND_A_11", "ref": "N",
-     "alt": "N[chr1:32000[", "info": "SVTYPE=BND",
-     "svtype": None, "svlen": None, "end": None},
+    # TC11 BND (matchable) + INS (silently skipped)
+    bnd("chr1", 31000, "BND_A_11", chr2="chr1", pos2=32000),
     {"chrom": "chr1", "pos": 32000, "id": "INS_A_11", "ref": "N",
      "alt": "<INS>", "info": "SVTYPE=INS;SVLEN=100;END=32100",
      "svtype": None, "svlen": None, "end": None},
@@ -117,6 +129,30 @@ RECORDS_A = [
     # (19a, 19b): 1500/2000 = 0.75.
     normal("chr2", 5000, "DUP_A_19a", "N", "<DUP>", "DUP", 2000, 7000),
     normal("chr2", 5500, "DUP_A_19b", "N", "<DUP>", "DUP", 2000, 7500),
+    # TC20 — inter-chrom BND identical mate. With B identical, sim=1.0.
+    bnd("chr1", 60000, "BND_A_20", chr2="chr2", pos2=70000),
+    # TC21 — slight offset on both breakends. dPOS=50, dPOS2=30.
+    # sim at slop=100 = (200-50-30)/200 = 0.60.  At slop=20: |50|>=20 → reject.
+    bnd("chr1", 60500, "BND_A_21", chr2="chr2", pos2=70000),
+    # TC22 — no B counterpart on chr1:80000 → unmatched.
+    bnd("chr1", 80000, "BND_A_22", chr2="chr2", pos2=90000),
+    # TC23 — CHR2 mismatch: A has chrX mate; B has chr2 mate. → no match.
+    bnd("chr1", 62000, "BND_A_23", chr2="chrX", pos2=70000),
+    # TC24 — malformed BND ALT (truncated). → warn-skip (skMalformedBnd).
+    {"chrom": "chr1", "pos": 64000, "id": "BND_A_24", "ref": "N",
+     "alt": "N[chr1:", "info": "SVTYPE=BND",
+     "svtype": None, "svlen": None, "end": None},
+    # TC25 — TRA record. → warn-skip (skUnsupportedTra).
+    # No CHR2 in INFO since the fixture header doesn't declare it; bcftools
+    # rejects undeclared INFO fields. matcha warn-skips TRA regardless of
+    # mate-position presence.
+    {"chrom": "chr1", "pos": 70000, "id": "TRA_A_25", "ref": "N",
+     "alt": "<TRA>", "info": "SVTYPE=TRA;END=70001",
+     "svtype": None, "svlen": None, "end": None},
+    # TC27 — intra-chrom BND mate pair on chr2 (for --self mode).
+    # 27a/27b: dPOS=20, dPOS2=20 → sim at slop=100 = (200-20-20)/200 = 0.80.
+    bnd("chr2", 60000, "BND_A_27a", chr2="chr2", pos2=80000),
+    bnd("chr2", 60020, "BND_A_27b", chr2="chr2", pos2=80020),
 ]
 
 RECORDS_B = [
@@ -142,10 +178,15 @@ RECORDS_B = [
     # TC10 all three SVTYPEs
     normal("chr1", 25000, "DUP_B_10", "N", "<DUP>", "DUP",   2000, 27000),
     normal("chr1", 28000, "INV_B_10", "N", "<INV>", "INV",   2000, 30000),
-    # TC11 BND in B too (silently skipped)
-    {"chrom": "chr1", "pos": 31000, "id": "BND_B_11", "ref": "N",
-     "alt": "N[chr1:32000[", "info": "SVTYPE=BND",
-     "svtype": None, "svlen": None, "end": None},
+    # TC11 BND in B — identical mate. Matches BND_A_11 at sim=1.0.
+    bnd("chr1", 31000, "BND_B_11", chr2="chr1", pos2=32000),
+    # TC20 inter-chrom BND, identical to A → sim=1.0
+    bnd("chr1", 60000, "BND_B_20", chr2="chr2", pos2=70000),
+    # TC21 inter-chrom BND, offset by 50/30 → sim=0.60 at default slop
+    bnd("chr1", 60550, "BND_B_21", chr2="chr2", pos2=70030),
+    # TC23 — A's BND_A_23 has chrX mate; this B record has chr2 mate.
+    # Position matches (chr1:62000) but CHR2 mismatch → must NOT pair.
+    bnd("chr1", 62000, "BND_B_23", chr2="chr2", pos2=70000),
 ]
 
 
@@ -177,12 +218,28 @@ def db(chrom, pos, rid, alt, svtype, svlen, end, af, ac, caller, callers):
     }
 
 
+def bnd_db(chrom, pos, rid, chr2, pos2, af, ac, caller, callers):
+    """BND-style DB record with anno INFO fields."""
+    alt = f"N[{chr2}:{pos2}["
+    info = (
+        f"SVTYPE=BND;"
+        f"AF={af};AC={ac};CALLER={caller};CALLERS={callers}"
+    )
+    return {
+        "chrom": chrom, "pos": pos, "id": rid, "ref": "N", "alt": alt,
+        "info": info,
+        "svtype": "BND", "svlen": 0, "end": pos + 1,
+        "chr2": chr2, "pos2": pos2,
+    }
+
+
 # DB fixture records, each carrying AF/AC/CALLER/CALLERS. Designed so that
 # specific A records have predictable annotation outputs:
 #   DEL_A_01 (chr1:1000-2000) -> one match (DEL_DB_01)
 #   DEL_A_02 (chr1:3000-4000) -> one match (DEL_DB_02)  (partial overlap)
 #   DEL_A_06 (chr1:13000-14000) -> two matches (DEL_DB_06a, DEL_DB_06b)
 #   DEL_A_07 (chr1:15000-16000) -> zero matches (no nearby DB record)
+#   BND_A_11 (chr1:31000 → chr1:32000) -> one match (BND_DB_11)
 RECORDS_DB = [
     db("chr1", 1000,  "DEL_DB_01",  "<DEL>", "DEL", -1000, 2000,
        0.10, 5,  "manta", "manta,delly"),
@@ -194,6 +251,9 @@ RECORDS_DB = [
        0.30, 15, "delly", "delly,gatk"),
     db("chr1", 13050, "DEL_DB_06a", "<DEL>", "DEL", -1000, 14050,
        0.20, 10, "manta", "manta"),
+    # BND match for BND_A_11.
+    bnd_db("chr1", 31000, "BND_DB_11", chr2="chr1", pos2=32000,
+           af=0.40, ac=20, caller="manta", callers="manta,gridss"),
 ]
 
 
@@ -230,64 +290,57 @@ def write_bcf(vcf_gz_path, bcf_path):
     subprocess.run(["bcftools", "index", bcf_path], check=True, capture_output=True)
 
 
-def compute_expected(records_a, records_b, min_recip=0.0, min_jac=0.0):
-    """Return list of output rows (as lists) for given thresholds.
+def interval_matchable(r):
+    return (r["svtype"] is not None and r["svtype"] != "BND"
+            and r["svlen"] is not None and r["end"] is not None)
 
-    Records whose svtype/svlen/end are None (intentionally malformed or
-    unsupported) are skipped — they will never appear in matcha's output.
+
+def bnd_matchable(r):
+    return r["svtype"] == "BND" and r.get("chr2") and r.get("pos2") is not None
+
+
+def compute_expected(records_a, records_b, metric, threshold):
+    """Interval-mode expected rows. metric is 'overlap' or 'jaccard'.
+
+    Records that aren't interval-matchable (None svtype, BND, malformed)
+    are skipped — BND is handled separately by compute_bnd_expected.
     """
-    def matchable(r):
-        return r["svtype"] is not None and r["svlen"] is not None and r["end"] is not None
+    assert metric in ("overlap", "jaccard")
 
-    # Build lookup of B records by (chrom, svtype)
     b_by_key = {}
     for rec in records_b:
-        if not matchable(rec):
+        if not interval_matchable(rec):
             continue
-        key = (rec["chrom"], rec["svtype"])
-        b_by_key.setdefault(key, []).append(rec)
+        b_by_key.setdefault((rec["chrom"], rec["svtype"]), []).append(rec)
 
     rows = []
     for rec_a in records_a:
-        if not matchable(rec_a):
+        if not interval_matchable(rec_a):
             continue
         chrom, posA, idA, svtype, endA = (
             rec_a["chrom"], rec_a["pos"], rec_a["id"], rec_a["svtype"], rec_a["end"],
         )
-        key = (chrom, svtype)
-        if key not in b_by_key:
-            continue
-        for rec_b in b_by_key[key]:
+        for rec_b in b_by_key.get((chrom, svtype), []):
             posB, idB, endB = rec_b["pos"], rec_b["id"], rec_b["end"]
-            ro = recip_overlap(posA, endA, posB, endB)
-            jac = jaccard(posA, endA, posB, endB)
-            if ro >= min_recip and jac >= min_jac:
-                rows.append([
-                    chrom, str(posA), str(endA), idA,
-                    str(posB), str(endB), idB,
-                    svtype,
-                    f"{ro:.6f}", f"{jac:.6f}",
-                ])
+            sim = (recip_overlap(posA, endA, posB, endB) if metric == "overlap"
+                   else jaccard(posA, endA, posB, endB))
+            if sim < threshold:
+                continue
+            rows.append([
+                chrom, str(posA), str(endA), idA,
+                str(posB), str(endB), idB,
+                svtype, f"{sim:.6f}",
+            ])
     return rows
 
 
-def compute_self_expected(records, min_recip=0.0, min_jac=0.0):
-    """Like compute_expected but matches a single callset against itself.
-
-    Each unordered pair (i, j) with i < j is reported once. Records must
-    share chrom and svtype to pair. Self-self pairs (i, i) are excluded.
-    Output order matches matcha's: per-chrom (header order), per-svtype,
-    then by source position. After bcftools sort, same-chrom records keep
-    their relative position order, so iterating sorted-by-position within
-    each (chrom, svtype) group corresponds to matcha's aOff-ordered
-    iteration.
-    """
-    def matchable(r):
-        return r["svtype"] is not None and r["svlen"] is not None and r["end"] is not None
+def compute_self_expected(records, metric, threshold):
+    """Interval self-mode expected rows. metric is 'overlap' or 'jaccard'."""
+    assert metric in ("overlap", "jaccard")
 
     by_key = {}
     for rec in records:
-        if not matchable(rec):
+        if not interval_matchable(rec):
             continue
         by_key.setdefault((rec["chrom"], rec["svtype"]), []).append(rec)
 
@@ -297,14 +350,84 @@ def compute_self_expected(records, min_recip=0.0, min_jac=0.0):
         for i in range(len(recs_sorted)):
             for j in range(i + 1, len(recs_sorted)):
                 a, b = recs_sorted[i], recs_sorted[j]
-                ro = recip_overlap(a["pos"], a["end"], b["pos"], b["end"])
-                jac = jaccard(a["pos"], a["end"], b["pos"], b["end"])
-                if ro >= min_recip and jac >= min_jac:
-                    rows.append([
-                        chrom, str(a["pos"]), str(a["end"]), a["id"],
-                        str(b["pos"]), str(b["end"]), b["id"],
-                        svtype, f"{ro:.6f}", f"{jac:.6f}",
-                    ])
+                sim = (recip_overlap(a["pos"], a["end"], b["pos"], b["end"])
+                       if metric == "overlap"
+                       else jaccard(a["pos"], a["end"], b["pos"], b["end"]))
+                if sim < threshold:
+                    continue
+                rows.append([
+                    chrom, str(a["pos"]), str(a["end"]), a["id"],
+                    str(b["pos"]), str(b["end"]), b["id"],
+                    svtype, f"{sim:.6f}",
+                ])
+    return rows
+
+
+def compute_bnd_expected(records_a, records_b, slop=100):
+    """BND expected rows. Two BNDs match iff same CHROM_A, same CHR2, and
+    both breakends are within slop (strict <). Similarity is
+    (2*slop - |dPOS| - |dPOS2|) / (2*slop)."""
+    b_by_chrom = {}
+    for rec in records_b:
+        if not bnd_matchable(rec):
+            continue
+        b_by_chrom.setdefault(rec["chrom"], []).append(rec)
+
+    rows = []
+    twoSlop = 2 * slop
+    for ra in records_a:
+        if not bnd_matchable(ra):
+            continue
+        for rb in b_by_chrom.get(ra["chrom"], []):
+            d1 = abs(ra["pos"] - rb["pos"])
+            if d1 >= slop:
+                continue
+            if ra["chr2"] != rb["chr2"]:
+                continue
+            d2 = abs(ra["pos2"] - rb["pos2"])
+            if d2 >= slop:
+                continue
+            sim = (twoSlop - d1 - d2) / twoSlop
+            if sim <= 0:
+                continue
+            rows.append([
+                ra["chrom"], str(ra["pos"]), ".", ra["id"],
+                str(rb["pos"]), ".", rb["id"], "BND",
+                f"{sim:.6f}",
+            ])
+    return rows
+
+
+def compute_self_bnd_expected(records, slop=100):
+    by_chrom = {}
+    for rec in records:
+        if not bnd_matchable(rec):
+            continue
+        by_chrom.setdefault(rec["chrom"], []).append(rec)
+
+    rows = []
+    twoSlop = 2 * slop
+    for chrom, recs in by_chrom.items():
+        recs_sorted = sorted(recs, key=lambda r: r["pos"])
+        for i in range(len(recs_sorted)):
+            for j in range(i + 1, len(recs_sorted)):
+                a, b = recs_sorted[i], recs_sorted[j]
+                d1 = abs(a["pos"] - b["pos"])
+                if d1 >= slop:
+                    continue
+                if a["chr2"] != b["chr2"]:
+                    continue
+                d2 = abs(a["pos2"] - b["pos2"])
+                if d2 >= slop:
+                    continue
+                sim = (twoSlop - d1 - d2) / twoSlop
+                if sim <= 0:
+                    continue
+                rows.append([
+                    chrom, str(a["pos"]), ".", a["id"],
+                    str(b["pos"]), ".", b["id"], "BND",
+                    f"{sim:.6f}",
+                ])
     return rows
 
 
@@ -341,23 +464,36 @@ def main():
     print("Writing fixtureDB.bcf ...", flush=True)
     write_bcf(os.path.join(out, "fixtureDB.vcf.gz"), os.path.join(out, "fixtureDB.bcf"))
 
-    # Expected TSVs for three threshold scenarios
+    # Chromosome order from HEADER for stable sort.
+    chrom_order = {c: i for i, c in enumerate(["chr1", "chr2", "chrX"])}
+    def sort_key(row):
+        # (chrom-order, svtype-string, posA, idA, posB)
+        return (chrom_order.get(row[0], 999), row[7], int(row[1]), row[3], int(row[4]))
+
+    # Expected TSVs for three threshold scenarios. Under the new CLI rule
+    # exactly one of --min-overlap / --min-jaccard is active per run; the
+    # SIMILARITY column reports that metric for interval rows. BND rows
+    # always use slop=100 proximity and are merged into every scenario.
     scenarios = [
-        ("default",      0.5,  0.0),   # --min-reciprocal-overlap 0.5
-        ("strict",       0.8,  0.8),   # --min-reciprocal-overlap 0.8 --min-jaccard 0.8
-        ("jaccard_only", 0.0,  0.5),   # --min-jaccard 0.5
+        ("default",      "overlap", 0.5),
+        ("strict",       "overlap", 0.8),
+        ("jaccard_only", "jaccard", 0.5),
     ]
-    for name, min_recip, min_jac in scenarios:
-        rows = compute_expected(RECORDS_A, RECORDS_B, min_recip, min_jac)
+    bnd_rows = compute_bnd_expected(RECORDS_A, RECORDS_B, slop=100)
+    for name, metric, thr in scenarios:
+        rows = compute_expected(RECORDS_A, RECORDS_B, metric, thr) + bnd_rows
+        rows.sort(key=sort_key)
         tsv_path = os.path.join(out, "expected", f"expected_{name}.tsv")
         write_expected_tsv(rows, tsv_path)
-        print(f"  {tsv_path}: {len(rows)} rows (min_recip={min_recip}, min_jac={min_jac})")
+        print(f"  {tsv_path}: {len(rows)} rows ({metric}>={thr}; +{len(bnd_rows)} BND)")
 
     # Self-mode expected output: --self --min-overlap 0.5 fixtureA.
-    self_rows = compute_self_expected(RECORDS_A, min_recip=0.5, min_jac=0.0)
+    self_rows = (compute_self_expected(RECORDS_A, "overlap", 0.5) +
+                 compute_self_bnd_expected(RECORDS_A, slop=100))
+    self_rows.sort(key=sort_key)
     self_path = os.path.join(out, "expected", "expected_self.tsv")
     write_expected_tsv(self_rows, self_path)
-    print(f"  {self_path}: {len(self_rows)} rows (--self, min_recip=0.5)")
+    print(f"  {self_path}: {len(self_rows)} rows (--self, overlap>=0.5 + BND slop=100)")
 
     print("Done.")
 

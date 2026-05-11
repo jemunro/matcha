@@ -55,15 +55,40 @@ timed("P01", "preprocessVcf: (svtype, bin) keys + chromsBySvtype + populatedBins
   doAssert "chr2" in pp.chromsBySvtype[svDUP], "DUP should include chr2"
   doAssert "chrX" in pp.chromsBySvtype[svINV], "INV should include chrX"
 
-# P02 — BND and INS records are excluded
-timed("P02", "preprocessVcf: BND and INS excluded from paths"):
+# P02 — BND records are kept; INS and TRA are skipped.
+timed("P02", "preprocessVcf: BND kept; INS and TRA excluded"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
+  doAssert (svBND, 0) in pp.paths,
+    "BND records should be in the (svBND, bin 0) temp BCF"
   for key in pp.paths.keys:
-    doAssert key.svtype != svBND, "BND should be excluded"
     doAssert key.svtype != svINS, "INS should be excluded"
     doAssert key.svtype != svTRA, "TRA should be excluded"
+
+# P02b — BND slim record carries authoritative CHR2/POS2 from ALT parse.
+timed("P02b", "preprocessVcf: BND slim record has CHR2/POS2 parsed from ALT"):
+  let tmpDir = createTempDir("matcha_test_", "")
+  defer: removeDir(tmpDir)
+  let pp = preprocessVcf(FixtureA, tmpDir, "A")
+  doAssert (svBND, 0) in pp.paths, "no BND temp BCF"
+  let path = pp.paths[(svBND, 0)]
+  var vcf: VCF
+  doAssert open(vcf, path), "cannot open BND temp BCF: " & path
+  var pos2Data: seq[int32]
+  var chr2Data: string
+  var foundA11 = false
+  for v in vcf:
+    if $v.ID == "BND_A_11":
+      doAssert v.info().get("CHR2", chr2Data) == Status.OK, "CHR2 missing on BND_A_11"
+      doAssert chr2Data == "chr1", "CHR2 should be chr1, got " & chr2Data
+      doAssert v.info().get("POS2", pos2Data) == Status.OK, "POS2 missing on BND_A_11"
+      doAssert pos2Data.len > 0 and int64(pos2Data[0]) == 32000,
+        "POS2 should be 32000, got " & $pos2Data
+      foundA11 = true
+      break
+  vcf.close()
+  doAssert foundA11, "BND_A_11 missing from BND temp BCF"
 
 # P03 — extracted fields are correct (POS, END, ID)
 timed("P03", "preprocessVcf: DEL_A_01 has correct POS=1000, END=2000"):

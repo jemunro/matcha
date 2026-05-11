@@ -57,6 +57,8 @@ type
     endPos*:  int64
     id*:      string
     bOffset*: int64   ## BGZF virtual offset into the original source file
+    chr2*:    string  ## mate chromosome (svBND only; empty for interval records)
+    pos2*:    int64   ## mate position   (svBND only; zero  for interval records)
 
   TiledBuffer* = object
     tileWidth*: int64

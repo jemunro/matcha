@@ -33,11 +33,10 @@ type
 
   MatchaVar* = enum
     ## Which (if any) implicit MATCHA variable the SRCFIELD refers to.
-    mvNone, mvCount, mvJaccard, mvOverlap
-
-  BestMetric* = enum
-    bmJaccard = "jaccard"
-    bmOverlap = "overlap"
+    ## MATCHA_SIMILARITY collapses what used to be MATCHA_OVERLAP /
+    ## MATCHA_JACCARD into a single per-match Float vector — the active
+    ## metric for interval rows, the slop-based proximity for BND rows.
+    mvNone, mvCount, mvSimilarity
 
   AnnoExpr* = object
     outField*:   string        ## INFO field name to emit
@@ -52,7 +51,7 @@ type
     minJaccard*:    float64
     minOverlapSet*: bool
     minJaccardSet*: bool
-    bestMetric*:    BestMetric
+    bndSlop*:       int          ## --bnd-slop (default 100)
     overwrite*:     bool
     nThreads*:      int
     tmpDir*:        string
@@ -63,12 +62,11 @@ type
     dbFields*:      seq[string]  ## deduped DB SRCFIELDs (excluding MATCHA_*)
 
   AnnoMatch* = object
-    aOffset*:  int64
-    bOffset*:  int64
-    posB*:     int64
-    overlap*:  float64
-    jaccard*:  float64
-    payload*:  Table[string, seq[string]]  ## DB srcField → stringified values
+    aOffset*:    int64
+    bOffset*:    int64
+    posB*:       int64
+    similarity*: float64
+    payload*:    Table[string, seq[string]]  ## DB srcField → stringified values
 
   DbPayload* = Table[string, seq[string]]
 
@@ -121,17 +119,16 @@ proc parseAnnoExpr*(s: string): AnnoExpr =
   result.srcField = srcStr
   result.matchaVar =
     case srcStr
-    of "MATCHA_COUNT":   mvCount
-    of "MATCHA_JACCARD": mvJaccard
-    of "MATCHA_OVERLAP": mvOverlap
-    else:                mvNone
+    of "MATCHA_COUNT":      mvCount
+    of "MATCHA_SIMILARITY": mvSimilarity
+    else:                   mvNone
 
 proc outputNumberType*(e: AnnoExpr): tuple[number, typ: string] =
   ## Derive the output INFO Number/Type from the expression's FUNC and source.
   case e.matchaVar
   of mvCount:
     return ("1", "Integer")
-  of mvJaccard, mvOverlap:
+  of mvSimilarity:
     case e.fn
     of afAll, afUnique: return (".", "Float")
     else:               return ("1", "Float")
@@ -230,12 +227,13 @@ proc extractDbValues(v: Variant; dbFields: seq[string];
 
 proc runAnnoJob*(job: MatchJob; cfg: AnnoConfig;
                  dbTypes: Table[string, string]): seq[AnnoMatch] =
-  ## Anno-mode adapter over `streamJobPairs`. The `extract` callback pulls
-  ## user-requested DB INFO values off each B candidate during the same
-  ## tile fetch that match-mode uses; the `emit` callback wraps the pair
-  ## into an AnnoMatch. No self-mode filter — anno is asymmetric (input
-  ## vs database) by construction.
+  ## Anno-mode adapter over `streamJobPairs` (interval matches). The
+  ## `extract` callback pulls user-requested DB INFO values off each B
+  ## candidate during the same tile fetch that match-mode uses; the `emit`
+  ## callback wraps the pair into an AnnoMatch. No self-mode filter — anno
+  ## is asymmetric (input vs database) by construction.
   let dbFields = cfg.dbFields
+  let useOverlap = cfg.minOverlapSet
   # Scratch buffers reused across all extract() calls within this job.
   var iBuf: seq[int32]
   var fBuf: seq[float32]
@@ -251,9 +249,39 @@ proc runAnnoJob*(job: MatchJob; cfg: AnnoConfig;
                 cand: BufferedRec; bExtra: DbPayload;
                 ovl, jac: float64): PairResult[AnnoMatch] =
       PairResult[AnnoMatch](keep: true, item: AnnoMatch(
-        aOffset: aOff, bOffset: cand.bOffset, posB: cand.pos,
-        overlap: ovl, jaccard: jac, payload: bExtra,
+        aOffset:    aOff, bOffset: cand.bOffset, posB: cand.pos,
+        similarity: (if useOverlap: ovl else: jac),
+        payload:    bExtra,
       )))
+
+proc runAnnoBndJob*(job: MatchJob; cfg: AnnoConfig;
+                    dbTypes: Table[string, string]): seq[AnnoMatch] =
+  ## Anno-mode BND adapter. Uses streamBndJobPairs with slop-based proximity.
+  let dbFields = cfg.dbFields
+  var iBuf: seq[int32]
+  var fBuf: seq[float32]
+  var sBuf: string
+
+  streamBndJobPairs[DbPayload, AnnoMatch](job, MatchConfig(
+      minOverlap: cfg.minOverlap, minJaccard: cfg.minJaccard,
+      minOverlapSet: cfg.minOverlapSet, minJaccardSet: cfg.minJaccardSet,
+      bndSlop: cfg.bndSlop,
+    ),
+    extract = proc(v: Variant): DbPayload =
+      extractDbValues(v, dbFields, dbTypes, iBuf, fBuf, sBuf),
+    emit = proc(va: Variant; posA, pos2A, aOff: int64;
+                cand: BufferedRec; bExtra: DbPayload;
+                sim: float64): PairResult[AnnoMatch] =
+      PairResult[AnnoMatch](keep: true, item: AnnoMatch(
+        aOffset:    aOff, bOffset: cand.bOffset, posB: cand.pos,
+        similarity: sim,
+        payload:    bExtra,
+      )))
+
+proc dispatchAnnoJob(job: MatchJob; cfg: AnnoConfig;
+                     dbTypes: Table[string, string]): seq[AnnoMatch] {.inline.} =
+  if job.svtype == svBND: runAnnoBndJob(job, cfg, dbTypes)
+  else:                   runAnnoJob(job, cfg, dbTypes)
 
 # ---------------------------------------------------------------------------
 # Aggregation kernel
@@ -262,17 +290,15 @@ proc runAnnoJob*(job: MatchJob; cfg: AnnoConfig;
 proc parseFloatSafe(s: string): float64 =
   try: parseFloat(s) except ValueError: 0.0
 
-proc selectBestIdx(matches: seq[AnnoMatch]; metric: BestMetric): int =
-  ## Index of the match with the highest metric score; ties broken by smaller
+proc selectBestIdx(matches: seq[AnnoMatch]): int =
+  ## Index of the match with the highest similarity; ties broken by smaller
   ## posB (earliest by position).
   result = 0
   for i in 1 ..< matches.len:
-    let curScore  =
-      if metric == bmJaccard: matches[result].jaccard else: matches[result].overlap
-    let candScore =
-      if metric == bmJaccard: matches[i].jaccard else: matches[i].overlap
-    if candScore > curScore: result = i
-    elif candScore == curScore and matches[i].posB < matches[result].posB:
+    if matches[i].similarity > matches[result].similarity:
+      result = i
+    elif matches[i].similarity == matches[result].similarity and
+         matches[i].posB < matches[result].posB:
       result = i
 
 proc gatherValues(e: AnnoExpr; matches: seq[AnnoMatch]): seq[string] =
@@ -282,18 +308,15 @@ proc gatherValues(e: AnnoExpr; matches: seq[AnnoMatch]): seq[string] =
   case e.matchaVar
   of mvCount:
     result.add($matches.len)
-  of mvJaccard:
-    for m in matches: result.add(formatFloat(m.jaccard, ffDecimal, 6))
-  of mvOverlap:
-    for m in matches: result.add(formatFloat(m.overlap, ffDecimal, 6))
+  of mvSimilarity:
+    for m in matches: result.add(formatFloat(m.similarity, ffDecimal, 6))
   of mvNone:
     for m in matches:
       if e.srcField in m.payload:
         for v in m.payload[e.srcField]:
           result.add(v)
 
-proc applyAggFunc*(e: AnnoExpr; matches: seq[AnnoMatch];
-                   metric: BestMetric): seq[string] =
+proc applyAggFunc*(e: AnnoExpr; matches: seq[AnnoMatch]): seq[string] =
   ## Run the aggregation function over the match set. Returns the formatted
   ## value(s) to set on the output INFO field. Empty seq → field absent.
   if matches.len == 0:
@@ -338,11 +361,10 @@ proc applyAggFunc*(e: AnnoExpr; matches: seq[AnnoMatch];
     if pooled.len == 0: return @[]
     return @[pooled[^1]]
   of afBest:
-    let bi = selectBestIdx(sorted, metric)
+    let bi = selectBestIdx(sorted)
     case e.matchaVar
-    of mvCount:    return @[$sorted.len]
-    of mvJaccard:  return @[formatFloat(sorted[bi].jaccard, ffDecimal, 6)]
-    of mvOverlap:  return @[formatFloat(sorted[bi].overlap, ffDecimal, 6)]
+    of mvCount:      return @[$sorted.len]
+    of mvSimilarity: return @[formatFloat(sorted[bi].similarity, ffDecimal, 6)]
     of mvNone:
       if e.srcField in sorted[bi].payload and
          sorted[bi].payload[e.srcField].len > 0:
@@ -373,7 +395,7 @@ proc annoThreadWorker(dummy: int) {.thread.} =
     while true:
       let idx = gAnnoNext.fetchAdd(1, moRelaxed)
       if idx >= gAnnoJobs.len: break
-      gAnnoResults[idx] = runAnnoJob(gAnnoJobs[idx], gAnnoCfg, gAnnoDbTypes)
+      gAnnoResults[idx] = dispatchAnnoJob(gAnnoJobs[idx], gAnnoCfg, gAnnoDbTypes)
       logV("anno job " & gAnnoJobs[idx].chrom & "/" & $gAnnoJobs[idx].svtype &
            "/bin" & $gAnnoJobs[idx].binA &
            ": " & $gAnnoResults[idx].len & " match(es)")
@@ -391,6 +413,10 @@ proc validateOutputPath(p: string) =
     quit(1)
 
 proc registerOutputHeader(h: vcf.Header; cfg: AnnoConfig) =
+  # Record the active interval metric. BND rows always use slop-similarity;
+  # this line documents which metric drove interval matching in this run.
+  let metricName = if cfg.minOverlapSet: "overlap" else: "jaccard"
+  discard h.add_string("##matcha_metric=" & metricName)
   for e in cfg.exprs:
     let (num, typ) = outputNumberType(e)
     let desc = "matcha anno: " & $e.fn & "(" & e.srcField & ")"
@@ -480,7 +506,7 @@ proc runAnno*(cfg: var AnnoConfig) =
   if jobs.len > 0:
     if cfg.nThreads == 1:
       for i, j in jobs.pairs:
-        jobResults[i] = runAnnoJob(j, cfg, dbTypes)
+        jobResults[i] = dispatchAnnoJob(j, cfg, dbTypes)
         logV("anno job " & j.chrom & "/" & $j.svtype & "/bin" & $j.binA &
              ": " & $jobResults[i].len & " match(es)")
     else:
@@ -551,7 +577,7 @@ proc runAnno*(cfg: var AnnoConfig) =
     if recOff in byAoff:
       let matches = byAoff[recOff]
       for e in cfg.exprs:
-        let vals = applyAggFunc(e, matches, cfg.bestMetric)
+        let vals = applyAggFunc(e, matches)
         setInfoValues(v, e, vals)
       inc nAnnotated
     else:

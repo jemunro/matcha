@@ -48,6 +48,7 @@ proc matchUsage(code: int = 1) =
   f.writeLine "Options:"
   f.writeLine "  --min-overlap FLOAT             minimum reciprocal overlap (0.0-1.0)"
   f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
+  f.writeLine "  --bnd-slop INT                  max breakend offset for BND matches (default: 100)"
   f.writeLine "  --self                          match a single input against itself"
   f.writeLine "                                  (each pair emitted once; no self-self)"
   f.writeLine "  --threads INT                   number of worker threads (default: 1)"
@@ -56,14 +57,17 @@ proc matchUsage(code: int = 1) =
   f.writeLine "  -v, --verbose                   verbose logging to stderr"
   f.writeLine "  -h, --help                      show this help"
   f.writeLine ""
-  f.writeLine "At least one of --min-overlap or --min-jaccard is required."
+  f.writeLine "Exactly one of --min-overlap or --min-jaccard is required."
+  f.writeLine "BND rows are matched by --bnd-slop only; the chosen metric drives interval rows."
   f.writeLine ""
-  f.writeLine "Output is tab-separated with a #-prefixed header line. Columns:"
-  f.writeLine "  #CHROM  POS_A  END_A  ID_A  POS_B  END_B  ID_B  SVTYPE  OVERLAP  JACCARD"
+  f.writeLine "Output is tab-separated. A ##matcha_metric=<overlap|jaccard> preamble"
+  f.writeLine "precedes the #-prefixed header line. Columns:"
+  f.writeLine "  #CHROM  POS_A  END_A  ID_A  POS_B  END_B  ID_B  SVTYPE  SIMILARITY"
+  f.writeLine "BND rows emit '.' for END_A / END_B."
   quit(code)
 
 proc runMatch(rawArgs: seq[string]) =
-  var cfg = MatchConfig(nThreads: 1)
+  var cfg = MatchConfig(nThreads: 1, bndSlop: 100)
   var positionals: seq[string]
   var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
   while true:
@@ -86,6 +90,15 @@ proc runMatch(rawArgs: seq[string]) =
           stderr.writeLine "error: --min-jaccard must be a float, got: " & v
           quit(1)
         cfg.minJaccardSet = true
+      of "bnd-slop":
+        let v = nextVal(p, "bnd-slop")
+        try: cfg.bndSlop = parseInt(v)
+        except ValueError:
+          stderr.writeLine "error: --bnd-slop must be an integer, got: " & v
+          quit(1)
+        if cfg.bndSlop <= 0:
+          stderr.writeLine "error: --bnd-slop must be > 0"
+          quit(1)
       of "threads":
         let v = nextVal(p, "threads")
         try: cfg.nThreads = parseInt(v)
@@ -111,8 +124,11 @@ proc runMatch(rawArgs: seq[string]) =
     of cmdArgument:
       positionals.add(p.key)
 
-  if not cfg.minOverlapSet and not cfg.minJaccardSet:
-    stderr.writeLine "error: at least one of --min-overlap or --min-jaccard is required"
+  if cfg.minOverlapSet == cfg.minJaccardSet:
+    if cfg.minOverlapSet:
+      stderr.writeLine "error: --min-overlap and --min-jaccard are mutually exclusive"
+    else:
+      stderr.writeLine "error: exactly one of --min-overlap or --min-jaccard is required"
     matchUsage()
   let expected = if cfg.selfMode: 1 else: 2
   if positionals.len != expected:
@@ -150,14 +166,14 @@ proc annoUsage(code: int = 1) =
   f.writeLine "  -o PATH                         output (.vcf | .vcf.gz | .bcf); default stdout VCF"
   f.writeLine "  --min-overlap FLOAT             minimum reciprocal overlap (0.0-1.0)"
   f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
-  f.writeLine "  --best-metric jaccard|overlap   metric used by best() (default: jaccard)"
+  f.writeLine "  --bnd-slop INT                  max breakend offset for BND matches (default: 100)"
   f.writeLine "  --overwrite                     replace OUTFIELDs already in input header"
   f.writeLine "  --threads INT                   number of worker threads (default: 1)"
   f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
   f.writeLine "  -v, --verbose                   verbose logging to stderr"
   f.writeLine "  -h, --help                      show full help (functions, MATCHA_* variables)"
   f.writeLine ""
-  f.writeLine "At least one of --min-overlap or --min-jaccard is required."
+  f.writeLine "Exactly one of --min-overlap or --min-jaccard is required."
   f.writeLine ""
   f.writeLine "Example:"
   f.writeLine "  matcha anno --min-overlap 0.7 \\"
@@ -189,14 +205,14 @@ proc annoHelp() =
   f.writeLine "                                  Default: uncompressed VCF to stdout."
   f.writeLine "  --min-overlap FLOAT             minimum reciprocal overlap (0.0-1.0)"
   f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
-  f.writeLine "  --best-metric jaccard|overlap   metric used by best() (default: jaccard)"
+  f.writeLine "  --bnd-slop INT                  max breakend offset for BND matches (default: 100)"
   f.writeLine "  --overwrite                     replace OUTFIELDs that already exist in input header"
   f.writeLine "  --threads INT                   number of worker threads (default: 1)"
   f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
   f.writeLine "  -v, --verbose                   verbose logging to stderr"
   f.writeLine "  -h, --help                      show this help"
   f.writeLine ""
-  f.writeLine "At least one of --min-overlap or --min-jaccard is required."
+  f.writeLine "Exactly one of --min-overlap or --min-jaccard is required."
   f.writeLine ""
   f.writeLine "Annotation expressions"
   f.writeLine "  Form:  -a OUTFIELD=FUNC(SRCFIELD)"
@@ -213,7 +229,7 @@ proc annoHelp() =
   f.writeLine "    -a CALLERS=unique(CALLERS)        deduped flattened list of caller IDs"
   f.writeLine "    -a TOP_CALLER=best(CALLER)        CALLER on the best-scoring match"
   f.writeLine "    -a N_MATCH=first(MATCHA_COUNT)    number of database matches (0 if none)"
-  f.writeLine "    -a TOP_JAC=max(MATCHA_JACCARD)    highest jaccard across matches"
+  f.writeLine "    -a TOP_SIM=max(MATCHA_SIMILARITY) highest similarity across matches"
   f.writeLine ""
   f.writeLine "Aggregation functions"
   f.writeLine "  max | min | mean    numeric.  Pool all values across matches, then aggregate."
@@ -221,8 +237,7 @@ proc annoHelp() =
   f.writeLine "  first | last        any.       Value from the earliest / latest match by"
   f.writeLine "                                 database-record position."
   f.writeLine "  best                any.       Value from the match with the highest"
-  f.writeLine "                                 --best-metric score; ties broken by earliest"
-  f.writeLine "                                 position."
+  f.writeLine "                                 SIMILARITY; ties broken by earliest position."
   f.writeLine "  all                 any.       All values, comma-separated. Output Number=."
   f.writeLine "  unique              any.       Deduplicated values, comma-separated."
   f.writeLine "                                 Output Number=."
@@ -237,15 +252,17 @@ proc annoHelp() =
   f.writeLine "                      input record. On unmatched records, expressions wrapping"
   f.writeLine "                      MATCHA_COUNT emit 0; other expressions leave their"
   f.writeLine "                      OUTFIELD absent."
-  f.writeLine "    MATCHA_JACCARD    Float (vector).  Per-match jaccard scores."
-  f.writeLine "    MATCHA_OVERLAP    Float (vector).  Per-match reciprocal-overlap scores."
+  f.writeLine "    MATCHA_SIMILARITY Float (vector).  Per-match similarity. For interval"
+  f.writeLine "                      matches this is the active metric (--min-overlap or"
+  f.writeLine "                      --min-jaccard). For BND matches this is the slop-based"
+  f.writeLine "                      proximity score (2*slop - |dPOS| - |dPOS2|) / (2*slop)."
   f.writeLine ""
-  f.writeLine "  Note: best(MATCHA_JACCARD) returns the jaccard of the best-by-metric match,"
-  f.writeLine "  which equals max(MATCHA_JACCARD) only when --best-metric jaccard (the default)."
+  f.writeLine "  Note: best(MATCHA_SIMILARITY) and max(MATCHA_SIMILARITY) coincide, since"
+  f.writeLine "  best() now ranks by similarity directly."
   quit(0)
 
 proc runAnnoCli(rawArgs: seq[string]) =
-  var cfg = AnnoConfig(nThreads: 1, bestMetric: bmJaccard)
+  var cfg = AnnoConfig(nThreads: 1, bndSlop: 100)
   var positionals: seq[string]
   var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
   while true:
@@ -277,15 +294,15 @@ proc runAnnoCli(rawArgs: seq[string]) =
           stderr.writeLine "error: --min-jaccard must be a float, got: " & v
           quit(1)
         cfg.minJaccardSet = true
-      of "best-metric":
-        let v = nextVal(p, "best-metric").toLowerAscii
-        cfg.bestMetric =
-          case v
-          of "jaccard": bmJaccard
-          of "overlap": bmOverlap
-          else:
-            stderr.writeLine "error: --best-metric must be 'jaccard' or 'overlap', got: " & v
-            quit(1)
+      of "bnd-slop":
+        let v = nextVal(p, "bnd-slop")
+        try: cfg.bndSlop = parseInt(v)
+        except ValueError:
+          stderr.writeLine "error: --bnd-slop must be an integer, got: " & v
+          quit(1)
+        if cfg.bndSlop <= 0:
+          stderr.writeLine "error: --bnd-slop must be > 0"
+          quit(1)
       of "overwrite":
         cfg.overwrite = true
       of "threads":
@@ -309,8 +326,11 @@ proc runAnnoCli(rawArgs: seq[string]) =
     of cmdArgument:
       positionals.add(p.key)
 
-  if not cfg.minOverlapSet and not cfg.minJaccardSet:
-    stderr.writeLine "error: at least one of --min-overlap or --min-jaccard is required"
+  if cfg.minOverlapSet == cfg.minJaccardSet:
+    if cfg.minOverlapSet:
+      stderr.writeLine "error: --min-overlap and --min-jaccard are mutually exclusive"
+    else:
+      stderr.writeLine "error: exactly one of --min-overlap or --min-jaccard is required"
     annoUsage()
   if positionals.len != 2:
     stderr.writeLine "error: expected 2 input files (input database), got " &

@@ -43,16 +43,24 @@ timed("M02", "no threshold flag: exits non-zero, mentions flag names"):
   doAssert "min-overlap" in outp or "min-jaccard" in outp,
     "error should mention threshold flags, got: " & outp
 
-# M03 — TC01 exact match: OVERLAP=1.0, JACCARD=1.0
-timed("M03", "exact match DEL_A_01/DEL_B_01: both metrics = 1.0"):
+# M02b — passing BOTH --min-overlap and --min-jaccard is an error (xor).
+timed("M02b", "both thresholds: mutually exclusive error"):
+  let (outp, code) = runMerged(
+    "match --min-overlap 0.5 --min-jaccard 0.5 " & FixtureA & " " & FixtureB)
+  doAssert code != 0, "passing both should fail"
+  doAssert "mutually exclusive" in outp.toLowerAscii or
+           "exactly one" in outp.toLowerAscii,
+    "error should mention mutual exclusion, got: " & outp
+
+# M03 — TC01 exact match: SIMILARITY=1.0
+timed("M03", "exact match DEL_A_01/DEL_B_01: similarity = 1.0"):
   let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
   doAssert code == 0, "exit " & $code & ": " & outp
   let rows = parseTsv(outp)
   var found = false
   for row in rows:
-    if row.len >= 10 and row[3] == "DEL_A_01" and row[6] == "DEL_B_01":
-      doAssert abs(parseFloat(row[8]) - 1.0) < 1e-5, "OVERLAP != 1.0: " & row[8]
-      doAssert abs(parseFloat(row[9]) - 1.0) < 1e-5, "JACCARD != 1.0: " & row[9]
+    if row.len >= 9 and row[3] == "DEL_A_01" and row[6] == "DEL_B_01":
+      doAssert abs(parseFloat(row[8]) - 1.0) < 1e-5, "SIMILARITY != 1.0: " & row[8]
       found = true
   doAssert found, "DEL_A_01/DEL_B_01 pair not found in output"
 
@@ -63,7 +71,7 @@ timed("M04", "partial overlap above threshold: DEL_A_02 emitted"):
   let rows = parseTsv(outp)
   var found = false
   for row in rows:
-    if row.len >= 10 and row[3] == "DEL_A_02":
+    if row.len >= 9 and row[3] == "DEL_A_02":
       found = true
   doAssert found, "DEL_A_02 partial overlap should be emitted at threshold 0.5"
 
@@ -73,7 +81,7 @@ timed("M05", "below-threshold overlap: DEL_A_03/DEL_B_03 not emitted"):
   doAssert code == 0
   let rows = parseTsv(outp)
   for row in rows:
-    if row.len >= 10:
+    if row.len >= 9:
       doAssert not (row[3] == "DEL_A_03" and row[6] == "DEL_B_03"),
         "DEL_A_03/DEL_B_03 overlap=0.4 should be filtered at threshold 0.5"
 
@@ -83,7 +91,7 @@ timed("M06", "SVTYPE mismatch DEL_A_05/DUP_B_05: no match emitted"):
   doAssert code == 0
   let rows = parseTsv(outp)
   for row in rows:
-    if row.len >= 10:
+    if row.len >= 9:
       doAssert not (row[3] == "DEL_A_05" and row[6] == "DUP_B_05"),
         "DEL/DUP SVTYPE mismatch should not match"
 
@@ -94,7 +102,7 @@ timed("M07", "multiple matches: 2 B records match DEL_A_06"):
   let rows = parseTsv(outp)
   var matchCount = 0
   for row in rows:
-    if row.len >= 10 and row[3] == "DEL_A_06":
+    if row.len >= 9 and row[3] == "DEL_A_06":
       inc matchCount
   doAssert matchCount == 2, "expected 2 matches for DEL_A_06, got " & $matchCount
 
@@ -104,7 +112,7 @@ timed("M08", "unmatched A record: DEL_A_07 not in output"):
   doAssert code == 0
   let rows = parseTsv(outp)
   for row in rows:
-    if row.len >= 10:
+    if row.len >= 9:
       doAssert row[3] != "DEL_A_07", "DEL_A_07 should have no match in B"
 
 # M09 — TC09 multi-chromosome: chr2 and chrX rows present
@@ -115,7 +123,7 @@ timed("M09", "multi-chromosome: chr2 and chrX results present"):
   var hasChr2 = false
   var hasChrX = false
   for row in rows:
-    if row.len >= 10:
+    if row.len >= 9:
       if row[0] == "chr2": hasChr2 = true
       if row[0] == "chrX": hasChrX = true
   doAssert hasChr2, "chr2 results missing"
@@ -127,24 +135,28 @@ timed("M10", "--min-jaccard 0.5 alone: DEL_A_08 excluded (jaccard=0.2)"):
   doAssert code == 0
   let rows = parseTsv(outp)
   for row in rows:
-    if row.len >= 10:
+    if row.len >= 9:
       doAssert row[3] != "DEL_A_08",
         "DEL_A_08 has jaccard=0.2 and should be excluded at --min-jaccard 0.5"
 
-# M11 — output has exactly 10 tab-separated columns, floats in [0,1]
-timed("M11", "output: 10 columns, valid floats in [0,1]"):
+# M11 — output has 9 tab-separated columns, similarity in [0,1].
+# Interval rows have numeric END_A/END_B; BND rows emit ".".
+timed("M11", "output: 9 columns, similarity in [0,1]"):
   let (outp, code) = run("match --min-overlap 0.9 " & FixtureA & " " & FixtureB)
   doAssert code == 0
   let rows = parseTsv(outp)
   doAssert rows.len > 0, "expected output rows"
   for row in rows:
-    doAssert row.len == 10, "expected 10 columns, got " & $row.len & ": " & row.join("\t")
+    doAssert row.len == 9, "expected 9 columns, got " & $row.len & ": " & row.join("\t")
     doAssert row[1].parseInt > 0, "POS_A must be positive integer"
     doAssert row[4].parseInt > 0, "POS_B must be positive integer"
-    let recip = parseFloat(row[8])
-    let jac   = parseFloat(row[9])
-    doAssert recip >= 0.0 and recip <= 1.0, "OVERLAP out of [0,1]: " & $recip
-    doAssert jac   >= 0.0 and jac   <= 1.0, "JACCARD out of [0,1]: " & $jac
+    let sim = parseFloat(row[8])
+    doAssert sim >= 0.0 and sim <= 1.0, "SIMILARITY out of [0,1]: " & $sim
+    if row[7] == "BND":
+      doAssert row[2] == "." and row[5] == ".", "BND END cols should be '.'"
+    else:
+      doAssert row[2].parseInt > 0 and row[5].parseInt > 0,
+        "interval END cols should be positive"
 
 # M12 — --output writes to file
 timed("M12", "--output: results written to file"):
@@ -167,16 +179,28 @@ timed("M13", "--threads 2 produces same output as --threads 1"):
   let sorted2 = outp2.strip.splitLines.sorted.join("\n")
   doAssert sorted1 == sorted2, "multi-thread output differs from single-thread"
 
-# M14 — output begins with a #-prefixed header line containing OVERLAP
-timed("M14", "output: first line is #-header with OVERLAP and JACCARD columns"):
+# M14 — output begins with ##matcha_metric= line, then a #-prefixed header
+# with the SIMILARITY column.
+timed("M14", "output: ##matcha_metric preamble + SIMILARITY header"):
   let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
   doAssert code == 0, "exit " & $code & ": " & outp
   let lines = outp.strip.splitLines
-  doAssert lines.len > 0, "no output lines"
-  let header = lines[0]
-  doAssert header.startsWith("#"), "first line should start with '#': " & header
-  doAssert "OVERLAP" in header, "header missing OVERLAP column: " & header
-  doAssert "JACCARD" in header, "header missing JACCARD column: " & header
+  doAssert lines.len > 1, "expected preamble + header + rows"
+  doAssert lines[0] == "##matcha_metric=overlap",
+    "first line should be ##matcha_metric=overlap, got: " & lines[0]
+  let header = lines[1]
+  doAssert header.startsWith("#CHROM"), "second line should be the #CHROM header"
+  doAssert "SIMILARITY" in header, "header missing SIMILARITY column: " & header
+  doAssert "OVERLAP" notin header, "OVERLAP column should be gone"
+  doAssert "JACCARD" notin header, "JACCARD column should be gone"
+
+# M14b — --min-jaccard switches the metric line accordingly.
+timed("M14b", "##matcha_metric=jaccard when --min-jaccard is active"):
+  let (outp, code) = run("match --min-jaccard 0.5 " & FixtureA & " " & FixtureB)
+  doAssert code == 0, "exit " & $code & ": " & outp
+  let lines = outp.strip.splitLines
+  doAssert lines[0] == "##matcha_metric=jaccard",
+    "got: " & lines[0]
 
 # M15 — .bcf inputs produce identical output to .vcf.gz inputs
 timed("M15", ".bcf inputs: same output as .vcf.gz inputs"):
@@ -265,3 +289,115 @@ timed("S07", "--self: .bcf input matches .vcf.gz input"):
   let vs = vOut.strip.splitLines.sorted.join("\n")
   let bs = bOut.strip.splitLines.sorted.join("\n")
   doAssert vs == bs, "BCF self-mode output differs from VCF"
+
+# ---------------------------------------------------------------------------
+# BND tests (B-prefix)
+# ---------------------------------------------------------------------------
+
+# B01 — BND_A_11 / BND_B_11 identical intra-chrom mate → sim=1.0.
+timed("B01", "BND identical mate pair: similarity=1.0"):
+  let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+  doAssert code == 0, "exit " & $code & ": " & outp
+  var found = false
+  for row in parseTsv(outp):
+    if row.len >= 9 and row[3] == "BND_A_11" and row[6] == "BND_B_11":
+      doAssert row[7] == "BND", "expected SVTYPE=BND, got " & row[7]
+      doAssert row[2] == "." and row[5] == ".", "BND END_A/END_B must be '.'"
+      doAssert abs(parseFloat(row[8]) - 1.0) < 1e-5,
+        "BND_A_11/B_11 sim != 1.0: " & row[8]
+      found = true
+  doAssert found, "BND_A_11/BND_B_11 missing from output"
+
+# B02 — BND_A_20 / BND_B_20 inter-chrom identical: sim=1.0.
+timed("B02", "BND inter-chrom identical: sim=1.0"):
+  let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+  doAssert code == 0
+  var found = false
+  for row in parseTsv(outp):
+    if row.len >= 9 and row[3] == "BND_A_20" and row[6] == "BND_B_20":
+      doAssert abs(parseFloat(row[8]) - 1.0) < 1e-5
+      found = true
+  doAssert found, "BND_A_20/BND_B_20 missing"
+
+# B03 — BND_A_21 / BND_B_21 offsets: sim=0.6 default slop.
+timed("B03", "BND offset 50/30: sim=0.60 at default slop 100"):
+  let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+  doAssert code == 0
+  var found = false
+  for row in parseTsv(outp):
+    if row.len >= 9 and row[3] == "BND_A_21" and row[6] == "BND_B_21":
+      doAssert abs(parseFloat(row[8]) - 0.6) < 1e-5,
+        "BND_A_21/B_21 sim != 0.6: " & row[8]
+      found = true
+  doAssert found, "BND_A_21/BND_B_21 missing"
+
+# B04 — Strict slop rejects BND_A_21 / BND_B_21 (dPOS=50 >= slop=20).
+timed("B04", "--bnd-slop 20 rejects offset-50 pair"):
+  let (outp, code) = run("match --min-overlap 0.5 --bnd-slop 20 " &
+                         FixtureA & " " & FixtureB)
+  doAssert code == 0
+  for row in parseTsv(outp):
+    if row.len >= 9:
+      doAssert not (row[3] == "BND_A_21" and row[6] == "BND_B_21"),
+        "BND_A_21/B_21 should be rejected at slop=20"
+  # But BND_A_20/BND_B_20 (offsets 0/0) should still match.
+  var foundExact = false
+  for row in parseTsv(outp):
+    if row.len >= 9 and row[3] == "BND_A_20" and row[6] == "BND_B_20":
+      foundExact = true
+  doAssert foundExact, "exact BND match should survive at any positive slop"
+
+# B05 — CHR2 mismatch (BND_A_23 chrX vs BND_B_23 chr2): no row.
+timed("B05", "CHR2 mismatch: BND_A_23 / BND_B_23 not paired"):
+  let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+  doAssert code == 0
+  for row in parseTsv(outp):
+    if row.len >= 9:
+      doAssert not (row[3] == "BND_A_23" and row[6] == "BND_B_23"),
+        "CHR2-mismatched pair should not be emitted"
+
+# B06 — BND_A_22 has no B mate at chr1:80000 → absent.
+timed("B06", "unmatched BND: BND_A_22 not in output"):
+  let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+  doAssert code == 0
+  for row in parseTsv(outp):
+    if row.len >= 9:
+      doAssert row[3] != "BND_A_22", "BND_A_22 should be unmatched"
+
+# B07 — Malformed BND ALT and TRA records are dropped at preproc
+#       (warn-skip on stderr); the merged stderr should mention them.
+timed("B07", "preproc warn-skips malformed BND and TRA on stderr"):
+  let (outp, _) = runMerged(
+    "match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+  doAssert "malformed_bnd" in outp or "BND_A_24" in outp,
+    "expected warn-skip for malformed BND_A_24, got stderr:\n" & outp
+  doAssert "unsupported_tra" in outp or "TRA_A_25" in outp,
+    "expected warn-skip for TRA_A_25, got stderr:\n" & outp
+
+# B08 — --self pairs BND_A_27a / BND_A_27b once (sim=0.80, aOff<bOff).
+timed("B08", "--self: BND mate pair appears exactly once"):
+  let (outp, code) = run("match --self --min-overlap 0.5 " & FixtureA)
+  doAssert code == 0, "exit " & $code & ": " & outp
+  var count = 0
+  var simVal = 0.0
+  for row in parseTsv(outp):
+    if row.len >= 9 and
+       ((row[3] == "BND_A_27a" and row[6] == "BND_A_27b") or
+        (row[3] == "BND_A_27b" and row[6] == "BND_A_27a")):
+      inc count
+      simVal = parseFloat(row[8])
+  doAssert count == 1, "expected 1 row for BND_A_27a/27b, got " & $count
+  doAssert abs(simVal - 0.8) < 1e-5, "self-pair sim != 0.8: " & $simVal
+
+# B09 — Mixed DEL+BND callset: both DEL and BND rows appear in one run.
+timed("B09", "mixed DEL+BND run produces both kinds of rows"):
+  let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+  doAssert code == 0
+  var sawDel = false
+  var sawBnd = false
+  for row in parseTsv(outp):
+    if row.len >= 9:
+      if row[7] == "DEL": sawDel = true
+      if row[7] == "BND": sawBnd = true
+  doAssert sawDel and sawBnd,
+    "expected both DEL and BND rows; saw DEL=" & $sawDel & " BND=" & $sawBnd

@@ -12,10 +12,12 @@
 ##   * Write to a per-(SVTYPE, bin) BCF spanning all chroms; CSI-indexed.
 ##
 ## Skip categories (counted; final summary always emitted):
-##   skUnsupportedSvtype  - BND/INS/TRA (count only, awaiting later milestone)
-##   skUnresolvableSvtype - neither INFO/SVTYPE nor symbolic ALT
+##   skUnsupportedSvtype  - INS only (silent count; out of scope)
+##   skUnsupportedTra     - TRA (warn-emitting; not supported)
+##   skUnresolvableSvtype - neither INFO/SVTYPE nor recognizable ALT
 ##   skUnresolvableEnd    - missing both INFO/END and INFO/SVLEN
 ##   skEndLePos           - resolved END <= POS
+##   skMalformedBnd       - BND ALT could not be parsed for mate position
 ##   skUnknownContig      - BCF_ERR_CTG_UNDEF on read
 ##
 ## Per-record warnings are throttled at MATCHA_WARN_CAP (default 5) per reason.
@@ -56,9 +58,11 @@ type
 
   SkipReason = enum
     skUnsupportedSvtype
+    skUnsupportedTra
     skUnresolvableSvtype
     skUnresolvableEnd
     skEndLePos
+    skMalformedBnd
     skUnknownContig
 
   WarnState = object
@@ -89,9 +93,11 @@ const SvInfoDefs = [
 proc reasonStr(r: SkipReason): string =
   case r
   of skUnsupportedSvtype:   "unsupported_svtype"
+  of skUnsupportedTra:      "unsupported_tra"
   of skUnresolvableSvtype:  "unresolvable_svtype"
   of skUnresolvableEnd:     "unresolvable_end"
   of skEndLePos:            "end_le_pos"
+  of skMalformedBnd:        "malformed_bnd"
   of skUnknownContig:       "unknown_contig"
 
 proc warnSkip(reason: SkipReason, ws: var WarnState,
@@ -116,11 +122,49 @@ proc symbolicAltSvtype(alt: string): SvType =
     return svUNKNOWN
   parseSvType(alt[1 .. ^2])
 
+proc isBndAlt*(alt: string): bool =
+  ## Detect VCF breakend ALT notation (`t[p[`, `t]p]`, `[p[t`, `]p]t`).
+  ## Distinct from symbolic `<BND>` (handled by symbolicAltSvtype).
+  if alt.len < 4 or alt[0] == '<': return false
+  for c in alt:
+    if c == '[' or c == ']': return true
+  false
+
+proc parseBndAlt*(alt: string): tuple[ok: bool; chr2: string; pos2: int64] =
+  ## Extract (chr2, pos2) from a breakend ALT. Returns ok=false on any
+  ## malformed input (missing bracket pair, missing colon, non-numeric pos,
+  ## non-positive pos). Strand is intentionally ignored.
+  if alt.len < 4: return
+  var bracket: char
+  var bStart = -1
+  for i, c in alt:
+    if c == '[' or c == ']':
+      bracket = c; bStart = i; break
+  if bStart < 0: return
+  var bEnd = -1
+  for i in bStart + 1 ..< alt.len:
+    if alt[i] == bracket:
+      bEnd = i; break
+  if bEnd < 0 or bEnd <= bStart + 1: return
+  let inner = alt[bStart + 1 ..< bEnd]
+  let colon = inner.rfind(':')
+  if colon < 1 or colon >= inner.len - 1: return
+  let chrom = inner[0 ..< colon]
+  let posStr = inner[colon + 1 .. ^1]
+  if chrom.len == 0: return
+  var pos: int64
+  try:
+    pos = parseBiggestInt(posStr).int64
+  except ValueError:
+    return
+  if pos <= 0: return
+  (ok: true, chr2: chrom, pos2: pos)
+
 proc resolveSvtype(v: Variant, infoBuf: var string): SvType =
-  ## Resolve SVTYPE. Symbolic ALT (when present and parseable as a known
-  ## SvType) takes priority; INFO/SVTYPE is the fallback. Returns svUNKNOWN
-  ## if neither resolves. The "ALT wins" precedence matches the contract
-  ## documented in CLAUDE.md.
+  ## Resolve SVTYPE. ALT wins on conflict. Recognized ALT forms:
+  ##   - symbolic `<DEL>` / `<DUP>` / `<INV>` / `<INS>` / `<TRA>` / `<BND>`
+  ##   - bracket-form breakend (any non-symbolic ALT containing `[` or `]`)
+  ## INFO/SVTYPE is the fallback. Returns svUNKNOWN if neither resolves.
   let infoOk = v.info().get("SVTYPE", infoBuf) == Status.OK and infoBuf.len > 0
   let infoSv =
     if infoOk: parseSvType($cast[cstring](addr infoBuf[0]))
@@ -129,6 +173,8 @@ proc resolveSvtype(v: Variant, infoBuf: var string): SvType =
   let alts = v.ALT
   if alts.len > 0:
     altSv = symbolicAltSvtype(alts[0])
+    if altSv == svUNKNOWN and isBndAlt(alts[0]):
+      altSv = svBND
   if altSv != svUNKNOWN:
     return altSv
   return infoSv
@@ -245,36 +291,67 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
       let svt = resolveSvtype(v, svtypeStr)
       if svt == svUNKNOWN:
         warnSkip(skUnresolvableSvtype, ws, $v.CHROM, v.POS, $v.ID,
-                 "no INFO/SVTYPE and no symbolic ALT")
+                 "no INFO/SVTYPE and no recognizable ALT")
+        break recordBody
+      if svt == svTRA:
+        warnSkip(skUnsupportedTra, ws, $v.CHROM, v.POS, $v.ID,
+                 "TRA records are not supported (use BND notation)")
         break recordBody
       if svt notin SupportedSvTypes:
-        inc ws.skipped[skUnsupportedSvtype]
+        inc ws.skipped[skUnsupportedSvtype]   # INS lands here
         break recordBody
 
-      let (eOk, endPos, endFromInfo) = resolveEnd(v, endData, svlenData)
-      if not eOk:
-        warnSkip(skUnresolvableEnd, ws, $v.CHROM, v.POS, $v.ID,
-                 "missing both INFO/END and INFO/SVLEN")
-        break recordBody
+      # Resolve END/SVLEN and assign a size bin. BND records take a
+      # dedicated branch: they are point events, so size has no meaning —
+      # END is set to POS+1 (CSI requires endPos > pos), SVLEN to 0, and
+      # they all land in a single (svBND, bin 0) temp BCF. CHR2/POS2 are
+      # parsed from the breakend ALT and authoritatively rewritten below.
+      var endPos: int64
+      var svlen: int64
+      var binIdx: int
+      var bndChr2: string
+      var bndPos2: int64
+      if svt == svBND:
+        let alts = v.ALT
+        let altStr = if alts.len > 0: alts[0] else: ""
+        let bnd = parseBndAlt(altStr)
+        if not bnd.ok:
+          warnSkip(skMalformedBnd, ws, $v.CHROM, v.POS, $v.ID,
+                   "could not parse breakend ALT: '" & altStr & "'")
+          break recordBody
+        bndChr2 = bnd.chr2
+        bndPos2 = bnd.pos2
+        endPos = v.POS + 1
+        svlen = 0
+        binIdx = 0
+      else:
+        let (eOk, ep, endFromInfo) = resolveEnd(v, endData, svlenData)
+        if not eOk:
+          warnSkip(skUnresolvableEnd, ws, $v.CHROM, v.POS, $v.ID,
+                   "missing both INFO/END and INFO/SVLEN")
+          break recordBody
 
-      if endPos <= v.POS:
-        warnSkip(skEndLePos, ws, $v.CHROM, v.POS, $v.ID,
-                 "END=" & $endPos & " <= POS=" & $v.POS)
-        break recordBody
+        if ep <= v.POS:
+          warnSkip(skEndLePos, ws, $v.CHROM, v.POS, $v.ID,
+                   "END=" & $ep & " <= POS=" & $v.POS)
+          break recordBody
 
-      let (sOk, svlenInit, svlenFromInfo) = resolveSvlen(v, endPos, svlenData)
-      if not sOk:
-        warnSkip(skUnresolvableEnd, ws, $v.CHROM, v.POS, $v.ID,
-                 "could not resolve SVLEN")
-        break recordBody
+        let (sOk, svlenInit, svlenFromInfo) = resolveSvlen(v, ep, svlenData)
+        if not sOk:
+          warnSkip(skUnresolvableEnd, ws, $v.CHROM, v.POS, $v.ID,
+                   "could not resolve SVLEN")
+          break recordBody
 
-      let endDerived = endPos - v.POS
-      var svlen = svlenInit
-      if endFromInfo and svlenFromInfo and
-         inconsistencyExceedsTenPct(svlen, endDerived):
-        warnInconsistency(ws, $v.CHROM, v.POS, $v.ID,
-                          "INFO/SVLEN=" & $svlen & " vs END-POS=" & $endDerived)
-        svlen = endDerived
+        let endDerived = ep - v.POS
+        var sv = svlenInit
+        if endFromInfo and svlenFromInfo and
+           inconsistencyExceedsTenPct(sv, endDerived):
+          warnInconsistency(ws, $v.CHROM, v.POS, $v.ID,
+                            "INFO/SVLEN=" & $sv & " vs END-POS=" & $endDerived)
+          sv = endDerived
+        endPos = ep
+        svlen = sv
+        binIdx = binIndexFor(svlen)
 
       # Synthesize ID if missing
       let curId = $v.ID
@@ -299,13 +376,19 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
       var endI32 = endPos.int32
       discard v.info.set("END", endI32)
 
+      if svt == svBND:
+        # ALT parse wins over any stale INFO/CHR2 or INFO/POS2 in the input.
+        var chr2Str = bndChr2
+        discard v.info.set("CHR2", chr2Str)
+        var pos2I32 = bndPos2.int32
+        discard v.info.set("POS2", pos2I32)
+
       # Encode the source-file offset as INFO/MATCHA_BOFF (Number=2, Integer)
       boffPair[0] = cast[int32]((recordOffset shr 32) and 0xFFFFFFFF'i64)
       boffPair[1] = cast[int32](recordOffset and 0xFFFFFFFF'i64)
       discard v.info.set("MATCHA_BOFF", boffPair)
 
-      # Compute bin and lazily open per-(svtype, bin) writer.
-      let binIdx = binIndexFor(svlen)
+      # Lazily open per-(svtype, bin) writer.
       let key: SvtypeBin = (svt, binIdx)
       if key notin writers:
         let path = tempBcfPath(tmpDir, prefix, $svt, binIdx)
