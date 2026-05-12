@@ -260,9 +260,11 @@ RECORDS_DB = [
 def records_to_vcf(records, header=HEADER):
     lines = [header]
     for r in records:
+        qual   = r.get("qual", ".")
+        filt   = r.get("filter", "PASS")
         lines.append(
             f"{r['chrom']}\t{r['pos']}\t{r['id']}\t{r['ref']}\t{r['alt']}"
-            f"\t.\tPASS\t{r['info']}"
+            f"\t{qual}\t{filt}\t{r['info']}"
         )
     return "\n".join(lines) + "\n"
 
@@ -438,6 +440,64 @@ def write_expected_tsv(rows, path):
             f.write("\t".join(row) + "\n")
 
 
+# ---------------------------------------------------------------------------
+# Collapse fixtures
+# ---------------------------------------------------------------------------
+
+COLLAPSE_HEADER = """\
+##fileformat=VCFv4.2
+##FILTER=<ID=PASS,Description="All filters passed">
+##FILTER=<ID=LowQual,Description="Low quality call">
+##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">
+##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="Difference in length between REF and ALT alleles">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant">
+##contig=<ID=chr1,length=248956422>
+##contig=<ID=chr2,length=242193529>
+##contig=<ID=chrX,length=156040895>
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"""
+
+def col(chrom, pos, rid, svtype, svlen, end, qual=".", filt="PASS"):
+    """Collapse fixture record."""
+    sign = -1 if svtype == "DEL" else 1
+    alt  = f"<{svtype}>"
+    info = f"SVTYPE={svtype};SVLEN={sign * abs(svlen)};END={end}"
+    return {"chrom": chrom, "pos": pos, "id": rid, "ref": "N", "alt": alt,
+            "info": info, "qual": str(qual), "filter": filt,
+            "svtype": svtype, "svlen": svlen, "end": end}
+
+
+# Delly: some PASS, one LowQual, one singleton, one DUP
+RECORDS_COLLAPSE_DELLY = [
+    col("chr1", 1000,  "DEL_D_01", "DEL", 1000, 2000,  qual=50,  filt="PASS"),
+    col("chr1", 3000,  "DEL_D_02", "DEL", 1000, 4000,  qual=30,  filt="LowQual"),
+    col("chr1", 5000,  "DEL_D_03", "DEL", 1000, 6000,  qual=40,  filt="PASS"),
+    col("chr1", 9000,  "DUP_D_01", "DUP", 1000, 10000, qual=50,  filt="PASS"),
+]
+
+# Manta: all PASS, one singleton, same positions as Delly (some exact, some shifted)
+RECORDS_COLLAPSE_MANTA = [
+    col("chr1", 1000,  "DEL_M_01", "DEL", 1000, 2000,  qual=80,  filt="PASS"),
+    col("chr1", 3100,  "DEL_M_02", "DEL", 1000, 4100,  qual=80,  filt="PASS"),
+    col("chr1", 7000,  "DEL_M_03", "DEL", 1000, 8000,  qual=80,  filt="PASS"),
+    col("chr1", 9000,  "DUP_M_01", "DUP", 1000, 10000, qual=80,  filt="PASS"),
+]
+
+# Multiallelic fixture: one record with two ALTs to test the error path.
+MULTIALLELIC_HEADER = """\
+##fileformat=VCFv4.2
+##FILTER=<ID=PASS,Description="All filters passed">
+##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position">
+##contig=<ID=chr1,length=248956422>
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"""
+
+RECORDS_MULTIALLELIC = [
+    {"chrom": "chr1", "pos": 1000, "id": "MULTI_01",
+     "ref": "N", "alt": "<DEL>,<DUP>", "qual": ".", "filter": "PASS",
+     "info": "SVTYPE=DEL;END=2000"},
+]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default="tests/fixtures")
@@ -494,6 +554,29 @@ def main():
     self_path = os.path.join(out, "expected", "expected_self.tsv")
     write_expected_tsv(self_rows, self_path)
     print(f"  {self_path}: {len(self_rows)} rows (--self, overlap>=0.5 + BND slop=100)")
+
+    print("Writing collapse_delly.vcf.gz ...")
+    write_vcf_gz(RECORDS_COLLAPSE_DELLY,
+                 os.path.join(out, "collapse_delly.vcf.gz"),
+                 header=COLLAPSE_HEADER)
+    print("Writing collapse_manta.vcf.gz ...")
+    write_vcf_gz(RECORDS_COLLAPSE_MANTA,
+                 os.path.join(out, "collapse_manta.vcf.gz"),
+                 header=COLLAPSE_HEADER)
+
+    print("Writing collapse_multiallelic.vcf.gz ...")
+    vcf_text = MULTIALLELIC_HEADER + "\n"
+    for r in RECORDS_MULTIALLELIC:
+        vcf_text += (f"{r['chrom']}\t{r['pos']}\t{r['id']}\t{r['ref']}\t{r['alt']}"
+                     f"\t{r['qual']}\t{r['filter']}\t{r['info']}\n")
+    multi_path = os.path.join(out, "collapse_multiallelic.vcf.gz")
+    subprocess.run(
+        ["bgzip", "-c"],
+        input=vcf_text.encode(), check=True,
+        stdout=open(multi_path, "wb"),
+        capture_output=False,
+    )
+    subprocess.run(["bcftools", "index", multi_path], check=True, capture_output=True)
 
     print("Done.")
 

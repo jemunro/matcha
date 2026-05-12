@@ -40,6 +40,9 @@ type
 proc bgzfHandle*(v: VCF): ptr BGZF {.inline.} =
   cast[VcfPriv](v).hts.fp.bgzf
 
+proc vcfHtsFile*(v: VCF): ptr htsFile {.inline.} =
+  cast[VcfPriv](v).hts
+
 type
   SvtypeBin* = tuple[svtype: SvType, bin: int]
 
@@ -101,6 +104,13 @@ const SvInfoDefs = [
   ("MATCHA_BOFF", "2", "Integer",
    "matcha-internal: source-file BGZF virtual offset (high32, low32)"),
 ]
+
+proc encodeBoff*(off: int64): seq[int32] {.inline.} =
+  @[cast[int32]((off shr 32) and 0xFFFF_FFFF'i64),
+    cast[int32](off and 0xFFFF_FFFF'i64)]
+
+proc decodeBoff*(arr: seq[int32]): int64 {.inline.} =
+  (int64(arr[0]) shl 32) or (int64(arr[1]) and 0xFFFF_FFFF'i64)
 
 proc reasonStr(r: SkipReason): string =
   case r
@@ -275,7 +285,7 @@ proc buildSlimHdr(src: ptr bcf_hdr_t,
           break
   discard bcf_hdr_sync(result)
 
-proc captureChromOrder(h: vcf.Header): seq[string] =
+proc captureChromOrder*(h: vcf.Header): seq[string] =
   ## Return contig IDs in the order they appear in the VCF header.
   var n: cint = 0
   let names = bcf_hdr_seqnames(h.hdr, n.addr)
@@ -286,9 +296,13 @@ proc captureChromOrder(h: vcf.Header): seq[string] =
 
 proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
                     extraKeepInfo: openArray[string] = [],
-                    ioThreads: int = 0): PreprocOutput =
+                    ioThreads:    int  = 0;
+                    noIndex:      bool = false;
+                    keepPassQual: bool = false): PreprocOutput =
   ## Stream vcfPath, normalize each record, and write per-SVTYPE BCFs.
-  ## All temp BCFs are CSI-indexed on return. Inputs may be VCF.gz or BCF.
+  ## When noIndex=false (default), all temp BCFs are CSI-indexed on return.
+  ## When keepPassQual=true, QUAL is preserved in the slim BCF (default: blanked).
+  ## Inputs may be VCF.gz or BCF.
   ##
   ## extraKeepInfo: additional INFO field names that survive the slim step.
   ## Used by `matcha anno` to carry user-requested DB fields into the
@@ -320,7 +334,6 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   var svtypeStr: string
   var endData, svlenData: seq[int32]
   var toDelete: seq[string]
-  var boffPair: seq[int32] = newSeq[int32](2)
 
   result.chromOrder = captureChromOrder(vcf.header)
 
@@ -342,6 +355,12 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
         warnSkip(skUnknownContig, ws, $v.CHROM, v.POS, $v.ID,
                  "BCF_ERR_CTG_UNDEF")
         break recordBody
+
+      if v.ALT.len > 1:
+        stderr.writeLine "error: multiallelic record at " & $v.CHROM & ":" &
+                         $v.POS & " in " & vcfPath &
+                         " — split multiallelics before running matcha"
+        quit(1)
 
       let svt = resolveSvtype(v, svtypeStr)
       if svt == svUNKNOWN:
@@ -437,8 +456,7 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
         discard v.info.set("END", endI32)
 
       # Encode the source-file offset as INFO/MATCHA_BOFF (Number=2, Integer)
-      boffPair[0] = cast[int32]((recordOffset shr 32) and 0xFFFFFFFF'i64)
-      boffPair[1] = cast[int32](recordOffset and 0xFFFFFFFF'i64)
+      var boffPair = encodeBoff(recordOffset)
       discard v.info.set("MATCHA_BOFF", boffPair)
 
       # Lazily open per-(svtype, bin) writer.
@@ -454,26 +472,30 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
         wtr.header.hdr = bcf_hdr_dup(slimHdr)
         wtr.set_samples(@["^"])   # temp BCFs carry no sample columns
         discard wtr.write_header()
-        let headerOff = uint64(bgzf_tell(bgzfHandle(wtr)))
         writers[key] = wtr
         result.paths[key] = path
-        let idx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
-        if idx == nil:
-          raise newException(IOError, "cannot create CSI index for: " & path)
-        indexes[key] = idx
+        if not noIndex:
+          let headerOff = uint64(bgzf_tell(bgzfHandle(wtr)))
+          let idx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
+          if idx == nil:
+            raise newException(IOError, "cannot create CSI index for: " & path)
+          indexes[key] = idx
       if svt notin result.chromsBySvtype:
         result.chromsBySvtype[svt] = initHashSet[string]()
       if svt notin result.populatedBins:
         result.populatedBins[svt] = {}
       result.populatedBins[svt].incl(uint8(binIdx))
 
-      # REF/ALT/QUAL are unused by matchcore — blank them out to shrink the record.
+      # REF/ALT are unused by matchcore — blank them to shrink the record.
+      # QUAL is blanked unless keepPassQual=true (collapse needs it for rep selection).
       discard bcf_update_alleles_str(vcf.header.hdr, v.c, "N\t.")
-      v.c.qual = cast[cfloat](bcf_float_missing.uint32)
+      if not keepPassQual:
+        v.c.qual = cast[cfloat](bcf_float_missing.uint32)
 
       discard writers[key].write_variant(v)
-      let woff = uint64(bgzf_tell(bgzfHandle(writers[key])))
-      discard hts_idx_push(indexes[key], v.c.rid, int64(v.c.pos), endPos, woff, 1)
+      if not noIndex:
+        let woff = uint64(bgzf_tell(bgzfHandle(writers[key])))
+        discard hts_idx_push(indexes[key], v.c.rid, int64(v.c.pos), endPos, woff, 1)
       result.chromsBySvtype[svt].incl($v.CHROM)
       inc ws.nKept
 
@@ -485,18 +507,21 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   vcf.close()
 
   for key, wtr in writers.mpairs:
-    let finalOff = uint64(bgzf_tell(bgzfHandle(wtr)))
-    hts_idx_finish(indexes[key], finalOff)
+    if not noIndex:
+      let finalOff = uint64(bgzf_tell(bgzfHandle(wtr)))
+      hts_idx_finish(indexes[key], finalOff)
     wtr.close()
-    let path = result.paths[key]
-    hts_idx_save(indexes[key], path.cstring, HTS_FMT_CSI.cint)
-    hts_idx_destroy(indexes[key])
+    if not noIndex:
+      let path = result.paths[key]
+      hts_idx_save(indexes[key], path.cstring, HTS_FMT_CSI.cint)
+      hts_idx_destroy(indexes[key])
 
   bcf_hdr_destroy(slimHdrInterval)
   bcf_hdr_destroy(slimHdrBnd)
 
-  logV("[" & prefix & "] indexed " & $result.paths.len &
-       " temp BCFs ((svtype, bin) groups)")
+  logV("[" & prefix & "] wrote " & $result.paths.len &
+       " temp BCFs ((svtype, bin) groups)" &
+       (if noIndex: " (no index)" else: " (CSI indexed)"))
   emitSummary(ws)
 
 proc buildWorkQueue*(a, b: PreprocOutput, cfg: MatchConfig): seq[MatchJob] =

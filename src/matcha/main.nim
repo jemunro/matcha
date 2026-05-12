@@ -1,8 +1,8 @@
 ## main.nim — CLI argument parsing and subcommand dispatch.
 ## Entry point is src/matcha.nim which includes this file.
 
-import std/[os, parseopt, strutils]
-import utils, match, anno, log
+import std/[os, parseopt, sequtils, strutils]
+import utils, match, anno, collapse, mergecore, log
 
 const NimblePkgVersion {.strdefine.} = "dev"
 const VERSION = NimblePkgVersion
@@ -26,8 +26,9 @@ proc usage(code: int = 1) =
   f.writeLine "Usage: matcha <subcommand> [options]"
   f.writeLine ""
   f.writeLine "Subcommands:"
-  f.writeLine "  match    Find pairwise matches between two SV callsets"
-  f.writeLine "  anno     Annotate a callset with INFO fields from a database VCF"
+  f.writeLine "  match      Find pairwise matches between two SV callsets"
+  f.writeLine "  anno       Annotate a callset with INFO fields from a database VCF"
+  f.writeLine "  collapse   Cluster equivalent SVs from multiple callers, emit one representative"
   f.writeLine ""
   f.writeLine "Flags:"
   f.writeLine "  --version       show version"
@@ -358,6 +359,163 @@ proc runAnnoCli(rawArgs: seq[string]) =
 
   runAnno(cfg)
 
+proc collapseUsage(code: int = 1) =
+  let f = if code == 0: stdout else: stderr
+  f.writeLine "Usage:"
+  f.writeLine "  matcha collapse [options] [Name:]callset1.bcf [Name:]callset2.bcf ..."
+  f.writeLine ""
+  f.writeLine "Cluster equivalent SVs from N single-sample callsets and emit one"
+  f.writeLine "representative record per cluster with provenance INFO fields."
+  f.writeLine ""
+  f.writeLine "Options:"
+  f.writeLine "  --min-overlap FLOAT           minimum reciprocal overlap (0.0-1.0)"
+  f.writeLine "  --min-jaccard FLOAT           minimum Jaccard index (0.0-1.0)"
+  f.writeLine "  --bnd-slop INT                max breakend offset for BND (default: 100)"
+  f.writeLine "  --linkage average|single|complete  agglomerative linkage (default: average)"
+  f.writeLine "  --priority CRITERIA           comma-separated: PASS,QUAL,CENTRE,ORDER"
+  f.writeLine "                                default: PASS,CENTRE,ORDER"
+  f.writeLine "                                ORDER is always appended as final tiebreaker"
+  f.writeLine "  --format FIELDS               comma-separated FORMAT fields to carry"
+  f.writeLine "                                default: GT"
+  f.writeLine "  --info FIELDS                 comma-separated INFO fields to keep"
+  f.writeLine "                                default: all (post conflict resolution)"
+  f.writeLine "  -o, --output PATH             output file (.vcf | .vcf.gz | .bcf)"
+  f.writeLine "                                default: uncompressed VCF to stdout"
+  f.writeLine "  --threads INT                 worker threads (default: 1)"
+  f.writeLine "  --tmp-dir PATH                temp directory (default: system temp)"
+  f.writeLine "  -v, --verbose                 verbose logging to stderr"
+  f.writeLine "  -h, --help                    show this help"
+  f.writeLine ""
+  f.writeLine "Exactly one of --min-overlap or --min-jaccard is required."
+  f.writeLine ""
+  f.writeLine "Input names: positional args may be prefixed with 'Name:' (e.g. Delly:delly.bcf)."
+  f.writeLine "If no name prefix is given, the basename without extension is used."
+  f.writeLine ""
+  f.writeLine "Output INFO fields added: SOURCE, SOURCELIST, N_SOURCE, N_MERGED."
+  quit(code)
+
+proc parsePriority(s: string): seq[PriorityCriterion] =
+  for tok in s.split(','):
+    case tok.strip.toUpperAscii
+    of "PASS":   result.add(pcPass)
+    of "QUAL":   result.add(pcQual)
+    of "CENTRE", "CENTER": result.add(pcCentre)
+    of "ORDER":  result.add(pcOrder)
+    else:
+      stderr.writeLine "error: unknown priority criterion '" & tok & "'"
+      stderr.writeLine "       valid values: PASS, QUAL, CENTRE, ORDER"
+      quit(1)
+  # ORDER is always the final tiebreaker; append if not already last.
+  if result.len == 0 or result[^1] != pcOrder:
+    result.add(pcOrder)
+
+proc runCollapseCli(rawArgs: seq[string]) =
+  var cfg = CollapseConfig(
+    nThreads:     1,
+    bndSlop:      100,
+    linkage:      lmAverage,
+    priority:     @[pcPass, pcCentre, pcOrder],
+    formatFields: @["GT"],
+  )
+  var positionals: seq[string]
+  var overlapSet, jaccardSet: bool
+  var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
+  while true:
+    p.next()
+    case p.kind
+    of cmdEnd: break
+    of cmdShortOption, cmdLongOption:
+      case p.key
+      of "min-overlap":
+        let v = nextVal(p, "min-overlap")
+        try: cfg.threshold = parseFloat(v)
+        except ValueError:
+          stderr.writeLine "error: --min-overlap must be a float, got: " & v; quit(1)
+        cfg.metric = mOverlap; overlapSet = true
+      of "min-jaccard":
+        let v = nextVal(p, "min-jaccard")
+        try: cfg.threshold = parseFloat(v)
+        except ValueError:
+          stderr.writeLine "error: --min-jaccard must be a float, got: " & v; quit(1)
+        cfg.metric = mJaccard; jaccardSet = true
+      of "bnd-slop":
+        let v = nextVal(p, "bnd-slop")
+        try: cfg.bndSlop = parseInt(v)
+        except ValueError:
+          stderr.writeLine "error: --bnd-slop must be an integer, got: " & v; quit(1)
+        if cfg.bndSlop <= 0:
+          stderr.writeLine "error: --bnd-slop must be > 0"; quit(1)
+      of "linkage":
+        let v = nextVal(p, "linkage").toLowerAscii
+        case v
+        of "average":  cfg.linkage = lmAverage
+        of "single":   cfg.linkage = lmSingle
+        of "complete": cfg.linkage = lmComplete
+        else:
+          stderr.writeLine "error: --linkage must be average, single, or complete"
+          quit(1)
+      of "priority":
+        cfg.priority = parsePriority(nextVal(p, "priority"))
+      of "format":
+        cfg.formatFields = nextVal(p, "format").split(',').mapIt(it.strip)
+      of "info":
+        cfg.infoFields = nextVal(p, "info").split(',').mapIt(it.strip)
+      of "o", "output":
+        cfg.outputPath = nextVal(p, "o")
+      of "threads":
+        let v = nextVal(p, "threads")
+        try: cfg.nThreads = parseInt(v)
+        except ValueError:
+          stderr.writeLine "error: --threads must be an integer, got: " & v; quit(1)
+        if cfg.nThreads < 1:
+          stderr.writeLine "error: --threads must be >= 1"; quit(1)
+      of "tmp-dir":
+        cfg.tmpDir = nextVal(p, "tmp-dir")
+      of "v", "verbose": setVerbose(true)
+      of "h", "help":    collapseUsage(0)
+      else:
+        stderr.writeLine "error: unknown option: --" & p.key
+        collapseUsage()
+    of cmdArgument:
+      positionals.add(p.key)
+
+  if overlapSet == jaccardSet:
+    if overlapSet:
+      stderr.writeLine "error: --min-overlap and --min-jaccard are mutually exclusive"
+    else:
+      stderr.writeLine "error: exactly one of --min-overlap or --min-jaccard is required"
+    collapseUsage()
+
+  if positionals.len < 1:
+    stderr.writeLine "error: at least one input file is required"
+    collapseUsage()
+
+  # Parse [Name:]path positional arguments.
+  for arg in positionals:
+    let colonIdx = arg.find(':')
+    var name, path: string
+    if colonIdx >= 0:
+      name = arg[0 ..< colonIdx]
+      path = arg[colonIdx + 1 .. ^1]
+    else:
+      path = arg
+      name = splitFile(path).name
+    if name.len == 0: name = splitFile(path).name
+    cfg.callers.add(CallerInput(name: name, path: path))
+
+  for caller in cfg.callers:
+    if not fileExists(caller.path):
+      stderr.writeLine "error: input file not found: " & caller.path
+      quit(1)
+
+  if cfg.tmpDir == "":
+    cfg.tmpDir = getTempDir()
+
+  # Build command line string for provenance header.
+  let cmdLine = "matcha collapse " & rawArgs.join(" ")
+
+  runCollapse(cfg, cmdLine)
+
 proc mainEntry*() =
   var args = commandLineParams()
   while args.len > 0 and (args[0] == "-v" or args[0] == "--verbose"):
@@ -370,6 +528,8 @@ proc mainEntry*() =
     runMatch(args[1 .. ^1])
   of "anno":
     runAnnoCli(args[1 .. ^1])
+  of "collapse":
+    runCollapseCli(args[1 .. ^1])
   of "--version":
     echo "matcha v" & VERSION
   of "--help", "-h":

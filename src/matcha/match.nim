@@ -53,7 +53,7 @@ proc runBndMatchJob*(job: MatchJob, cfg: MatchConfig): seq[MatchResult] =
         aOffset:    aOff, bOffset: cand.bOffset,
       )))
 
-proc dispatchMatchJob(job: MatchJob, cfg: MatchConfig): seq[MatchResult] {.inline.} =
+proc dispatchMatchJob*(job: MatchJob, cfg: MatchConfig): seq[MatchResult] {.inline.} =
   if job.svtype == svBND: runBndMatchJob(job, cfg)
   else:                   runMatchJob(job, cfg)
 
@@ -80,6 +80,30 @@ proc threadWorker(dummy: int) {.thread.} =
 # ---------------------------------------------------------------------------
 # Top-level entry point
 # ---------------------------------------------------------------------------
+
+proc runMatchJobsWithPool*(jobs: seq[MatchJob]; cfg: MatchConfig): seq[seq[MatchResult]] =
+  ## Run matching jobs via the global thread pool (or inline for nThreads=1).
+  ## Returns per-job result seqs. Callers flatten them as needed.
+  result = newSeq[seq[MatchResult]](jobs.len)
+  if jobs.len == 0: return
+  if cfg.nThreads == 1:
+    for i, job in jobs.pairs:
+      result[i] = dispatchMatchJob(job, cfg)
+      logV("job " & job.chrom & "/" & $job.svtype & "/bin" & $job.binA &
+           ": " & $result[i].len & " matches")
+  else:
+    logV("starting " & $cfg.nThreads & " worker thread(s) for " & $jobs.len & " job(s)")
+    gJobs       = jobs
+    gCfg        = cfg
+    gJobResults = newSeq[seq[MatchResult]](jobs.len)
+    gNextJob.store(0, moRelaxed)
+    var threads = newSeq[Thread[int]](cfg.nThreads)
+    for i in 0 ..< cfg.nThreads:
+      createThread(threads[i], threadWorker, i)
+    for i in 0 ..< cfg.nThreads:
+      joinThread(threads[i])
+    result = gJobResults
+    logV("workers complete")
 
 proc runMatch*(cfg: MatchConfig) =
   logV("matcha match: A=" & cfg.callsetA & " B=" & cfg.callsetB &
