@@ -478,15 +478,15 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
   )
   let jobs = buildWorkQueue(mergedPreproc, mergedPreproc, matchCfg)
   logV("collapse self-match: " & $jobs.len & " job(s)")
-  let allMatchResults = block:
-    var r: seq[MatchResult]
-    for jrs in runMatchJobsWithPool(jobs, matchCfg):
-      for mr in jrs: r.add(mr)
+  let allPairs = block:
+    var r: seq[MatchPair]
+    for jrs in runMatchPairJobsWithPool(jobs, matchCfg):
+      for mp in jrs: r.add(mp)
     r
-  logV("self-match: " & $allMatchResults.len & " pair(s)")
+  logV("self-match: " & $allPairs.len & " pair(s)")
 
   # Phase 5: Pass 2 — enumerate allOffsets + PASS/QUAL from merged slim BCFs.
-  let simMap = buildSimilarityMap(allMatchResults)
+  let simMap = buildSimilarityMap(allPairs)
   let (allOffsets, passQualMap) = exploreMerged(mergedPaths)
   logV("offsets seen: " & $allOffsets.len)
 

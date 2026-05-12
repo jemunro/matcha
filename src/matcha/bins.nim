@@ -55,7 +55,6 @@ type
   BufferedRec* = object
     pos*:     int64
     endPos*:  int64
-    id*:      string
     bOffset*: int64   ## BGZF virtual offset into the original source file
 
   TiledBuffer* = object

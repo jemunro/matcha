@@ -6,7 +6,7 @@
 ##
 ##   resolveHeaders        — analyse N input VCF headers, produce MergedHeader
 ##   mergeSortSlimBcfs     — k-way merge + sort of per-caller slim BCFs
-##   buildSimilarityMap    — MatchResult seq → (canonicalPair → similarity) table
+##   buildSimilarityMap    — MatchPair seq → (canonicalPair → similarity) table
 ##   buildComponents       — union-find over pairs → offset→componentId table
 ##   agglomerateComponent  — Lance-Williams agglomerative clustering
 ##   clusterAll            — full pipeline: components → agglomerate each
@@ -15,7 +15,7 @@
 import std/[algorithm, sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
-import utils, preproc
+import preproc, matchcore
 
 # ---------------------------------------------------------------------------
 # Types
@@ -233,18 +233,18 @@ proc resolveHeaders*(callers: seq[CallerInput]): MergedHeader =
                           ") — emitting Number=.")
 
 # ---------------------------------------------------------------------------
-# Similarity map (from MatchResult seq)
+# Similarity map (from MatchPair seq)
 # ---------------------------------------------------------------------------
 
-proc buildSimilarityMap*(results: seq[MatchResult]): Table[(int64, int64), float64] =
-  ## Build canonical-pair → similarity table from match results.
+proc buildSimilarityMap*(pairs: seq[MatchPair]): Table[(int64, int64), float64] =
+  ## Build canonical-pair → similarity table from match pairs.
   ## Canonical key: (min(aOff,bOff), max(aOff,bOff)).
-  for r in results:
-    let key = pairKey(r.aOffset, r.bOffset)
+  for p in pairs:
+    let key = pairKey(p.aOff, p.bOff)
     # Keep highest similarity if duplicate pairs arrive (shouldn't happen, but be safe).
     let cur = result.getOrDefault(key, 0.0)
-    if r.similarity > cur:
-      result[key] = r.similarity
+    if p.sim > cur:
+      result[key] = p.sim
 
 # ---------------------------------------------------------------------------
 # Union-find → connected components

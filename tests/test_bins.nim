@@ -77,8 +77,8 @@ timed("B09", "adjacentBins(2, 0.9): tight window picks only bin 2"):
 # TiledBuffer
 # ---------------------------------------------------------------------------
 
-proc makeRec(pos, endPos: int64, id: string = ""): BufferedRec =
-  BufferedRec(pos: pos, endPos: endPos, id: id, bOffset: 0)
+proc makeRec(pos, endPos: int64): BufferedRec =
+  BufferedRec(pos: pos, endPos: endPos, bOffset: 0)
 
 # T01 — cold buffer fetch loads expected tiles
 timed("T01", "TiledBuffer: cold fetch loads tiles in expected range"):

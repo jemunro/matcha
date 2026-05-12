@@ -20,10 +20,11 @@ type
     mJaccard = "jaccard"
 
   MatchResult* = object
-    chrom*:      string
+    chromA*:     string
     posA*:       int64
     endA*:       int64    ## ignored for svBND rows; emitted as "." in output
     idA*:        string
+    chromB*:     string
     posB*:       int64
     endB*:       int64    ## ignored for svBND rows; emitted as "." in output
     idB*:        string
@@ -50,7 +51,7 @@ type
 const SupportedSvTypes* = {svDEL, svDUP, svINV, svBND}
 
 const OutputHeader* =
-  "#CHROM\tPOS_A\tEND_A\tID_A\tPOS_B\tEND_B\tID_B\tSVTYPE\tSIMILARITY"
+  "#CHROM_A\tPOS_A\tEND_A\tID_A\tCHROM_B\tPOS_B\tEND_B\tID_B\tSVTYPE\tSIMILARITY"
 
 proc parseSvType*(s: string): SvType =
   case s.toUpperAscii
@@ -67,6 +68,6 @@ proc formatMatchResult*(r: MatchResult): string =
   ## BND rows emit "." for END_A / END_B (BNDs are points, not intervals).
   let endAStr = if r.svtype == svBND: "." else: $r.endA
   let endBStr = if r.svtype == svBND: "." else: $r.endB
-  r.chrom & "\t" & $r.posA & "\t" & endAStr & "\t" & r.idA & "\t" &
-  $r.posB & "\t" & endBStr & "\t" & r.idB & "\t" & $r.svtype & "\t" &
+  r.chromA & "\t" & $r.posA & "\t" & endAStr & "\t" & r.idA & "\t" &
+  r.chromB & "\t" & $r.posB & "\t" & endBStr & "\t" & r.idB & "\t" & $r.svtype & "\t" &
   formatFloat(r.similarity, ffDecimal, 6)

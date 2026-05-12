@@ -59,8 +59,8 @@ timed("M03", "exact match DEL_A_01/DEL_B_01: similarity = 1.0"):
   let rows = parseTsv(outp)
   var found = false
   for row in rows:
-    if row.len >= 9 and row[3] == "DEL_A_01" and row[6] == "DEL_B_01":
-      doAssert abs(parseFloat(row[8]) - 1.0) < 1e-5, "SIMILARITY != 1.0: " & row[8]
+    if row.len >= 10 and row[3] == "DEL_A_01" and row[7] == "DEL_B_01":
+      doAssert abs(parseFloat(row[9]) - 1.0) < 1e-5, "SIMILARITY != 1.0: " & row[9]
       found = true
   doAssert found, "DEL_A_01/DEL_B_01 pair not found in output"
 
@@ -71,7 +71,7 @@ timed("M04", "partial overlap above threshold: DEL_A_02 emitted"):
   let rows = parseTsv(outp)
   var found = false
   for row in rows:
-    if row.len >= 9 and row[3] == "DEL_A_02":
+    if row.len >= 10 and row[3] == "DEL_A_02":
       found = true
   doAssert found, "DEL_A_02 partial overlap should be emitted at threshold 0.5"
 
@@ -81,8 +81,8 @@ timed("M05", "below-threshold overlap: DEL_A_03/DEL_B_03 not emitted"):
   doAssert code == 0
   let rows = parseTsv(outp)
   for row in rows:
-    if row.len >= 9:
-      doAssert not (row[3] == "DEL_A_03" and row[6] == "DEL_B_03"),
+    if row.len >= 10:
+      doAssert not (row[3] == "DEL_A_03" and row[7] == "DEL_B_03"),
         "DEL_A_03/DEL_B_03 overlap=0.4 should be filtered at threshold 0.5"
 
 # M06 — TC05 SVTYPE mismatch produces no output
@@ -91,8 +91,8 @@ timed("M06", "SVTYPE mismatch DEL_A_05/DUP_B_05: no match emitted"):
   doAssert code == 0
   let rows = parseTsv(outp)
   for row in rows:
-    if row.len >= 9:
-      doAssert not (row[3] == "DEL_A_05" and row[6] == "DUP_B_05"),
+    if row.len >= 10:
+      doAssert not (row[3] == "DEL_A_05" and row[7] == "DUP_B_05"),
         "DEL/DUP SVTYPE mismatch should not match"
 
 # M07 — TC06 multiple matches: both B records emitted for DEL_A_06
@@ -102,7 +102,7 @@ timed("M07", "multiple matches: 2 B records match DEL_A_06"):
   let rows = parseTsv(outp)
   var matchCount = 0
   for row in rows:
-    if row.len >= 9 and row[3] == "DEL_A_06":
+    if row.len >= 10 and row[3] == "DEL_A_06":
       inc matchCount
   doAssert matchCount == 2, "expected 2 matches for DEL_A_06, got " & $matchCount
 
@@ -112,7 +112,7 @@ timed("M08", "unmatched A record: DEL_A_07 not in output"):
   doAssert code == 0
   let rows = parseTsv(outp)
   for row in rows:
-    if row.len >= 9:
+    if row.len >= 10:
       doAssert row[3] != "DEL_A_07", "DEL_A_07 should have no match in B"
 
 # M09 — TC09 multi-chromosome: chr2 and chrX rows present
@@ -123,7 +123,7 @@ timed("M09", "multi-chromosome: chr2 and chrX results present"):
   var hasChr2 = false
   var hasChrX = false
   for row in rows:
-    if row.len >= 9:
+    if row.len >= 10:
       if row[0] == "chr2": hasChr2 = true
       if row[0] == "chrX": hasChrX = true
   doAssert hasChr2, "chr2 results missing"
@@ -135,27 +135,27 @@ timed("M10", "--min-jaccard 0.5 alone: DEL_A_08 excluded (jaccard=0.2)"):
   doAssert code == 0
   let rows = parseTsv(outp)
   for row in rows:
-    if row.len >= 9:
+    if row.len >= 10:
       doAssert row[3] != "DEL_A_08",
         "DEL_A_08 has jaccard=0.2 and should be excluded at --min-jaccard 0.5"
 
 # M11 — output has 9 tab-separated columns, similarity in [0,1].
 # Interval rows have numeric END_A/END_B; BND rows emit ".".
-timed("M11", "output: 9 columns, similarity in [0,1]"):
+timed("M11", "output: 10 columns, similarity in [0,1]"):
   let (outp, code) = run("match --min-overlap 0.9 " & FixtureA & " " & FixtureB)
   doAssert code == 0
   let rows = parseTsv(outp)
   doAssert rows.len > 0, "expected output rows"
   for row in rows:
-    doAssert row.len == 9, "expected 9 columns, got " & $row.len & ": " & row.join("\t")
+    doAssert row.len == 10, "expected 10 columns, got " & $row.len & ": " & row.join("\t")
     doAssert row[1].parseInt > 0, "POS_A must be positive integer"
-    doAssert row[4].parseInt > 0, "POS_B must be positive integer"
-    let sim = parseFloat(row[8])
+    doAssert row[5].parseInt > 0, "POS_B must be positive integer"
+    let sim = parseFloat(row[9])
     doAssert sim >= 0.0 and sim <= 1.0, "SIMILARITY out of [0,1]: " & $sim
-    if row[7] == "BND":
-      doAssert row[2] == "." and row[5] == ".", "BND END cols should be '.'"
+    if row[8] == "BND":
+      doAssert row[2] == "." and row[6] == ".", "BND END cols should be '.'"
     else:
-      doAssert row[2].parseInt > 0 and row[5].parseInt > 0,
+      doAssert row[2].parseInt > 0 and row[6].parseInt > 0,
         "interval END cols should be positive"
 
 # M12 — --output writes to file
@@ -239,7 +239,7 @@ timed("S02", "--self: no row has ID_A == ID_B"):
   doAssert code == 0
   for row in parseTsv(outp):
     if row.len >= 10:
-      doAssert row[3] != row[6], "self-self pair leaked: " & row.join("\t")
+      doAssert row[3] != row[7], "self-self pair leaked: " & row.join("\t")
 
 # S03 — --self emits each unordered (X,Y) pair at most once
 timed("S03", "--self: no duplicate symmetric pairs"):
@@ -249,8 +249,8 @@ timed("S03", "--self: no duplicate symmetric pairs"):
   for row in parseTsv(outp):
     if row.len >= 10:
       # canonical pair key: lexicographically min/max of the two IDs
-      let key = (if row[3] < row[6]: row[3] & "|" & row[6]
-                 else: row[6] & "|" & row[3])
+      let key = (if row[3] < row[7]: row[3] & "|" & row[7]
+                 else: row[7] & "|" & row[3])
       doAssert key notin seen, "duplicate pair: " & key
       seen.incl(key)
 
@@ -300,11 +300,11 @@ timed("B01", "BND identical mate pair: similarity=1.0"):
   doAssert code == 0, "exit " & $code & ": " & outp
   var found = false
   for row in parseTsv(outp):
-    if row.len >= 9 and row[3] == "BND_A_11" and row[6] == "BND_B_11":
-      doAssert row[7] == "BND", "expected SVTYPE=BND, got " & row[7]
-      doAssert row[2] == "." and row[5] == ".", "BND END_A/END_B must be '.'"
-      doAssert abs(parseFloat(row[8]) - 1.0) < 1e-5,
-        "BND_A_11/B_11 sim != 1.0: " & row[8]
+    if row.len >= 10 and row[3] == "BND_A_11" and row[7] == "BND_B_11":
+      doAssert row[8] == "BND", "expected SVTYPE=BND, got " & row[8]
+      doAssert row[2] == "." and row[6] == ".", "BND END_A/END_B must be '.'"
+      doAssert abs(parseFloat(row[9]) - 1.0) < 1e-5,
+        "BND_A_11/B_11 sim != 1.0: " & row[9]
       found = true
   doAssert found, "BND_A_11/BND_B_11 missing from output"
 
@@ -314,8 +314,8 @@ timed("B02", "BND inter-chrom identical: sim=1.0"):
   doAssert code == 0
   var found = false
   for row in parseTsv(outp):
-    if row.len >= 9 and row[3] == "BND_A_20" and row[6] == "BND_B_20":
-      doAssert abs(parseFloat(row[8]) - 1.0) < 1e-5
+    if row.len >= 10 and row[3] == "BND_A_20" and row[7] == "BND_B_20":
+      doAssert abs(parseFloat(row[9]) - 1.0) < 1e-5
       found = true
   doAssert found, "BND_A_20/BND_B_20 missing"
 
@@ -325,9 +325,9 @@ timed("B03", "BND offset 50/30: sim=0.60 at default slop 100"):
   doAssert code == 0
   var found = false
   for row in parseTsv(outp):
-    if row.len >= 9 and row[3] == "BND_A_21" and row[6] == "BND_B_21":
-      doAssert abs(parseFloat(row[8]) - 0.6) < 1e-5,
-        "BND_A_21/B_21 sim != 0.6: " & row[8]
+    if row.len >= 10 and row[3] == "BND_A_21" and row[7] == "BND_B_21":
+      doAssert abs(parseFloat(row[9]) - 0.6) < 1e-5,
+        "BND_A_21/B_21 sim != 0.6: " & row[9]
       found = true
   doAssert found, "BND_A_21/BND_B_21 missing"
 
@@ -337,13 +337,13 @@ timed("B04", "--bnd-slop 20 rejects offset-50 pair"):
                          FixtureA & " " & FixtureB)
   doAssert code == 0
   for row in parseTsv(outp):
-    if row.len >= 9:
-      doAssert not (row[3] == "BND_A_21" and row[6] == "BND_B_21"),
+    if row.len >= 10:
+      doAssert not (row[3] == "BND_A_21" and row[7] == "BND_B_21"),
         "BND_A_21/B_21 should be rejected at slop=20"
   # But BND_A_20/BND_B_20 (offsets 0/0) should still match.
   var foundExact = false
   for row in parseTsv(outp):
-    if row.len >= 9 and row[3] == "BND_A_20" and row[6] == "BND_B_20":
+    if row.len >= 10 and row[3] == "BND_A_20" and row[7] == "BND_B_20":
       foundExact = true
   doAssert foundExact, "exact BND match should survive at any positive slop"
 
@@ -352,8 +352,8 @@ timed("B05", "CHR2 mismatch: BND_A_23 / BND_B_23 not paired"):
   let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
   doAssert code == 0
   for row in parseTsv(outp):
-    if row.len >= 9:
-      doAssert not (row[3] == "BND_A_23" and row[6] == "BND_B_23"),
+    if row.len >= 10:
+      doAssert not (row[3] == "BND_A_23" and row[7] == "BND_B_23"),
         "CHR2-mismatched pair should not be emitted"
 
 # B06 — BND_A_22 has no B mate at chr1:80000 → absent.
@@ -361,7 +361,7 @@ timed("B06", "unmatched BND: BND_A_22 not in output"):
   let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
   doAssert code == 0
   for row in parseTsv(outp):
-    if row.len >= 9:
+    if row.len >= 10:
       doAssert row[3] != "BND_A_22", "BND_A_22 should be unmatched"
 
 # B07 — Malformed BND ALT and TRA records are dropped at preproc
@@ -381,11 +381,11 @@ timed("B08", "--self: BND mate pair appears exactly once"):
   var count = 0
   var simVal = 0.0
   for row in parseTsv(outp):
-    if row.len >= 9 and
-       ((row[3] == "BND_A_27a" and row[6] == "BND_A_27b") or
-        (row[3] == "BND_A_27b" and row[6] == "BND_A_27a")):
+    if row.len >= 10 and
+       ((row[3] == "BND_A_27a" and row[7] == "BND_A_27b") or
+        (row[3] == "BND_A_27b" and row[7] == "BND_A_27a")):
       inc count
-      simVal = parseFloat(row[8])
+      simVal = parseFloat(row[9])
   doAssert count == 1, "expected 1 row for BND_A_27a/27b, got " & $count
   doAssert abs(simVal - 0.8) < 1e-5, "self-pair sim != 0.8: " & $simVal
 
@@ -396,8 +396,8 @@ timed("B09", "mixed DEL+BND run produces both kinds of rows"):
   var sawDel = false
   var sawBnd = false
   for row in parseTsv(outp):
-    if row.len >= 9:
-      if row[7] == "DEL": sawDel = true
-      if row[7] == "BND": sawBnd = true
+    if row.len >= 10:
+      if row[8] == "DEL": sawDel = true
+      if row[8] == "BND": sawBnd = true
   doAssert sawDel and sawBnd,
     "expected both DEL and BND rows; saw DEL=" & $sawDel & " BND=" & $sawBnd

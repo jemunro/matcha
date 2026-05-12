@@ -330,7 +330,7 @@ def compute_expected(records_a, records_b, metric, threshold):
                 continue
             rows.append([
                 chrom, str(posA), str(endA), idA,
-                str(posB), str(endB), idB,
+                chrom, str(posB), str(endB), idB,
                 svtype, f"{sim:.6f}",
             ])
     return rows
@@ -359,7 +359,7 @@ def compute_self_expected(records, metric, threshold):
                     continue
                 rows.append([
                     chrom, str(a["pos"]), str(a["end"]), a["id"],
-                    str(b["pos"]), str(b["end"]), b["id"],
+                    chrom, str(b["pos"]), str(b["end"]), b["id"],
                     svtype, f"{sim:.6f}",
                 ])
     return rows
@@ -394,7 +394,7 @@ def compute_bnd_expected(records_a, records_b, slop=100):
                 continue
             rows.append([
                 ra["chrom"], str(ra["pos"]), ".", ra["id"],
-                str(rb["pos"]), ".", rb["id"], "BND",
+                ra["chrom"], str(rb["pos"]), ".", rb["id"], "BND",
                 f"{sim:.6f}",
             ])
     return rows
@@ -427,7 +427,7 @@ def compute_self_bnd_expected(records, slop=100):
                     continue
                 rows.append([
                     chrom, str(a["pos"]), ".", a["id"],
-                    str(b["pos"]), ".", b["id"], "BND",
+                    chrom, str(b["pos"]), ".", b["id"], "BND",
                     f"{sim:.6f}",
                 ])
     return rows

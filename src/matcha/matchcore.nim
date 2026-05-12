@@ -1,20 +1,27 @@
 ## matchcore.nim — shared per-job matching loop.
 ##
-## Both `matcha match` and `matcha anno` walk the same A-vs-B candidate space.
-## The differences are narrow:
-##   - what (if anything) gets pulled off each B candidate, and
-##   - what gets emitted (and whether) for each passing pair.
+## Both `matcha match`, `matcha anno`, and `matcha collapse` walk the same
+## A-vs-B candidate space. This module is intentionally minimal: it returns
+## pure (aOff, bOff, sim) triples and leaves per-mode field resolution
+## (CHROM/POS/END/ID/INFO) to the adapters in match.nim and anno.nim. Those
+## adapters re-scan the same slim BCFs that matchcore reads, picking records
+## up by INFO/MATCHA_BOFF — the slim BCFs are tiny and already CSI-indexed.
 ##
-## streamJobPairs[B, R] handles the generic streaming + tiled-buffer + filter
-## machinery and invokes the supplied `extract` and `emit` callbacks at the
-## right points. Per-mode adapters live in match.nim and anno.nim.
+## Self-mode dedup (aOff < bOff filter, dropping the trivial X-vs-X case) is
+## baked in via cfg.selfMode; anno never sets it.
 
 import std/[algorithm, deques, sequtils, tables]
 import hts
 import intervals, preproc, bins, utils
 
+type
+  MatchPair* = object
+    aOff*: int64
+    bOff*: int64
+    sim*:  float64
+
 # ---------------------------------------------------------------------------
-# Shared low-level helpers (previously duplicated in match.nim)
+# Slim-BCF INFO decode helpers (also used by per-mode resolution adapters)
 # ---------------------------------------------------------------------------
 
 proc readBoff*(v: Variant; scratch: var seq[int32]): int64 =
@@ -48,29 +55,14 @@ proc extractEnd*(v: Variant; endData, svlenData: var seq[int32];
   false
 
 # ---------------------------------------------------------------------------
-# Generic per-job streaming
+# Interval matching
 # ---------------------------------------------------------------------------
 
-type
-  PairResult*[R] = object
-    keep*:  bool   ## false → callback rejected this pair (e.g. self-mode dedup)
-    item*:  R
-
-  BExtractCb*[B] = proc(v: Variant): B {.closure.}
-  PairEmitCb*[B, R] = proc(va: Variant; posA, endA, aOff: int64;
-                            cand: BufferedRec; bExtra: B;
-                            sim: float64): PairResult[R] {.closure.}
-
-proc streamJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
-                           extract: BExtractCb[B];
-                           emit: PairEmitCb[B, R]): seq[R] =
+proc streamJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
   ## Drive the per-job match: stream A from the per-(svtype, binA) BCF
   ## restricted to job.chrom, fetch B candidates lazily through TiledBuffers,
-  ## compute the active interval metric (reciprocal overlap or Jaccard,
-  ## chosen via cfg.metric), apply the threshold, and dispatch each passing
-  ## pair to `emit`. The optional `extract` callback runs once per fetched
-  ## B record and its return value is threaded into the matching `emit`
-  ## call — used by anno mode to carry user-requested INFO values.
+  ## compute the active interval metric, apply the threshold, and append a
+  ## (aOff, bOff, sim) triple for each passing pair.
   var vcfA: VCF
   if not open(vcfA, job.pathA):
     raise newException(IOError, "cannot open A BCF: " & job.pathA)
@@ -84,21 +76,8 @@ proc streamJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
   for binB in sortedBinsB:
     buffers[binB] = initTiledBuffer(binRange(binB).hi, job.chrom)
 
-  # Parallel per-binB cache of B-side payloads (one entry per fetched B
-  # record, keyed by its source bOffset). Populated during fetchTile,
-  # consumed when emitting each pair. Bounded by job size.
-  var bExtras: Table[int, Table[int64, B]]
-  for binB in sortedBinsB:
-    bExtras[binB] = initTable[int64, B]()
-
-  # Scratch buffers for INFO field decodes.
   var endData, svlenData, boffData: seq[int32]
 
-  # Region-query one tile from the per-binB slim BCF. Lazily opens the reader
-  # on first call for each binB. CSI queries return records whose [POS, END)
-  # overlaps the region, so a record straddling a tile boundary appears in
-  # both adjacent fetches; filter by POS to assign each record to exactly one
-  # tile.
   proc fetchTile(binB, tileIdx: int): seq[BufferedRec] =
     if binB notin vcfsB:
       var v: VCF
@@ -113,11 +92,9 @@ proc streamJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
       if int(vb.POS div W) != tileIdx: continue
       var endB: int64
       if not extractEnd(vb, endData, svlenData, endB): continue
-      let bOff = readBoff(vb, boffData)
       result.add(BufferedRec(
-        pos: vb.POS, endPos: endB, id: $vb.ID, bOffset: bOff,
+        pos: vb.POS, endPos: endB, bOffset: readBoff(vb, boffData),
       ))
-      bExtras[binB][bOff] = extract(vb)
 
   for va in vcfA.query(job.chrom):
     var endA: int64
@@ -126,25 +103,20 @@ proc streamJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
     let aOff = readBoff(va, boffData)
 
     for binB in sortedBinsB:
-      let b = binB  # owned copy — lent iterator vars can't be captured
+      let b = binB   # owned copy — lent iterator vars can't be captured
       let cands = buffers[b].getCandidates(posA, endA,
         proc(ti: int): seq[BufferedRec] = fetchTile(b, ti))
       for cand in cands:
+        if cfg.selfMode and aOff >= cand.bOffset: continue
         let sim =
           if cfg.metric == mOverlap:
             reciprocalOverlap(posA, endA, cand.pos, cand.endPos)
           else:
             jaccard(posA, endA, cand.pos, cand.endPos)
         if sim < cfg.threshold: continue
-        let bExtra =
-          if cand.bOffset in bExtras[b]: bExtras[b][cand.bOffset]
-          else: default(B)
-        let pr = emit(va, posA, endA, aOff, cand, bExtra, sim)
-        if pr.keep:
-          result.add(pr.item)
+        result.add(MatchPair(aOff: aOff, bOff: cand.bOffset, sim: sim))
 
-    # Evict tiles no future A record can need; payloads for those B records
-    # become unreachable too — drop them in parallel to keep memory bounded.
+    # Evict tiles no future A record can need.
     for binB, buf in buffers.mpairs:
       buf.evict(posA)
 
@@ -153,17 +125,10 @@ proc streamJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
     v.close()
 
 # ---------------------------------------------------------------------------
-# BND streaming (point events; slop-based proximity)
+# BND matching (point events; slop-based proximity)
 # ---------------------------------------------------------------------------
 
-type
-  BndPairEmitCb*[B, R] = proc(va: Variant; posA, pos2A, aOff: int64;
-                              cand: BufferedRec; bExtra: B;
-                              sim: float64): PairResult[R] {.closure.}
-
-proc streamBndJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
-                              extract: BExtractCb[B];
-                              emit: BndPairEmitCb[B, R]): seq[R] =
+proc streamBndJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
   ## Per-job BND matching with a sliding cache of B records.
   ##
   ## A is streamed in POS order from the per-chrom sorted slim BCF, so the
@@ -173,12 +138,7 @@ proc streamBndJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
   ##   1. Evict from the front records whose POS dropped out of the window.
   ##   2. CSI-query *only* the new right-edge slice (cacheEnd .. winHi) we
   ##      haven't fetched yet, and append the decoded records to the cache.
-  ##   3. Iterate the cache to filter by chr2/pos2 and dispatch `emit`.
-  ##
-  ## Net effect: each B record is fetched, decoded, and `extract()`-ed at
-  ## most once across all A records whose windows include it. When A jumps
-  ## past the cache (gap > 2*slop), the cache empties via eviction and the
-  ## next delta query covers the full window — same cost as the old code.
+  ##   3. Iterate the cache to filter by chr2/pos2 and emit passing pairs.
   let slop = cfg.bndSlop
   if slop <= 0: return
   if 0 notin job.binsB: return            # B has no BND temp BCF
@@ -195,15 +155,11 @@ proc streamBndJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
     pos2:   int64
     bOff:   int64
     chr2:   string
-    id:     string
-    extra:  B
 
   var cache = initDeque[BndCacheRec]()
   ## Exclusive upper bound of the POS range currently covered by the cache
-  ## (or by the union of all queries issued so far on this chrom). Records
-  ## with pos in [cache.peekFirst().pos, cacheEnd) are guaranteed to be
-  ## either in `cache` or to have been evicted because no future A can
-  ## reach them. low(int64) forces a full first-A query.
+  ## (or by the union of all queries issued so far on this chrom).
+  ## low(int64) forces a full first-A query.
   var cacheEnd: int64 = low(int64)
 
   var boffData, pos2Data: seq[int32]
@@ -222,7 +178,6 @@ proc streamBndJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
 
     # Strict-band window (open both ends): pos must satisfy
     #   posA - slop < pos < posA + slop
-    # i.e. inclusive integer range [posA - slop + 1, posA + slop - 1].
     let winLo = posA - slop.int64 + 1
     let winHi = posA + slop.int64           # exclusive upper bound
 
@@ -241,7 +196,6 @@ proc streamBndJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
         let region = job.chrom & ":" & $regLo & "-" & $regHi
         for vb in vcfB.query(region):
           let posB = vb.POS
-          # Skip records the previous query already cached (boundary dedup).
           if posB < queryLo: continue
           let p2B = readPos2(vb, pos2Data)
           if not p2B.ok: continue
@@ -249,14 +203,10 @@ proc streamBndJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
           if not c2B.ok: continue
           cache.addLast(BndCacheRec(
             pos: posB, pos2: p2B.pos2, bOff: readBoff(vb, boffData),
-            chr2: c2B.chr2, id: $vb.ID, extra: extract(vb),
+            chr2: c2B.chr2,
           ))
       cacheEnd = queryHi
 
-    # Emit: scan the cache (now == the window contents) and dispatch
-    # passing pairs. Indexed iteration avoids a generic-deque `items`
-    # resolution issue when BndCacheRec depends on the proc's type
-    # parameter `B`.
     for i in 0 ..< cache.len:
       let cand = cache[i]
       if cand.chr2 != chr2A: continue
@@ -265,12 +215,8 @@ proc streamBndJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
       let d1 = abs(cand.pos - posA)
       let sim = (twoSlop - float64(d1) - float64(d2)) / twoSlop
       if sim <= 0: continue                  ## safety net (band check enforces)
-      let buffered = BufferedRec(
-        pos: cand.pos, endPos: cand.pos + 1, id: cand.id, bOffset: cand.bOff,
-      )
-      let pr = emit(va, posA, pos2A, aOff, buffered, cand.extra, sim)
-      if pr.keep:
-        result.add(pr.item)
+      if cfg.selfMode and aOff >= cand.bOff: continue
+      result.add(MatchPair(aOff: aOff, bOff: cand.bOff, sim: sim))
 
   vcfA.close()
   vcfB.close()

@@ -14,7 +14,7 @@
 import std/[algorithm, atomics, os, sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
-import utils, preproc, log, bins, matchcore
+import utils, preproc, log, matchcore
 
 # ---------------------------------------------------------------------------
 # Types
@@ -223,52 +223,61 @@ proc extractDbValues(v: Variant; dbFields: seq[string];
       if v.info().get(name, sBuf) == Status.OK and sBuf.len > 0:
         result[name] = sBuf.split(',')
 
-proc runAnnoJob*(job: MatchJob; cfg: AnnoConfig;
-                 dbTypes: Table[string, string]): seq[AnnoMatch] =
-  ## Anno-mode adapter over `streamJobPairs` (interval matches). The
-  ## `extract` callback pulls user-requested DB INFO values off each B
-  ## candidate during the same tile fetch that match-mode uses; the `emit`
-  ## callback wraps the pair into an AnnoMatch. No self-mode filter — anno
-  ## is asymmetric (input vs database) by construction.
-  let dbFields = cfg.dbFields
-  # Scratch buffers reused across all extract() calls within this job.
+proc collectBFields(path, chrom: string; needed: HashSet[int64];
+                    dbFields: seq[string]; dbTypes: Table[string, string]):
+    Table[int64, tuple[posB: int64; payload: DbPayload]] =
+  ## Scan a slim B BCF for `chrom`, capturing POS and the requested DB INFO
+  ## values for every record whose MATCHA_BOFF is in `needed`. The slim B
+  ## BCFs already carry the user-requested DB fields (via preproc's
+  ## extraKeepInfo), so no original-file seek is required.
+  var vcf: VCF
+  if not open(vcf, path):
+    raise newException(IOError, "cannot reopen slim B BCF: " & path)
+  var boffData: seq[int32]
   var iBuf: seq[int32]
   var fBuf: seq[float32]
   var sBuf: string
+  for v in vcf.query(chrom):
+    let off = readBoff(v, boffData)
+    if off notin needed: continue
+    result[off] = (v.POS, extractDbValues(v, dbFields, dbTypes, iBuf, fBuf, sBuf))
+  vcf.close()
 
-  streamJobPairs[DbPayload, AnnoMatch](job, MatchConfig(
-      metric: cfg.metric, threshold: cfg.threshold, bndSlop: cfg.bndSlop),
-    extract = proc(v: Variant): DbPayload =
-      extractDbValues(v, dbFields, dbTypes, iBuf, fBuf, sBuf),
-    emit = proc(va: Variant; posA, endA, aOff: int64;
-                cand: BufferedRec; bExtra: DbPayload;
-                sim: float64): PairResult[AnnoMatch] =
-      PairResult[AnnoMatch](keep: true, item: AnnoMatch(
-        aOffset:    aOff, bOffset: cand.bOffset, posB: cand.pos,
-        similarity: sim,
-        payload:    bExtra,
-      )))
+proc resolveAnnoPairs(job: MatchJob; pairs: seq[MatchPair];
+                      dbFields: seq[string];
+                      dbTypes: Table[string, string]): seq[AnnoMatch] =
+  ## Materialise AnnoMatches by scanning each B slim BCF once for the
+  ## offsets that participated in at least one match. extractDbValues runs
+  ## only for matched B records — a net win over the previous design which
+  ## extracted DB INFO for every B fetched into a tile, even unmatched ones.
+  if pairs.len == 0: return
+  var needB: HashSet[int64]
+  for p in pairs: needB.incl(p.bOff)
+  var fieldsB: Table[int64, tuple[posB: int64; payload: DbPayload]]
+  for _, pathB in job.binsB:
+    for off, f in collectBFields(pathB, job.chrom, needB, dbFields, dbTypes):
+      fieldsB[off] = f
+  for p in pairs:
+    let f = fieldsB[p.bOff]
+    result.add(AnnoMatch(
+      aOffset:    p.aOff, bOffset: p.bOff, posB: f.posB,
+      similarity: p.sim, payload: f.payload,
+    ))
+
+proc runAnnoJob*(job: MatchJob; cfg: AnnoConfig;
+                 dbTypes: Table[string, string]): seq[AnnoMatch] =
+  ## Anno-mode adapter: run the minimal matcher, then resolve DB INFO
+  ## for matched B records via a single sequential scan of the slim B BCFs.
+  let pairs = streamJobPairs(job, MatchConfig(
+    metric: cfg.metric, threshold: cfg.threshold, bndSlop: cfg.bndSlop))
+  resolveAnnoPairs(job, pairs, cfg.dbFields, dbTypes)
 
 proc runAnnoBndJob*(job: MatchJob; cfg: AnnoConfig;
                     dbTypes: Table[string, string]): seq[AnnoMatch] =
-  ## Anno-mode BND adapter. Uses streamBndJobPairs with slop-based proximity.
-  let dbFields = cfg.dbFields
-  var iBuf: seq[int32]
-  var fBuf: seq[float32]
-  var sBuf: string
-
-  streamBndJobPairs[DbPayload, AnnoMatch](job, MatchConfig(
-      metric: cfg.metric, threshold: cfg.threshold, bndSlop: cfg.bndSlop),
-    extract = proc(v: Variant): DbPayload =
-      extractDbValues(v, dbFields, dbTypes, iBuf, fBuf, sBuf),
-    emit = proc(va: Variant; posA, pos2A, aOff: int64;
-                cand: BufferedRec; bExtra: DbPayload;
-                sim: float64): PairResult[AnnoMatch] =
-      PairResult[AnnoMatch](keep: true, item: AnnoMatch(
-        aOffset:    aOff, bOffset: cand.bOffset, posB: cand.pos,
-        similarity: sim,
-        payload:    bExtra,
-      )))
+  ## Anno-mode BND adapter: slop-based proximity, same resolution model.
+  let pairs = streamBndJobPairs(job, MatchConfig(
+    metric: cfg.metric, threshold: cfg.threshold, bndSlop: cfg.bndSlop))
+  resolveAnnoPairs(job, pairs, cfg.dbFields, dbTypes)
 
 proc dispatchAnnoJob(job: MatchJob; cfg: AnnoConfig;
                      dbTypes: Table[string, string]): seq[AnnoMatch] {.inline.} =

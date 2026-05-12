@@ -8,7 +8,7 @@ Compiled, efficient structural variant (SV) matching and annotation tool written
 |---|---|
 | `matcha match` — pairwise matching between two SV callsets | complete |
 | `matcha anno` — annotate a query callset from a population database VCF | complete |
-| `matcha collapse` — merge SVs from multiple callers within one sample | planned |
+| `matcha collapse` — cluster SVs from multiple callers within one sample, emit one representative per cluster | complete (single-sample enforcement pending) |
 | `matcha merge` — merge SVs across samples into a cohort pVCF | planned |
 
 DEL/DUP/INV match by coordinate + size (reciprocal overlap or Jaccard). BND records match by breakend proximity. INS is out of scope (silent skip). Genotypes are ignored.
@@ -63,10 +63,10 @@ Tab-separated. Skip comment lines with `grep -v ^#` or `awk '!/^#/'`.
 
 ```
 ##matcha_metric=<overlap|jaccard>
-#CHROM  POS_A  END_A  ID_A  POS_B  END_B  ID_B  SVTYPE  SIMILARITY
+#CHROM_A  POS_A  END_A  ID_A  CHROM_B  POS_B  END_B  ID_B  SVTYPE  SIMILARITY
 ```
 
-BND rows emit `.` for `END_A` and `END_B`.
+BND rows emit `.` for `END_A` and `END_B`. `CHROM_A` and `CHROM_B` are always equal in the current matcher (each job is per-chromosome); the two columns make the schema explicit for future cross-chrom pairing.
 
 ---
 
@@ -106,6 +106,61 @@ Available as SRCFIELD in any `-a` expression:
 - `MATCHA_SIMILARITY` — Float vector, one value per match (interval metric or BND proximity score).
 
 A `##matcha_metric=<overlap|jaccard>` line is written to the output header.
+
+---
+
+## matcha collapse
+
+Cluster equivalent SVs from N single-sample callsets (e.g. Delly + Manta + GRIDSS run on the same sample) and emit one representative record per cluster, with provenance INFO fields recording which callers contributed.
+
+```
+matcha collapse [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
+
+  --min-overlap FLOAT          (exactly one of these two is required)
+  --min-jaccard FLOAT
+  --bnd-slop INT               default 100
+  --linkage average|single|complete   agglomerative linkage (default: average)
+  --priority CRITERIA          comma-separated tiebreak cascade for representative
+                               selection: PASS, QUAL, CENTRE, ORDER
+                               default: PASS,CENTRE,ORDER
+                               ORDER is always appended as the final tiebreaker
+  --format FIELDS              comma-separated FORMAT fields to carry (default: GT)
+  --info FIELDS                comma-separated INFO fields to keep
+                               (default: all, post conflict resolution)
+  -o, --output PATH            output (.vcf | .vcf.gz | .bcf); default stdout VCF
+  --threads INT                default 1
+  --tmp-dir PATH
+  -v, --verbose
+  -h, --help
+```
+
+### Input naming
+
+Each positional may be prefixed with `Name:` (e.g. `Delly:delly.bcf`); without a prefix, the basename without extension is used. Names appear in provenance fields and drive the `CENTRE` priority criterion.
+
+### Representative selection
+
+Within each cluster, the representative record is picked by walking the `--priority` cascade until one criterion decides:
+
+- `PASS` — prefer records with `FILTER=PASS`.
+- `QUAL` — prefer higher `QUAL` (BCF missing values lose).
+- `CENTRE` — prefer callers earlier in the command line.
+- `ORDER` — implicit final tiebreaker; preserves record order from the input.
+
+### Linkage
+
+`--linkage` controls the agglomerative cluster definition: `single` (any pair above threshold links), `average` (mean pairwise similarity ≥ threshold; default), or `complete` (all pairwise similarities must be ≥ threshold).
+
+### Output
+
+Per-cluster INFO fields added to the output:
+
+- `SOURCE` — name of the caller providing the representative record.
+- `SOURCELIST` — names of all callers contributing to the cluster (CLI order).
+- `N_SOURCE` — distinct input callsets in the cluster.
+- `N_MERGED` — total records merged into the cluster (≥ `N_SOURCE`).
+
+Conflict-resolved INFO fields (e.g. differing `SVLEN` across callers) and FORMAT fields configured via `--info` / `--format` are carried through from the representative record.
 
 ---
 
