@@ -47,10 +47,8 @@ type
     dbNumber*:   string        ## "1" / "." / "N" (DB-sourced only)
 
   AnnoConfig* = object
-    minOverlap*:    float64
-    minJaccard*:    float64
-    minOverlapSet*: bool
-    minJaccardSet*: bool
+    metric*:        Metric       ## Active interval metric (mOverlap | mJaccard).
+    threshold*:     float64      ## Minimum score for the active metric.
     bndSlop*:       int          ## --bnd-slop (default 100)
     overwrite*:     bool
     nThreads*:      int
@@ -233,24 +231,21 @@ proc runAnnoJob*(job: MatchJob; cfg: AnnoConfig;
   ## callback wraps the pair into an AnnoMatch. No self-mode filter — anno
   ## is asymmetric (input vs database) by construction.
   let dbFields = cfg.dbFields
-  let useOverlap = cfg.minOverlapSet
   # Scratch buffers reused across all extract() calls within this job.
   var iBuf: seq[int32]
   var fBuf: seq[float32]
   var sBuf: string
 
   streamJobPairs[DbPayload, AnnoMatch](job, MatchConfig(
-      minOverlap: cfg.minOverlap, minJaccard: cfg.minJaccard,
-      minOverlapSet: cfg.minOverlapSet, minJaccardSet: cfg.minJaccardSet,
-    ),
+      metric: cfg.metric, threshold: cfg.threshold, bndSlop: cfg.bndSlop),
     extract = proc(v: Variant): DbPayload =
       extractDbValues(v, dbFields, dbTypes, iBuf, fBuf, sBuf),
     emit = proc(va: Variant; posA, endA, aOff: int64;
                 cand: BufferedRec; bExtra: DbPayload;
-                ovl, jac: float64): PairResult[AnnoMatch] =
+                sim: float64): PairResult[AnnoMatch] =
       PairResult[AnnoMatch](keep: true, item: AnnoMatch(
         aOffset:    aOff, bOffset: cand.bOffset, posB: cand.pos,
-        similarity: (if useOverlap: ovl else: jac),
+        similarity: sim,
         payload:    bExtra,
       )))
 
@@ -263,10 +258,7 @@ proc runAnnoBndJob*(job: MatchJob; cfg: AnnoConfig;
   var sBuf: string
 
   streamBndJobPairs[DbPayload, AnnoMatch](job, MatchConfig(
-      minOverlap: cfg.minOverlap, minJaccard: cfg.minJaccard,
-      minOverlapSet: cfg.minOverlapSet, minJaccardSet: cfg.minJaccardSet,
-      bndSlop: cfg.bndSlop,
-    ),
+      metric: cfg.metric, threshold: cfg.threshold, bndSlop: cfg.bndSlop),
     extract = proc(v: Variant): DbPayload =
       extractDbValues(v, dbFields, dbTypes, iBuf, fBuf, sBuf),
     emit = proc(va: Variant; posA, pos2A, aOff: int64;
@@ -415,7 +407,7 @@ proc validateOutputPath(p: string) =
 proc registerOutputHeader(h: vcf.Header; cfg: AnnoConfig) =
   # Record the active interval metric. BND rows always use slop-similarity;
   # this line documents which metric drove interval matching in this run.
-  let metricName = if cfg.minOverlapSet: "overlap" else: "jaccard"
+  let metricName = $cfg.metric
   discard h.add_string("##matcha_metric=" & metricName)
   for e in cfg.exprs:
     let (num, typ) = outputNumberType(e)
@@ -489,8 +481,7 @@ proc runAnno*(cfg: var AnnoConfig) =
 
   # buildWorkQueue takes a MatchConfig; build a shim with matching thresholds.
   var matchCfg = MatchConfig(
-    minOverlap: cfg.minOverlap, minJaccard: cfg.minJaccard,
-    minOverlapSet: cfg.minOverlapSet, minJaccardSet: cfg.minJaccardSet,
+    metric: cfg.metric, threshold: cfg.threshold,
     nThreads: cfg.nThreads, tmpDir: cfg.tmpDir, selfMode: false,
   )
   let jobs = buildWorkQueue(filesA, filesB, matchCfg)

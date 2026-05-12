@@ -59,17 +59,18 @@ type
   BExtractCb*[B] = proc(v: Variant): B {.closure.}
   PairEmitCb*[B, R] = proc(va: Variant; posA, endA, aOff: int64;
                             cand: BufferedRec; bExtra: B;
-                            ovl, jac: float64): PairResult[R] {.closure.}
+                            sim: float64): PairResult[R] {.closure.}
 
 proc streamJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
                            extract: BExtractCb[B];
                            emit: PairEmitCb[B, R]): seq[R] =
   ## Drive the per-job match: stream A from the per-(svtype, binA) BCF
   ## restricted to job.chrom, fetch B candidates lazily through TiledBuffers,
-  ## compute overlap/jaccard, apply the threshold filter, and dispatch each
-  ## passing pair to `emit`. The optional `extract` callback runs once per
-  ## fetched B record and its return value is threaded into the matching
-  ## `emit` call — used by anno mode to carry user-requested INFO values.
+  ## compute the active interval metric (reciprocal overlap or Jaccard,
+  ## chosen via cfg.metric), apply the threshold, and dispatch each passing
+  ## pair to `emit`. The optional `extract` callback runs once per fetched
+  ## B record and its return value is threaded into the matching `emit`
+  ## call — used by anno mode to carry user-requested INFO values.
   var vcfA: VCF
   if not open(vcfA, job.pathA):
     raise newException(IOError, "cannot open A BCF: " & job.pathA)
@@ -129,17 +130,18 @@ proc streamJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
       let cands = buffers[b].getCandidates(posA, endA,
         proc(ti: int): seq[BufferedRec] = fetchTile(b, ti))
       for cand in cands:
-        let ovl = reciprocalOverlap(posA, endA, cand.pos, cand.endPos)
-        let jac = jaccard(posA, endA, cand.pos, cand.endPos)
-        let passOverlap = (not cfg.minOverlapSet) or (ovl >= cfg.minOverlap)
-        let passJaccard = (not cfg.minJaccardSet) or (jac >= cfg.minJaccard)
-        if passOverlap and passJaccard:
-          let bExtra =
-            if cand.bOffset in bExtras[b]: bExtras[b][cand.bOffset]
-            else: default(B)
-          let pr = emit(va, posA, endA, aOff, cand, bExtra, ovl, jac)
-          if pr.keep:
-            result.add(pr.item)
+        let sim =
+          if cfg.metric == mOverlap:
+            reciprocalOverlap(posA, endA, cand.pos, cand.endPos)
+          else:
+            jaccard(posA, endA, cand.pos, cand.endPos)
+        if sim < cfg.threshold: continue
+        let bExtra =
+          if cand.bOffset in bExtras[b]: bExtras[b][cand.bOffset]
+          else: default(B)
+        let pr = emit(va, posA, endA, aOff, cand, bExtra, sim)
+        if pr.keep:
+          result.add(pr.item)
 
     # Evict tiles no future A record can need; payloads for those B records
     # become unreachable too — drop them in parallel to keep memory bounded.
@@ -265,7 +267,6 @@ proc streamBndJobPairs*[B, R](job: MatchJob; cfg: MatchConfig;
       if sim <= 0: continue                  ## safety net (band check enforces)
       let buffered = BufferedRec(
         pos: cand.pos, endPos: cand.pos + 1, id: cand.id, bOffset: cand.bOff,
-        chr2: cand.chr2, pos2: cand.pos2,
       )
       let pr = emit(va, posA, pos2A, aOff, buffered, cand.extra, sim)
       if pr.keep:

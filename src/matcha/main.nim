@@ -57,8 +57,8 @@ proc matchUsage(code: int = 1) =
   f.writeLine "  -v, --verbose                   verbose logging to stderr"
   f.writeLine "  -h, --help                      show this help"
   f.writeLine ""
-  f.writeLine "Exactly one of --min-overlap or --min-jaccard is required."
-  f.writeLine "BND rows are matched by --bnd-slop only; the chosen metric drives interval rows."
+  f.writeLine "Exactly one of --min-overlap or --min-jaccard is required —"
+  f.writeLine "the active metric for interval matches. BND rows use --bnd-slop independently."
   f.writeLine ""
   f.writeLine "Output is tab-separated. A ##matcha_metric=<overlap|jaccard> preamble"
   f.writeLine "precedes the #-prefixed header line. Columns:"
@@ -69,6 +69,10 @@ proc matchUsage(code: int = 1) =
 proc runMatch(rawArgs: seq[string]) =
   var cfg = MatchConfig(nThreads: 1, bndSlop: 100)
   var positionals: seq[string]
+  # Track which metric flag(s) were supplied so we can enforce the xor rule
+  # after parsing. The cfg.metric / cfg.threshold fields don't carry "unset"
+  # state on their own.
+  var overlapSet, jaccardSet: bool
   var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
   while true:
     p.next()
@@ -78,18 +82,20 @@ proc runMatch(rawArgs: seq[string]) =
       case p.key
       of "min-overlap":
         let v = nextVal(p, "min-overlap")
-        try: cfg.minOverlap = parseFloat(v)
+        try: cfg.threshold = parseFloat(v)
         except ValueError:
           stderr.writeLine "error: --min-overlap must be a float, got: " & v
           quit(1)
-        cfg.minOverlapSet = true
+        cfg.metric = mOverlap
+        overlapSet = true
       of "min-jaccard":
         let v = nextVal(p, "min-jaccard")
-        try: cfg.minJaccard = parseFloat(v)
+        try: cfg.threshold = parseFloat(v)
         except ValueError:
           stderr.writeLine "error: --min-jaccard must be a float, got: " & v
           quit(1)
-        cfg.minJaccardSet = true
+        cfg.metric = mJaccard
+        jaccardSet = true
       of "bnd-slop":
         let v = nextVal(p, "bnd-slop")
         try: cfg.bndSlop = parseInt(v)
@@ -124,8 +130,8 @@ proc runMatch(rawArgs: seq[string]) =
     of cmdArgument:
       positionals.add(p.key)
 
-  if cfg.minOverlapSet == cfg.minJaccardSet:
-    if cfg.minOverlapSet:
+  if overlapSet == jaccardSet:
+    if overlapSet:
       stderr.writeLine "error: --min-overlap and --min-jaccard are mutually exclusive"
     else:
       stderr.writeLine "error: exactly one of --min-overlap or --min-jaccard is required"
@@ -264,6 +270,7 @@ proc annoHelp() =
 proc runAnnoCli(rawArgs: seq[string]) =
   var cfg = AnnoConfig(nThreads: 1, bndSlop: 100)
   var positionals: seq[string]
+  var overlapSet, jaccardSet: bool
   var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
   while true:
     p.next()
@@ -282,18 +289,20 @@ proc runAnnoCli(rawArgs: seq[string]) =
         cfg.outputPath = nextVal(p, "o")
       of "min-overlap":
         let v = nextVal(p, "min-overlap")
-        try: cfg.minOverlap = parseFloat(v)
+        try: cfg.threshold = parseFloat(v)
         except ValueError:
           stderr.writeLine "error: --min-overlap must be a float, got: " & v
           quit(1)
-        cfg.minOverlapSet = true
+        cfg.metric = mOverlap
+        overlapSet = true
       of "min-jaccard":
         let v = nextVal(p, "min-jaccard")
-        try: cfg.minJaccard = parseFloat(v)
+        try: cfg.threshold = parseFloat(v)
         except ValueError:
           stderr.writeLine "error: --min-jaccard must be a float, got: " & v
           quit(1)
-        cfg.minJaccardSet = true
+        cfg.metric = mJaccard
+        jaccardSet = true
       of "bnd-slop":
         let v = nextVal(p, "bnd-slop")
         try: cfg.bndSlop = parseInt(v)
@@ -326,8 +335,8 @@ proc runAnnoCli(rawArgs: seq[string]) =
     of cmdArgument:
       positionals.add(p.key)
 
-  if cfg.minOverlapSet == cfg.minJaccardSet:
-    if cfg.minOverlapSet:
+  if overlapSet == jaccardSet:
+    if overlapSet:
       stderr.writeLine "error: --min-overlap and --min-jaccard are mutually exclusive"
     else:
       stderr.writeLine "error: exactly one of --min-overlap or --min-jaccard is required"

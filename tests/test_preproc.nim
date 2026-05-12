@@ -37,7 +37,7 @@ template delBin0(pp: PreprocOutput): string = pp.paths[(svDEL, 0)]
 # A MatchConfig with --min-overlap 0.5 (same as smoke tests). buildWorkQueue
 # uses the threshold for adjacent-bin pruning.
 proc baseCfg(): MatchConfig =
-  MatchConfig(minOverlap: 0.5, minOverlapSet: true, nThreads: 1)
+  MatchConfig(metric: mOverlap, threshold: 0.5, nThreads: 1)
 
 # P01 — preprocessVcf produces the expected (svtype, bin) keys + chroms
 timed("P01", "preprocessVcf: (svtype, bin) keys + chromsBySvtype + populatedBins"):
@@ -192,18 +192,20 @@ proc readRecords(path: string): seq[tuple[id: string, pos: int64, endPos: int64,
                 infoNames: infoNames, svlen: svlenVal))
   vcf.close()
 
-# P08 — INFO is slimmed to keep-set only after preprocessing
+# P08 — INFO is slimmed to per-SVTYPE keep-set only after preprocessing
 timed("P08", "preprocessVcf: temp BCF records have only keep-set INFO fields"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
-  let allowed = ["SVTYPE", "SVLEN", "END", "CHR2", "END2", "POS2",
-                 "MATCHA_BOFF"].toHashSet
-  for path in pp.paths.values:
+  let allowedInterval = ["END", "MATCHA_BOFF"].toHashSet
+  let allowedBnd      = ["CHR2", "POS2", "MATCHA_BOFF"].toHashSet
+  for key, path in pp.paths:
+    let allowed = if key.svtype == svBND: allowedBnd else: allowedInterval
     for rec in readRecords(path):
       for name in rec.infoNames:
         doAssert name in allowed,
-          "unexpected INFO field " & name & " in " & rec.id
+          "unexpected INFO field " & name & " in " & rec.id &
+          " (svtype=" & $key.svtype & ")"
 
 # P09 — record with ID="." gets synthesized (CHROM_POS_SVTYPE_LINENUMBER)
 timed("P09", "preprocessVcf: missing ID is synthesized"):
@@ -227,7 +229,6 @@ timed("P10", "preprocessVcf: ALT-symbolic SVTYPE (TC12) routed to (DEL, 0)"):
   var found = false
   for rec in readRecords(pp.delBin0):
     if rec.id == "DEL_A_12_alt_only":
-      doAssert rec.svtype == "DEL", "expected SVTYPE=DEL, got " & rec.svtype
       found = true
       break
   doAssert found, "DEL_A_12_alt_only missing from (DEL, 0) BCF"
@@ -240,7 +241,6 @@ timed("P11", "preprocessVcf: ALT wins on SVTYPE conflict (TC13)"):
   var inDel = false
   for rec in readRecords(pp.delBin0):
     if rec.id == "DEL_A_13_conflict":
-      doAssert rec.svtype == "DEL", "SVTYPE should be DEL after ALT wins"
       inDel = true
       break
   doAssert inDel, "DEL_A_13_conflict should be in (DEL, 0) BCF"
@@ -280,8 +280,6 @@ timed("P14", "preprocessVcf: inconsistent END/SVLEN → SVLEN := END-POS (TC17)"
       # Input: POS=43000, END=44000, INFO/SVLEN=-1500. END-POS=1000.
       # |1500-1000|/1500 = 33% > 10% → END wins, SVLEN normalized to 1000.
       doAssert rec.endPos == 44000, "END should be 44000, got " & $rec.endPos
-      doAssert rec.svlen == 1000,
-        "SVLEN should be normalized to 1000 (END-POS), got " & $rec.svlen
       found = true
       break
   doAssert found, "DEL_A_17_inconsistent missing from (DEL, 0) BCF"
@@ -350,7 +348,6 @@ timed("P16", "preprocessVcf: 5000bp DEL_A_08 lands in (DEL, bin 3)"):
     if rec.id == "DEL_A_08":
       doAssert rec.pos == 17000, "DEL_A_08 POS"
       doAssert rec.endPos == 22000, "DEL_A_08 END"
-      doAssert rec.svlen == 5000, "DEL_A_08 SVLEN should be normalized to 5000"
       foundLarge = true
       break
   doAssert foundLarge, "DEL_A_08 missing from (DEL, 3) BCF"

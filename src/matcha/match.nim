@@ -16,12 +16,11 @@ proc runMatchJob*(job: MatchJob, cfg: MatchConfig): seq[MatchResult] =
   ## pair and excludes the trivial X-vs-X case.
   let selfMode = cfg.selfMode
   let svtype = job.svtype
-  let useOverlap = cfg.minOverlapSet
   streamJobPairs[bool, MatchResult](job, cfg,
     extract = proc(v: Variant): bool = false,
     emit = proc(va: Variant; posA, endA, aOff: int64;
                 cand: BufferedRec; bExtra: bool;
-                ovl, jac: float64): PairResult[MatchResult] =
+                sim: float64): PairResult[MatchResult] =
       if selfMode and aOff >= cand.bOffset:
         return PairResult[MatchResult](keep: false)
       PairResult[MatchResult](keep: true, item: MatchResult(
@@ -29,7 +28,7 @@ proc runMatchJob*(job: MatchJob, cfg: MatchConfig): seq[MatchResult] =
         posA:       posA, endA: endA, idA: $va.ID,
         posB:       cand.pos, endB: cand.endPos, idB: cand.id,
         svtype:     svtype,
-        similarity: (if useOverlap: ovl else: jac),
+        similarity: sim,
         aOffset:    aOff, bOffset: cand.bOffset,
       )))
 
@@ -131,8 +130,7 @@ proc runMatch*(cfg: MatchConfig) =
     if cfg.outputPath == "": stdout
     else: open(cfg.outputPath, fmWrite)
 
-  let metricName = if cfg.minOverlapSet: "overlap" else: "jaccard"
-  outFile.writeLine("##matcha_metric=" & metricName)
+  outFile.writeLine("##matcha_metric=" & $cfg.metric)
   outFile.writeLine(OutputHeader)
 
   var totalMatches = 0

@@ -12,6 +12,13 @@ type
     svTRA = "TRA"
     svUNKNOWN = "UNKNOWN"
 
+  Metric* = enum
+    ## Active interval-match metric. Exactly one is chosen per run via
+    ## `--min-overlap` or `--min-jaccard`. BND matching is independent of
+    ## this — it uses `--bnd-slop`.
+    mOverlap = "overlap"
+    mJaccard = "jaccard"
+
   MatchResult* = object
     chrom*:      string
     posA*:       int64
@@ -23,15 +30,13 @@ type
     svtype*:     SvType
     similarity*: float64
     aOffset*:    int64    ## BGZF virtual offset of A's source record (0 if unknown).
-                          ## Populated for milestone-2 anno/merge/collapse;
-                          ## not emitted in match TSV output.
+                          ## Used by anno phase 3 to rejoin annotations against
+                          ## the original input. Not emitted in TSV output.
     bOffset*:    int64    ## Same as aOffset, for B.
 
   MatchConfig* = object
-    minOverlap*:      float64
-    minJaccard*:      float64
-    minOverlapSet*:   bool
-    minJaccardSet*:   bool
+    metric*:          Metric   ## Active interval metric (mOverlap | mJaccard).
+    threshold*:       float64  ## Minimum score for the active metric (0.0-1.0).
     bndSlop*:         int      ## --bnd-slop (default 100); both breakends of a
                                ## BND pair must lie within this many bp.
     nThreads*:        int

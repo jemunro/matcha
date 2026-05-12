@@ -6,8 +6,8 @@
 ##   * Resolve SVLEN (INFO/SVLEN abs; END-POS fallback; warn+normalize on >10%
 ##     disagreement when both INFO fields were independently provided).
 ##   * Synthesize ID if absent ("." or empty) → CHROM_POS_SVTYPE_LINENUMBER.
-##   * Slim INFO to the keep-set (SVTYPE, SVLEN, END, CHR2, END2, POS2,
-##     MATCHA_BOFF).
+##   * Slim INFO to the per-SVTYPE keep-set:
+##     intervals → {END, MATCHA_BOFF}; BND → {CHR2, POS2, MATCHA_BOFF}.
 ##   * Compute size-bin via bins.binIndexFor(SVLEN).
 ##   * Write to a per-(SVTYPE, bin) BCF spanning all chroms; CSI-indexed.
 ##
@@ -75,11 +75,23 @@ type
     cap:          int
     callset:      string
 
-const KeepInfo = ["SVTYPE", "SVLEN", "END", "CHR2", "END2", "POS2", "MATCHA_BOFF"]
+# INFO fields kept in each class of temp BCF. SVTYPE is encoded in the filename;
+# SVLEN is derivable from END-POS and matchcore never reads it.
+const IntervalInfoDefs = [
+  ("END",         "1", "Integer", "End position of the SV (1-based, inclusive)"),
+  ("MATCHA_BOFF", "2", "Integer",
+   "matcha-internal: source-file BGZF virtual offset (high32, low32)"),
+]
+const BndInfoDefs = [
+  ("CHR2",        "1", "String",  "Chromosome of mate breakend"),
+  ("POS2",        "1", "Integer", "Position of mate breakend"),
+  ("MATCHA_BOFF", "2", "Integer",
+   "matcha-internal: source-file BGZF virtual offset (high32, low32)"),
+]
 
 # Standard SV INFO definitions to backfill when the input header omits them.
 # Without these, info.set() at write time fails because hts-nim resolves
-# the field's type via the (reader's) header.
+# the field's type via the (reader's) header. Applied to the INPUT VCF only.
 const SvInfoDefs = [
   ("SVTYPE",      "1", "String",  "Type of structural variant"),
   ("SVLEN",       "1", "Integer", "Length of the SV (absolute value, positive)"),
@@ -227,6 +239,42 @@ proc tempBcfPath(tmpDir, prefix, svtype: string, binIdx: int): string =
   tmpDir / "matcha_" & $getCurrentProcessId() & "_" & prefix & "_" &
            svtype & "_b" & $binIdx & ".bcf"
 
+proc hrecToLine(h: ptr bcf_hrec_t): string =
+  let keys = cast[ptr UncheckedArray[cstring]](h.keys)
+  let vals = cast[ptr UncheckedArray[cstring]](h.vals)
+  result = "##INFO=<"
+  for i in 0 ..< h.nkeys.int:
+    if i > 0: result &= ","
+    result &= $keys[i] & "=" & $vals[i]
+  result &= ">"
+
+proc buildSlimHdr(src: ptr bcf_hdr_t,
+                  infoDefs: openArray[(string, string, string, string)],
+                  extraKeepInfo: openArray[string]): ptr bcf_hdr_t =
+  ## Duplicate src, strip all FORMAT and INFO defs, then add back only the
+  ## fields in infoDefs plus any extraKeepInfo fields (re-serialised verbatim
+  ## from the source hrec so that types are preserved for decode in anno).
+  result = bcf_hdr_dup(src)
+  bcf_hdr_remove(result, BCF_HEADER_TYPE.BCF_HL_FMT.cint, nil)
+  bcf_hdr_remove(result, BCF_HEADER_TYPE.BCF_HL_INFO.cint, nil)
+  for (id, num, typ, desc) in infoDefs:
+    discard bcf_hdr_append(result,
+      ("##INFO=<ID=" & id & ",Number=" & num & ",Type=" & typ &
+       ",Description=\"" & desc & "\">").cstring)
+  if extraKeepInfo.len > 0:
+    let extraSet = toHashSet(extraKeepInfo)
+    let hrecs = cast[ptr UncheckedArray[ptr bcf_hrec_t]](src.hrec)
+    for i in 0 ..< src.nhrec.int:
+      let hrec = hrecs[i]
+      if hrec.`type` != BCF_HEADER_TYPE.BCF_HL_INFO.cint: continue
+      let keys = cast[ptr UncheckedArray[cstring]](hrec.keys)
+      let vals = cast[ptr UncheckedArray[cstring]](hrec.vals)
+      for j in 0 ..< hrec.nkeys.int:
+        if $keys[j] == "ID" and $vals[j] in extraSet:
+          discard bcf_hdr_append(result, hrecToLine(hrec).cstring)
+          break
+  discard bcf_hdr_sync(result)
+
 proc captureChromOrder(h: vcf.Header): seq[string] =
   ## Return contig IDs in the order they appear in the VCF header.
   var n: cint = 0
@@ -252,11 +300,18 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   vcf.set_samples(@["^"])
   ensureSvInfoDefs(vcf.header)
 
-  # Build the effective keep-set once. HashSet membership check is O(1) and
-  # avoids re-scanning extraKeepInfo for every INFO field on every record.
-  var keepSet = initHashSet[string]()
-  for n in KeepInfo: keepSet.incl(n)
-  for n in extraKeepInfo: keepSet.incl(n)
+  # Per-SVTYPE keep-sets (HashSet membership is O(1) per INFO field per record).
+  var keepSetInterval = initHashSet[string]()
+  var keepSetBnd      = initHashSet[string]()
+  for (id, _, _, _) in IntervalInfoDefs: keepSetInterval.incl(id)
+  for (id, _, _, _) in BndInfoDefs:      keepSetBnd.incl(id)
+  for n in extraKeepInfo:
+    keepSetInterval.incl(n)
+    keepSetBnd.incl(n)
+
+  # Slim header templates: built once, duped per writer.
+  let slimHdrInterval = buildSlimHdr(vcf.header.hdr, IntervalInfoDefs, extraKeepInfo)
+  let slimHdrBnd      = buildSlimHdr(vcf.header.hdr, BndInfoDefs,      extraKeepInfo)
 
   var writers: Table[SvtypeBin, VCF]
   var indexes: Table[SvtypeBin, ptr hts_idx_t]
@@ -359,29 +414,27 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
         v.ID = synthesizeId($v.CHROM, v.POS, svt, lineno)
         inc ws.syntheticId
 
-      # Slim INFO: drop everything outside the keep-set (two-phase to avoid
-      # iterator invalidation as we delete).
+      # Slim INFO: drop everything outside the per-SVTYPE keep-set (two-phase
+      # to avoid iterator invalidation as we delete).
+      let activeKeepSet = if svt == svBND: keepSetBnd else: keepSetInterval
       toDelete.setLen(0)
       for fld in v.info.fields:
-        if fld.name notin keepSet:
+        if fld.name notin activeKeepSet:
           toDelete.add(fld.name)
       for name in toDelete:
         discard v.info.delete(name)
 
-      # Authoritative writes (overwrite whatever was there with normalized values)
-      var svtStr = $svt
-      discard v.info.set("SVTYPE", svtStr)
-      var svlenI32 = svlen.int32
-      discard v.info.set("SVLEN", svlenI32)
-      var endI32 = endPos.int32
-      discard v.info.set("END", endI32)
-
+      # Authoritative writes — only the fields in the active keep-set.
       if svt == svBND:
         # ALT parse wins over any stale INFO/CHR2 or INFO/POS2 in the input.
+        # endPos (= POS+1) is used only for hts_idx_push below; not written.
         var chr2Str = bndChr2
         discard v.info.set("CHR2", chr2Str)
         var pos2I32 = bndPos2.int32
         discard v.info.set("POS2", pos2I32)
+      else:
+        var endI32 = endPos.int32
+        discard v.info.set("END", endI32)
 
       # Encode the source-file offset as INFO/MATCHA_BOFF (Number=2, Integer)
       boffPair[0] = cast[int32]((recordOffset shr 32) and 0xFFFFFFFF'i64)
@@ -395,7 +448,10 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
         var wtr: VCF
         if not open(wtr, path, mode = "wb"):
           raise newException(IOError, "cannot create temp BCF: " & path)
-        wtr.copy_header(vcf.header)
+        wtr.copy_header(vcf.header)   # initializes wtr.header (open leaves it nil)
+        let slimHdr = if svt == svBND: slimHdrBnd else: slimHdrInterval
+        bcf_hdr_destroy(wtr.header.hdr)
+        wtr.header.hdr = bcf_hdr_dup(slimHdr)
         wtr.set_samples(@["^"])   # temp BCFs carry no sample columns
         discard wtr.write_header()
         let headerOff = uint64(bgzf_tell(bgzfHandle(wtr)))
@@ -410,6 +466,10 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
       if svt notin result.populatedBins:
         result.populatedBins[svt] = {}
       result.populatedBins[svt].incl(uint8(binIdx))
+
+      # REF/ALT/QUAL are unused by matchcore — blank them out to shrink the record.
+      discard bcf_update_alleles_str(vcf.header.hdr, v.c, "N\t.")
+      v.c.qual = cast[cfloat](bcf_float_missing.uint32)
 
       discard writers[key].write_variant(v)
       let woff = uint64(bgzf_tell(bgzfHandle(writers[key])))
@@ -432,6 +492,9 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
     hts_idx_save(indexes[key], path.cstring, HTS_FMT_CSI.cint)
     hts_idx_destroy(indexes[key])
 
+  bcf_hdr_destroy(slimHdrInterval)
+  bcf_hdr_destroy(slimHdrBnd)
+
   logV("[" & prefix & "] indexed " & $result.paths.len &
        " temp BCFs ((svtype, bin) groups)")
   emitSummary(ws)
@@ -448,16 +511,7 @@ proc buildWorkQueue*(a, b: PreprocOutput, cfg: MatchConfig): seq[MatchJob] =
   ##
   ## Job order: chrom in input header order, then svtype string, then binA.
 
-  # Binding threshold for size-bin adjacency: the stricter of the two.
-  # (Both metrics share the [lenA*t, lenA/t] size constraint, and a higher
-  # threshold yields a smaller adjacent set.)
-  let threshold =
-    if cfg.minOverlapSet and cfg.minJaccardSet:
-      max(cfg.minOverlap, cfg.minJaccard)
-    elif cfg.minOverlapSet:
-      cfg.minOverlap
-    else:
-      cfg.minJaccard
+  let threshold = cfg.threshold
 
   # Index of chrom → header order for sorting. Use A's chromOrder; fall back
   # to alphabetical for any chrom not in A's header (shouldn't happen since
