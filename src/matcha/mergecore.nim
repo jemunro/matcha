@@ -12,10 +12,10 @@
 ##   clusterAll            — full pipeline: components → agglomerate each
 ##   selectRepresentative  — priority-cascade representative selection
 
-import std/[algorithm, sequtils, sets, strutils, tables]
+import std/[sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
-import preproc, matchcore
+import preproc, matchcore, synced_bcf_reader
 
 # ---------------------------------------------------------------------------
 # Types
@@ -301,24 +301,28 @@ proc buildComponents*(simMap: Table[(int64, int64), float64];
 
 proc mergeSortSlimBcfs*(inputs: seq[string]; callerIdxs: seq[int];
                         outPath: string; chromOrder: seq[string]) =
-  ## Merge N slim BCFs for the same (svtype, bin) into a single coordinate-sorted
-  ## output BCF with a CSI index. Rewrites MATCHA_BOFF as a composite value:
+  ## Merge N slim BCFs for the same (svtype, bin) into a coordinate-sorted
+  ## output BCF with a CSI index using synced_bcf_reader for streaming.
+  ## Rewrites MATCHA_BOFF as a composite value:
   ##   compositeOff = (callerIdx.int64 shl 48) or origOff
   ## Works for k=1 (degenerate single-input pass that still rewrites BOFF + indexes).
+  ## Chromosome order follows the natural index order of the first reader.
   if inputs.len == 0: return
 
-  var readers = newSeq[VCF](inputs.len)
-  for i, path in inputs.pairs:
-    if not open(readers[i], path):
-      raise newException(IOError, "cannot open slim BCF: " & path)
+  let sr = bcf_sr_init()
+  if sr == nil:
+    raise newException(IOError, "bcf_sr_init failed")
+  discard bcf_sr_set_opt(sr, BCF_SR_ALLOW_NO_IDX)
 
-  # Build output header: dup first reader's slim header (correct INFO defs,
-  # correct contigs from the primary caller). Add any contigs from other
-  # callers that are missing from the first caller's header. This avoids
-  # bcf_hdr_remove for CTG lines (which can corrupt the internal ID table).
-  let outHdr = bcf_hdr_dup(readers[0].header.hdr)
+  for path in inputs:
+    if bcf_sr_add_reader(sr, path.cstring) == 0:
+      raise newException(IOError, "cannot open slim BCF for merge: " & path &
+                         " (" & $bcf_sr_strerror(srs_errnum(sr)) & ")")
 
-  # Collect contigs already in outHdr.
+  let nreaders = srs_nreaders(sr).int
+
+  # Build output header: dup first reader's slim header, add missing contigs.
+  let outHdr = bcf_hdr_dup(srs_get_header(sr, 0))
   var knownCtgs: HashSet[string]
   block:
     var n: cint = 0
@@ -326,11 +330,9 @@ proc mergeSortSlimBcfs*(inputs: seq[string]; callerIdxs: seq[int];
     if names != nil:
       for i in 0 ..< n.int: knownCtgs.incl($names[i])
       free(names)
-
-  # Add any missing contigs from other readers.
-  for ri in 1 ..< readers.len:
+  for ri in 1 ..< nreaders:
     var n: cint = 0
-    let names = bcf_hdr_seqnames(readers[ri].header.hdr, n.addr)
+    let names = bcf_hdr_seqnames(srs_get_header(sr, ri.cint), n.addr)
     if names != nil:
       for i in 0 ..< n.int:
         let c = $names[i]
@@ -340,77 +342,70 @@ proc mergeSortSlimBcfs*(inputs: seq[string]; callerIdxs: seq[int];
       free(names)
   discard bcf_hdr_sync(outHdr)
 
-  # Build chrom-name → output-rid mapping from the synced header.
-  var outChromRid: Table[string, cint]
-  block:
-    var n: cint = 0
-    let names = bcf_hdr_seqnames(outHdr, n.addr)
-    if names != nil:
-      for i in 0 ..< n.int: outChromRid[$names[i]] = cint(i)
-      free(names)
-
-  # Build chrom-name → chromOrder-index for sort key.
-  var chromIdx: Table[string, int]
-  for i, c in chromOrder.pairs: chromIdx[c] = i
-
-  type Entry = tuple[ci: int, pos: int64, ri: int, endPos: int64, rec: ptr bcf1_t]
-  var entries: seq[Entry]
-  var boffArr, endArr: seq[int32]
-
-  for ri, vcf in readers.pairs:
-    let callerIdx = callerIdxs[ri]
-    for v in vcf:
-      # Recode MATCHA_BOFF as composite (callerIdx | origOff).
-      boffArr.setLen(0)
-      discard v.info.get("MATCHA_BOFF", boffArr)
-      let origOff = if boffArr.len >= 2: decodeBoff(boffArr) else: 0'i64
-      var newBoff = encodeBoff((callerIdx.int64 shl 48) or origOff)
-      discard v.info.set("MATCHA_BOFF", newBoff)
-
-      # End position for CSI indexing (END for intervals, POS+1 for BNDs).
-      endArr.setLen(0)
-      discard v.info.get("END", endArr)
-      let endPos = if endArr.len > 0: int64(endArr[0]) else: int64(v.c.pos) + 1
-
-      # Remap chromosome to output header rid.
-      let chromName = $v.CHROM
-      let outRid = outChromRid.getOrDefault(chromName, cint(-1))
-      let recCopy = bcf_dup(v.c)
-      if outRid >= 0: recCopy.rid = outRid
-
-      entries.add((ci: chromIdx.getOrDefault(chromName, high(int)),
-                   pos: v.c.pos, ri: ri, endPos: endPos, rec: recCopy))
-
-  entries.sort(proc(a, b: Entry): int =
-    let c = cmp(a.ci, b.ci)
-    if c != 0: return c
-    let p = cmp(a.pos, b.pos)
-    if p != 0: return p
-    cmp(a.ri, b.ri))
-
-  # Open writer while readers are still open so we can call copy_header.
-  # (open() in write mode leaves outVcf.header nil; copy_header initializes it.)
+  # Open writer: open the first input just to get a hts-nim header wrapper,
+  # then replace the underlying hdr pointer with our merged outHdr.
+  var tmpVcf: VCF
+  if not open(tmpVcf, inputs[0]):
+    raise newException(IOError, "cannot open for header init: " & inputs[0])
   var outVcf: VCF
   if not open(outVcf, outPath, mode = "wb"):
     raise newException(IOError, "cannot create merged slim BCF: " & outPath)
-  outVcf.copy_header(readers[0].header)
+  outVcf.copy_header(tmpVcf.header)
+  tmpVcf.close()
   bcf_hdr_destroy(outVcf.header.hdr)
   outVcf.header.hdr = outHdr
   discard outVcf.write_header()
-
-  for vcf in readers.mitems: vcf.close()
 
   let headerOff = uint64(bgzf_tell(bgzfHandle(outVcf)))
   let idx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
   if idx == nil:
     raise newException(IOError, "cannot create CSI index: " & outPath)
 
-  for e in entries:
-    discard bcf_write(vcfHtsFile(outVcf), outHdr, e.rec)
-    if e.rec.rid >= 0:
-      let woff = uint64(bgzf_tell(bgzfHandle(outVcf)))
-      discard hts_idx_push(idx, e.rec.rid, int64(e.rec.pos), e.endPos, woff, 1)
-    bcf_destroy(e.rec)
+  # Reusable buffers for bcf_get_info_values (reallocated by htslib as needed,
+  # freed with c_free after the loop).
+  var boffDst: pointer = nil
+  var boffN:   cint    = 0
+  var endDst:  pointer = nil
+  var endN:    cint    = 0
+
+  while bcf_sr_next_line(sr) > 0:
+    for i in 0 ..< nreaders:
+      if srs_has_line(sr, i.cint) == 0: continue
+      let srcHdr  = srs_get_header(sr, i.cint)
+      let rec     = bcf_dup(srs_get_line(sr, i.cint))
+
+      # Read MATCHA_BOFF and END before modifying the record.
+      let nboff = bcf_get_info_values(srcHdr, rec, "MATCHA_BOFF",
+                                      boffDst.addr, boffN.addr, BCF_HT_INT.cint)
+      let origOff =
+        if nboff >= 2:
+          let a = cast[ptr UncheckedArray[int32]](boffDst)
+          decodeBoff(@[a[0], a[1]])
+        else: 0'i64
+
+      let nend = bcf_get_info_values(srcHdr, rec, "END",
+                                     endDst.addr, endN.addr, BCF_HT_INT.cint)
+      let endPos =
+        if nend >= 1: int64(cast[ptr UncheckedArray[int32]](endDst)[0])
+        else: int64(rec.pos) + 1
+
+      # Rewrite MATCHA_BOFF as composite (callerIdx | origOff).
+      var newBoff = encodeBoff((callerIdxs[i].int64 shl 48) or origOff)
+      discard bcf_update_info(srcHdr, rec, "MATCHA_BOFF",
+                              newBoff[0].addr, 2.cint, BCF_HT_INT.cint)
+
+      # Translate record RIDs and tag IDs from srcHdr space to outHdr space.
+      discard bcf_translate(outHdr, srcHdr, rec)
+
+      discard bcf_write(vcfHtsFile(outVcf), outHdr, rec)
+      if rec.rid >= 0:
+        let woff = uint64(bgzf_tell(bgzfHandle(outVcf)))
+        discard hts_idx_push(idx, rec.rid, int64(rec.pos), endPos, woff, 1)
+      bcf_destroy(rec)
+
+  if boffDst != nil: c_free(boffDst)
+  if endDst  != nil: c_free(endDst)
+  bcf_sr_destroy(sr)
 
   let finalOff = uint64(bgzf_tell(bgzfHandle(outVcf)))
   hts_idx_finish(idx, finalOff)
