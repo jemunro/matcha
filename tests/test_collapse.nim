@@ -3,13 +3,16 @@
 ## Run from project root: nim c --hints:off -r tests/test_collapse.nim
 echo "--------------- Test Collapse ---------------"
 
-import std/[os, osproc, sequtils, strutils]
+import std/[os, osproc, sequtils, strutils, tables]
 import test_utils
 
-const BinPath  = "./matcha"
-const FixDelly = "tests/fixtures/collapse_delly.vcf.gz"
-const FixManta = "tests/fixtures/collapse_manta.vcf.gz"
-const FixMulti = "tests/fixtures/collapse_multiallelic.vcf.gz"
+const BinPath    = "./matcha"
+const FixCaller1   = "tests/fixtures/collapse_caller1.vcf.gz"
+const FixCaller2   = "tests/fixtures/collapse_caller2.vcf.gz"
+const FixMulti   = "tests/fixtures/collapse_multiallelic.vcf.gz"
+const FixCaller1_1S = "tests/fixtures/collapse_caller1_1sample.vcf.gz"
+const FixCaller2_1S = "tests/fixtures/collapse_caller2_1sample.vcf.gz"
+const FixCaller1_2S = "tests/fixtures/collapse_caller1_2sample.vcf.gz"
 
 proc tmpBcf(): string =
   "/tmp/test_collapse_" & $os.getCurrentProcessId() & ".bcf"
@@ -56,8 +59,8 @@ proc parseCollapsed(vcfText: string): seq[ColRecord] =
 proc collapseRun(extra = ""): (seq[ColRecord], int) =
   ## Run a standard 2-caller collapse → tmpfile, return parsed records + exit code.
   let outBcf = tmpBcf()
-  let (_, code) = run("collapse --min-jaccard 0.5 Delly:" & FixDelly &
-                      " Manta:" & FixManta & " -o " & outBcf & " " & extra)
+  let (_, code) = run("collapse --min-jaccard 0.5 Caller1:" & FixCaller1 &
+                      " Caller2:" & FixCaller2 & " -o " & outBcf & " " & extra)
   if code != 0:
     discard tryRemoveFile(outBcf)
     return (@[], code)
@@ -74,8 +77,8 @@ timed("C01", "binary available"):
 # C02 — collapse exits 0 and produces a valid BCF
 timed("C02", "2-caller collapse: exits 0, BCF readable"):
   let outBcf = tmpBcf()
-  let (_, code) = run("collapse --min-jaccard 0.5 Delly:" & FixDelly &
-                      " Manta:" & FixManta & " -o " & outBcf)
+  let (_, code) = run("collapse --min-jaccard 0.5 Caller1:" & FixCaller1 &
+                      " Caller2:" & FixCaller2 & " -o " & outBcf)
   doAssert code == 0, "collapse exited " & $code
   doAssert fileExists(outBcf), "output BCF not created"
   let view = viewBcf(outBcf)
@@ -90,25 +93,25 @@ timed("C03", "correct output record count (5 for the 2-caller fixture)"):
     ": " & recs.mapIt(it.id).join(", ")
 
 # C04 — PASS filter beats LowQual: DEL_M_02 chosen over DEL_D_02
-timed("C04", "PASS priority: Manta DEL_M_02 preferred over LowQual DEL_D_02"):
+timed("C04", "PASS priority: Caller2 DEL_M_02 preferred over LowQual DEL_D_02"):
   let (recs, code) = collapseRun()
   doAssert code == 0
   var found = false
   for r in recs:
-    if r.pos == 3100 and r.source == "Manta":
+    if r.pos == 3100 and r.source == "Caller2":
       doAssert r.id == "DEL_M_02", "expected DEL_M_02, got " & r.id
       doAssert r.filter == "PASS", "expected PASS, got " & r.filter
       found = true
-  doAssert found, "no PASS-selected Manta record at pos 3100"
+  doAssert found, "no PASS-selected Caller2 record at pos 3100"
 
-# C05 — ORDER tiebreak when both PASS: Delly (callerIdx 0) wins over Manta
-timed("C05", "ORDER tiebreak: Delly DEL_D_01 preferred over Manta DEL_M_01"):
+# C05 — ORDER tiebreak when both PASS: Caller1 (callerIdx 0) wins over Caller2
+timed("C05", "ORDER tiebreak: Caller1 DEL_D_01 preferred over Caller2 DEL_M_01"):
   let (recs, code) = collapseRun()
   doAssert code == 0
   var found = false
   for r in recs:
     if r.pos == 1000 and r.nMerged == 2:
-      doAssert r.source == "Delly", "expected source=Delly, got " & r.source
+      doAssert r.source == "Caller1", "expected source=Caller1, got " & r.source
       doAssert r.id == "DEL_D_01", "expected DEL_D_01, got " & r.id
       found = true
   doAssert found, "no merged record at pos 1000"
@@ -122,12 +125,12 @@ timed("C06", "singletons preserved with N_MERGED=1 and N_SOURCE=1"):
     if r.id == "DEL_D_03":
       doAssert r.nMerged == 1, "DEL_D_03 nMerged=" & $r.nMerged
       doAssert r.nSource == 1, "DEL_D_03 nSource=" & $r.nSource
-      doAssert r.sourceList == "Delly", "DEL_D_03 sourceList=" & r.sourceList
+      doAssert r.sourceList == "Caller1", "DEL_D_03 sourceList=" & r.sourceList
       d03 = true
     elif r.id == "DEL_M_03":
       doAssert r.nMerged == 1, "DEL_M_03 nMerged=" & $r.nMerged
       doAssert r.nSource == 1, "DEL_M_03 nSource=" & $r.nSource
-      doAssert r.sourceList == "Manta", "DEL_M_03 sourceList=" & r.sourceList
+      doAssert r.sourceList == "Caller2", "DEL_M_03 sourceList=" & r.sourceList
       m03 = true
   doAssert d03, "DEL_D_03 singleton not found"
   doAssert m03, "DEL_M_03 singleton not found"
@@ -139,17 +142,17 @@ timed("C07", "merged records: N_MERGED=2, N_SOURCE=2, SOURCELIST contains both")
   for r in recs:
     if r.nMerged == 2:
       doAssert r.nSource == 2, r.id & " nSource=" & $r.nSource
-      doAssert "Delly" in r.sourceList and "Manta" in r.sourceList,
+      doAssert "Caller1" in r.sourceList and "Caller2" in r.sourceList,
                r.id & " sourceList=" & r.sourceList
 
-# C08 — DUP cluster: Delly wins (ORDER), N_MERGED=2
+# C08 — DUP cluster: Caller1 wins (ORDER), N_MERGED=2
 timed("C08", "DUP cluster: DUP_D_01 selected by ORDER, N_MERGED=2"):
   let (recs, code) = collapseRun()
   doAssert code == 0
   var found = false
   for r in recs:
     if r.id == "DUP_D_01":
-      doAssert r.source == "Delly"
+      doAssert r.source == "Caller1"
       doAssert r.nMerged == 2
       found = true
   doAssert found, "DUP_D_01 not found in output"
@@ -175,8 +178,8 @@ timed("C10", "multiallelic record causes non-zero exit with informative message"
 # C11 — --min-overlap threshold also works (not only --min-jaccard)
 timed("C11", "--min-overlap 0.5 produces the same cluster topology"):
   let outBcf = tmpBcf()
-  let (_, code) = run("collapse --min-overlap 0.5 Delly:" & FixDelly &
-                      " Manta:" & FixManta & " -o " & outBcf)
+  let (_, code) = run("collapse --min-overlap 0.5 Caller1:" & FixCaller1 &
+                      " Caller2:" & FixCaller2 & " -o " & outBcf)
   doAssert code == 0, "collapse --min-overlap failed"
   let recs = parseCollapsed(viewBcf(outBcf))
   discard tryRemoveFile(outBcf)
@@ -185,8 +188,8 @@ timed("C11", "--min-overlap 0.5 produces the same cluster topology"):
 # C12 — --info filter: requesting only SVTYPE in output drops END/SVLEN
 timed("C12", "--info SVTYPE filter keeps SVTYPE, drops END and SVLEN"):
   let outBcf = tmpBcf()
-  let (_, code) = run("collapse --min-jaccard 0.5 --info SVTYPE Delly:" & FixDelly &
-                      " Manta:" & FixManta & " -o " & outBcf)
+  let (_, code) = run("collapse --min-jaccard 0.5 --info SVTYPE Caller1:" & FixCaller1 &
+                      " Caller2:" & FixCaller2 & " -o " & outBcf)
   doAssert code == 0, "collapse --info SVTYPE failed"
   let view = viewBcf(outBcf)
   discard tryRemoveFile(outBcf)
@@ -199,3 +202,99 @@ timed("C12", "--info SVTYPE filter keeps SVTYPE, drops END and SVLEN"):
   doAssert sawSvtype, "--info SVTYPE: SVTYPE not in output"
   doAssert not sawEnd,   "--info SVTYPE: END should be absent, but found"
   doAssert not sawSvlen, "--info SVTYPE: SVLEN should be absent, but found"
+
+# CT03 — --format "" → output has zero sample columns
+timed("CT03", "--format '' produces zero-sample output"):
+  let outBcf = tmpBcf()
+  let (_, code) = run("collapse --min-jaccard 0.5 --format \"\" Caller1:" & FixCaller1 &
+                      " Caller2:" & FixCaller2 & " -o " & outBcf)
+  doAssert code == 0, "collapse --format '' failed"
+  let view = viewBcf(outBcf)
+  discard tryRemoveFile(outBcf)
+  # #CHROM header line should have exactly 8 columns (no FORMAT, no samples).
+  var sawChromLine = false
+  for line in view.splitLines:
+    if line.startsWith("#CHROM"):
+      sawChromLine = true
+      let n = line.split('\t').len
+      doAssert n == 8, "expected 8 columns in #CHROM line (no FORMAT/samples), got " & $n
+  doAssert sawChromLine, "no #CHROM line in output"
+
+# CT05 — 1-sample collapse: output has one sample column (caller 0's sample
+# name) and GT carries through per record from its source caller.
+timed("CT05", "1-sample collapse: SAMPLE1 column carries GT round-trip"):
+  let outBcf = tmpBcf()
+  let (_, code) = run("collapse --min-jaccard 0.5 Caller1:" & FixCaller1_1S &
+                      " Caller2:" & FixCaller2_1S & " -o " & outBcf)
+  doAssert code == 0, "1-sample collapse failed"
+  let view = viewBcf(outBcf)
+  discard tryRemoveFile(outBcf)
+  # #CHROM line should have 10 cols (8 std + FORMAT + 1 sample); sample is SAMPLE1.
+  var chromCols: seq[string]
+  for line in view.splitLines:
+    if line.startsWith("#CHROM"):
+      chromCols = line.split('\t')
+      break
+  doAssert chromCols.len == 10, "expected 10 cols in #CHROM, got " & $chromCols.len
+  doAssert chromCols[8] == "FORMAT", "col 8 = FORMAT, got " & chromCols[8]
+  doAssert chromCols[9] == "SAMPLE1", "col 9 = SAMPLE1, got " & chromCols[9]
+  # Verify GTs round-trip. Per fixture: DEL_D_01 (Caller1)=0/1, DEL_M_02 (Caller2)=0/1,
+  # DEL_D_03 (Caller1)=1/1, DEL_M_03 (Caller2)=0/0, DUP_D_01 (Caller1)=0/1.
+  var gts: Table[string, string]
+  for line in view.splitLines:
+    if line.len == 0 or line[0] == '#': continue
+    let cols = line.split('\t')
+    if cols.len < 10: continue
+    gts[cols[2]] = cols[9]
+  doAssert gts.getOrDefault("DEL_D_01") == "0/1",
+           "DEL_D_01 GT=" & gts.getOrDefault("DEL_D_01")
+  doAssert gts.getOrDefault("DEL_M_02") == "0/1",
+           "DEL_M_02 GT=" & gts.getOrDefault("DEL_M_02")
+  doAssert gts.getOrDefault("DEL_D_03") == "1/1",
+           "DEL_D_03 GT=" & gts.getOrDefault("DEL_D_03")
+  doAssert gts.getOrDefault("DEL_M_03") == "0/0",
+           "DEL_M_03 GT=" & gts.getOrDefault("DEL_M_03")
+  doAssert gts.getOrDefault("DUP_D_01") == "0/1",
+           "DUP_D_01 GT=" & gts.getOrDefault("DUP_D_01")
+
+# CT06 — 2-sample input rejected with a clear error.
+timed("CT06", "multi-sample input causes non-zero exit with informative message"):
+  let outBcf = tmpBcf()
+  let (outp, code) = runMerged("collapse --min-jaccard 0.5 D:" & FixCaller1_2S &
+                               " M:" & FixCaller2_1S & " -o " & outBcf)
+  discard tryRemoveFile(outBcf)
+  doAssert code != 0, "expected non-zero exit for 2-sample input, got 0"
+  doAssert "sample" in outp.toLowerAscii,
+           "expected 'sample' in error output, got: " & outp
+  doAssert "at most 1" in outp or "supports" in outp,
+           "expected informative reject message, got: " & outp
+
+# CT07 — inconsistent sample counts across inputs rejected.
+timed("CT07", "inconsistent sample counts cause non-zero exit"):
+  let outBcf = tmpBcf()
+  let (outp, code) = runMerged("collapse --min-jaccard 0.5 D:" & FixCaller1_1S &
+                               " M:" & FixCaller2 & " -o " & outBcf)
+  discard tryRemoveFile(outBcf)
+  doAssert code != 0, "expected non-zero exit for inconsistent counts, got 0"
+  doAssert "inconsistent" in outp.toLowerAscii or "same sample count" in outp,
+           "expected inconsistent-counts message, got: " & outp
+
+# CT04 — 3-caller run (aliasing one fixture twice) — streaming loop ticks
+# across 3 readers; record counts/sources are correct.
+timed("CT04", "3-caller run: streaming across 3 readers produces sensible counts"):
+  let outBcf = tmpBcf()
+  let (_, code) = run("collapse --min-jaccard 0.5 " &
+                      " Caller1:" & FixCaller1 &
+                      " Caller2:" & FixCaller2 &
+                      " Caller1b:" & FixCaller1 &
+                      " -o " & outBcf)
+  doAssert code == 0, "3-caller collapse failed"
+  let recs = parseCollapsed(viewBcf(outBcf))
+  discard tryRemoveFile(outBcf)
+  # The Caller1 fixture self-matches Caller1b (identical content) → most records
+  # cluster across Caller1 and Caller1b with N_SOURCE >= 2.
+  doAssert recs.len > 0, "no records in 3-caller output"
+  var sawCaller1b: bool
+  for r in recs:
+    if "Caller1b" in r.sourceList: sawCaller1b = true
+  doAssert sawCaller1b, "Caller1b (third caller) absent from any cluster SOURCELIST"

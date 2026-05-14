@@ -5,17 +5,16 @@
 ##          FieldResolution, MergedHeader
 ##
 ##   resolveHeaders        — analyse N input VCF headers, produce MergedHeader
-##   mergeSortSlimBcfs     — k-way merge + sort of per-caller slim BCFs
 ##   buildSimilarityMap    — MatchPair seq → (canonicalPair → similarity) table
 ##   buildComponents       — union-find over pairs → offset→componentId table
 ##   agglomerateComponent  — Lance-Williams agglomerative clustering
 ##   clusterAll            — full pipeline: components → agglomerate each
 ##   selectRepresentative  — priority-cascade representative selection
 
-import std/[sequtils, sets, strutils, tables]
+import std/[sequtils, strutils, tables]
 import hts
 import hts/private/hts_concat
-import preproc, matchcore, synced_bcf_reader
+import matchcore
 
 # ---------------------------------------------------------------------------
 # Types
@@ -214,14 +213,30 @@ proc resolveHeaders*(callers: seq[CallerInput]): MergedHeader =
     let refNum = defs[0].number
     let refTyp = defs[0].typ
     var compatible = true
+    var typeConflict = false
     for d in defs:
       if d.number != refNum or d.typ != refTyp:
-        compatible = false; break
+        compatible = false
+      if d.typ != refTyp:
+        typeConflict = true
     if compatible or defs.len == 1:
       let desc = mergeDescriptions(defs.mapIt(it.desc))
       result.headerLines.add(makeFmtLine(fld, refNum, refTyp, desc))
+    elif typeConflict:
+      # Type conflict → rename each caller's instance (data semantics differ).
+      var res = FieldResolution(kind: fcIncompatibleFmt)
+      var warnParts: seq[string]
+      for d in defs:
+        let suffix = callers[d.callerIdx].name
+        let newName = fld & "_" & suffix
+        res.renames[d.callerIdx] = newName
+        result.headerLines.add(makeFmtLine(newName, d.number, d.typ, d.desc))
+        warnParts.add(callers[d.callerIdx].name & ":" & d.number & "/" & d.typ)
+      result.fmtRes[fld] = res
+      result.warnings.add("FORMAT Type conflict for " & fld & " (" & warnParts.join(", ") &
+                          ") — renamed to " & res.renames.values.toSeq.join(", "))
     else:
-      # Incompatible FORMAT → Number=. with warning.
+      # Number-only conflict (compatible Type) → emit Number=. and warn.
       var res = FieldResolution(kind: fcIncompatibleFmt)
       let desc = mergeDescriptions(defs.mapIt(it.desc))
       result.headerLines.add(makeFmtLine(fld, ".", refTyp, desc))
@@ -229,7 +244,7 @@ proc resolveHeaders*(callers: seq[CallerInput]): MergedHeader =
       var warnParts: seq[string]
       for d in defs:
         warnParts.add(callers[d.callerIdx].name & ":" & d.number & "/" & d.typ)
-      result.warnings.add("FORMAT conflict for " & fld & " (" & warnParts.join(", ") &
+      result.warnings.add("FORMAT Number conflict for " & fld & " (" & warnParts.join(", ") &
                           ") — emitting Number=.")
 
 # ---------------------------------------------------------------------------
@@ -294,124 +309,6 @@ proc buildComponents*(simMap: Table[(int64, int64), float64];
       union(uf, ia, ib)
   for i, off in allOffsets.pairs:
     result[off] = find(uf, i)
-
-# ---------------------------------------------------------------------------
-# k-way merge-sort of per-caller slim BCFs
-# ---------------------------------------------------------------------------
-
-proc mergeSortSlimBcfs*(inputs: seq[string]; callerIdxs: seq[int];
-                        outPath: string; chromOrder: seq[string]) =
-  ## Merge N slim BCFs for the same (svtype, bin) into a coordinate-sorted
-  ## output BCF with a CSI index using synced_bcf_reader for streaming.
-  ## Rewrites MATCHA_BOFF as a composite value:
-  ##   compositeOff = (callerIdx.int64 shl 48) or origOff
-  ## Works for k=1 (degenerate single-input pass that still rewrites BOFF + indexes).
-  ## Chromosome order follows the natural index order of the first reader.
-  if inputs.len == 0: return
-
-  let sr = bcf_sr_init()
-  if sr == nil:
-    raise newException(IOError, "bcf_sr_init failed")
-  discard bcf_sr_set_opt(sr, BCF_SR_ALLOW_NO_IDX)
-
-  for path in inputs:
-    if bcf_sr_add_reader(sr, path.cstring) == 0:
-      raise newException(IOError, "cannot open slim BCF for merge: " & path &
-                         " (" & $bcf_sr_strerror(srs_errnum(sr)) & ")")
-
-  let nreaders = srs_nreaders(sr).int
-
-  # Build output header: dup first reader's slim header, add missing contigs.
-  let outHdr = bcf_hdr_dup(srs_get_header(sr, 0))
-  var knownCtgs: HashSet[string]
-  block:
-    var n: cint = 0
-    let names = bcf_hdr_seqnames(outHdr, n.addr)
-    if names != nil:
-      for i in 0 ..< n.int: knownCtgs.incl($names[i])
-      free(names)
-  for ri in 1 ..< nreaders:
-    var n: cint = 0
-    let names = bcf_hdr_seqnames(srs_get_header(sr, ri.cint), n.addr)
-    if names != nil:
-      for i in 0 ..< n.int:
-        let c = $names[i]
-        if c notin knownCtgs:
-          discard bcf_hdr_append(outHdr, ("##contig=<ID=" & c & ">").cstring)
-          knownCtgs.incl(c)
-      free(names)
-  discard bcf_hdr_sync(outHdr)
-
-  # Open writer: open the first input just to get a hts-nim header wrapper,
-  # then replace the underlying hdr pointer with our merged outHdr.
-  var tmpVcf: VCF
-  if not open(tmpVcf, inputs[0]):
-    raise newException(IOError, "cannot open for header init: " & inputs[0])
-  var outVcf: VCF
-  if not open(outVcf, outPath, mode = "wb"):
-    raise newException(IOError, "cannot create merged slim BCF: " & outPath)
-  outVcf.copy_header(tmpVcf.header)
-  tmpVcf.close()
-  bcf_hdr_destroy(outVcf.header.hdr)
-  outVcf.header.hdr = outHdr
-  discard outVcf.write_header()
-
-  let headerOff = uint64(bgzf_tell(bgzfHandle(outVcf)))
-  let idx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
-  if idx == nil:
-    raise newException(IOError, "cannot create CSI index: " & outPath)
-
-  # Reusable buffers for bcf_get_info_values (reallocated by htslib as needed,
-  # freed with c_free after the loop).
-  var boffDst: pointer = nil
-  var boffN:   cint    = 0
-  var endDst:  pointer = nil
-  var endN:    cint    = 0
-
-  while bcf_sr_next_line(sr) > 0:
-    for i in 0 ..< nreaders:
-      if srs_has_line(sr, i.cint) == 0: continue
-      let srcHdr  = srs_get_header(sr, i.cint)
-      let rec     = bcf_dup(srs_get_line(sr, i.cint))
-
-      # Read MATCHA_BOFF and END before modifying the record.
-      let nboff = bcf_get_info_values(srcHdr, rec, "MATCHA_BOFF",
-                                      boffDst.addr, boffN.addr, BCF_HT_INT.cint)
-      let origOff =
-        if nboff >= 2:
-          let a = cast[ptr UncheckedArray[int32]](boffDst)
-          decodeBoff(@[a[0], a[1]])
-        else: 0'i64
-
-      let nend = bcf_get_info_values(srcHdr, rec, "END",
-                                     endDst.addr, endN.addr, BCF_HT_INT.cint)
-      let endPos =
-        if nend >= 1: int64(cast[ptr UncheckedArray[int32]](endDst)[0])
-        else: int64(rec.pos) + 1
-
-      # Rewrite MATCHA_BOFF as composite (callerIdx | origOff).
-      var newBoff = encodeBoff((callerIdxs[i].int64 shl 48) or origOff)
-      discard bcf_update_info(srcHdr, rec, "MATCHA_BOFF",
-                              newBoff[0].addr, 2.cint, BCF_HT_INT.cint)
-
-      # Translate record RIDs and tag IDs from srcHdr space to outHdr space.
-      discard bcf_translate(outHdr, srcHdr, rec)
-
-      discard bcf_write(vcfHtsFile(outVcf), outHdr, rec)
-      if rec.rid >= 0:
-        let woff = uint64(bgzf_tell(bgzfHandle(outVcf)))
-        discard hts_idx_push(idx, rec.rid, int64(rec.pos), endPos, woff, 1)
-      bcf_destroy(rec)
-
-  if boffDst != nil: c_free(boffDst)
-  if endDst  != nil: c_free(endDst)
-  bcf_sr_destroy(sr)
-
-  let finalOff = uint64(bgzf_tell(bgzfHandle(outVcf)))
-  hts_idx_finish(idx, finalOff)
-  outVcf.close()
-  hts_idx_save(idx, outPath.cstring, HTS_FMT_CSI.cint)
-  hts_idx_destroy(idx)
 
 # ---------------------------------------------------------------------------
 # Agglomerative clustering (Lance-Williams on similarity)

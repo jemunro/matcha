@@ -25,7 +25,7 @@
 import std/[algorithm, os, sets, strutils, tables]
 import hts
 import hts/private/hts_concat  # BCF_ERR_CTG_UNDEF, BGZF, htsFile, bgzf_tell
-import utils, log, bins
+import utils, log, bins, synced_bcf_reader
 
 # hts-nim's VCF type keeps the underlying htsFile* private. We need access to
 # it (specifically vcf.hts.fp.bgzf) so we can call bgzf_tell to record each
@@ -59,7 +59,7 @@ type
     pathA*:   string
     binsB*:   Table[int, string]                      ## binB → B's path
 
-  SkipReason = enum
+  SkipReason* = enum
     skUnsupportedSvtype
     skUnsupportedTra
     skUnresolvableSvtype
@@ -68,15 +68,18 @@ type
     skMalformedBnd
     skUnknownContig
 
-  WarnState = object
-    skipped:      array[SkipReason, int]
-    emitted:      array[SkipReason, int]
-    inconsistent: int
-    syntheticId:  int
-    nRead:        int
-    nKept:        int
-    cap:          int
-    callset:      string
+  WarnState* = object
+    skipped*:      array[SkipReason, int]
+    emitted*:      array[SkipReason, int]
+    inconsistent*: int
+    syntheticId*:  int
+    nRead*:        int
+    nKept*:        int
+    cap*:          int
+    callset*:      string
+
+proc initWarnState*(callset: string): WarnState =
+  WarnState(cap: warnCap(), callset: callset)
 
 # INFO fields kept in each class of temp BCF. SVTYPE is encoded in the filename;
 # SVLEN is derivable from END-POS and matchcore never reads it.
@@ -122,7 +125,7 @@ proc reasonStr(r: SkipReason): string =
   of skMalformedBnd:        "malformed_bnd"
   of skUnknownContig:       "unknown_contig"
 
-proc warnSkip(reason: SkipReason, ws: var WarnState,
+proc warnSkip*(reason: SkipReason, ws: var WarnState,
               chrom: string, pos: int64, id: string, detail: string) =
   inc ws.skipped[reason]
   if ws.emitted[reason] < ws.cap:
@@ -182,6 +185,31 @@ proc parseBndAlt*(alt: string): tuple[ok: bool; chr2: string; pos2: int64] =
   if pos <= 0: return
   (ok: true, chr2: chrom, pos2: pos)
 
+proc inconsistencyExceedsTenPct(svlen, endDerived: int64): bool =
+  if svlen <= 0: return false
+  abs(svlen - endDerived).float / svlen.float > 0.10
+
+proc synthesizeId(chrom: string, pos: int64, svt: SvType, lineno: int): string =
+  chrom & "_" & $pos & "_" & $svt & "_" & $lineno
+
+# ---------------------------------------------------------------------------
+# Raw C-API normalization helpers (used by preprocessVcf and integratedMerge)
+# ---------------------------------------------------------------------------
+
+proc getChromName*(hdr: ptr bcf_hdr_t; rid: int32): string =
+  ## Look up contig name for `rid` directly from the header dictionary.
+  if rid < 0: return ""
+  let pairs = cast[ptr UncheckedArray[bcf_idpair_t]](hdr.id[BCF_DT_CTG])
+  if pairs == nil: return ""
+  result = $pairs[rid].key
+
+proc getRecId*(rec: ptr bcf1_t): string =
+  ## Return the record's ID (empty string for "." or missing).
+  ## Caller must have called bcf_unpack(rec, BCF_UN_STR) first.
+  if rec.d.id == nil: return ""
+  let s = $rec.d.id
+  if s == ".": "" else: s
+
 proc resolveSvtype(v: Variant, infoBuf: var string): SvType =
   ## Resolve SVTYPE. ALT wins on conflict. Recognized ALT forms:
   ##   - symbolic `<DEL>` / `<DUP>` / `<INV>` / `<INS>` / `<TRA>` / `<BND>`
@@ -218,13 +246,6 @@ proc resolveSvlen(v: Variant, endPos: int64, infoSvlen: var seq[int32]):
     return (true, derived, false)
   return (false, 0'i64, false)
 
-proc inconsistencyExceedsTenPct(svlen, endDerived: int64): bool =
-  if svlen <= 0: return false
-  abs(svlen - endDerived).float / svlen.float > 0.10
-
-proc synthesizeId(chrom: string, pos: int64, svt: SvType, lineno: int): string =
-  chrom & "_" & $pos & "_" & $svt & "_" & $lineno
-
 proc ensureSvInfoDefs(h: vcf.Header) =
   for def in SvInfoDefs:
     let (id, num, typ, desc) = def
@@ -233,7 +254,113 @@ proc ensureSvInfoDefs(h: vcf.Header) =
     except KeyError:
       discard h.add_info(id, num, typ, desc)
 
-proc emitSummary(ws: WarnState) =
+proc normalizeRecord*(hdr: ptr bcf_hdr_t; rec: ptr bcf1_t; lineno: int;
+                     ws: var WarnState; view: Variant;
+                     svtypeBuf: var string; endBuf, svlenBuf: var seq[int32];
+                     vcfPath: string):
+    tuple[ok: bool; svt: SvType; endPos: int64; svlen: int64; binIdx: int;
+          bndChr2: string; bndPos2: int64] =
+  ## Resolve SVTYPE/END/SVLEN/binIdx for a single record. May synthesize an
+  ## ID on the record (via bcf_update_id) and may quit() on multiallelic input.
+  ## Increments `ws` counters for skipped/synthesized/inconsistent records.
+  ## Returns ok=false for any skip reason; caller should not write the record.
+  ##
+  ## `view` is a reusable non-owning Variant wrapper (from synced_bcf_reader's
+  ## newVariantView) that lets us call the Variant-based resolvers on records
+  ## owned by a synced reader. Its lifetime must outlive this call.
+
+  inc ws.nRead
+  result.ok = false
+
+  if rec.errcode == BCF_ERR_CTG_UNDEF:
+    let chrom = getChromName(hdr, rec.rid)
+    warnSkip(skUnknownContig, ws, chrom, rec.pos + 1, "", "BCF_ERR_CTG_UNDEF")
+    return
+
+  if rec.n_allele.int > 2:
+    let chrom = getChromName(hdr, rec.rid)
+    stderr.writeLine "error: multiallelic record at " & chrom & ":" &
+                     $(rec.pos + 1) & " in " & vcfPath &
+                     " — split multiallelics before running matcha"
+    quit(1)
+
+  discard bcf_unpack(rec, BCF_UN_SHR.cint)
+
+  setRecView(view, hdr, rec)
+
+  let chrom = getChromName(hdr, rec.rid)
+  let pos1  = rec.pos + 1
+  let curId = getRecId(rec)
+
+  let svt = resolveSvtype(view, svtypeBuf)
+  if svt == svUNKNOWN:
+    warnSkip(skUnresolvableSvtype, ws, chrom, pos1, curId,
+             "no INFO/SVTYPE and no recognizable ALT")
+    return
+  if svt == svTRA:
+    warnSkip(skUnsupportedTra, ws, chrom, pos1, curId,
+             "TRA records are not supported (use BND notation)")
+    return
+  if svt notin SupportedSvTypes:
+    inc ws.skipped[skUnsupportedSvtype]  # INS lands here silently
+    return
+
+  var endPos, svlen: int64
+  var binIdx: int
+  var bndChr2: string
+  var bndPos2: int64
+
+  if svt == svBND:
+    var altStr = ""
+    if rec.n_allele.int > 1 and rec.d.allele != nil:
+      let alts = cast[cstringArray](rec.d.allele)
+      altStr = $alts[1]
+    let bnd = parseBndAlt(altStr)
+    if not bnd.ok:
+      warnSkip(skMalformedBnd, ws, chrom, pos1, curId,
+               "could not parse breakend ALT: '" & altStr & "'")
+      return
+    bndChr2 = bnd.chr2
+    bndPos2 = bnd.pos2
+    endPos  = pos1 + 1
+    svlen   = 0
+    binIdx  = 0
+  else:
+    let endR = resolveEnd(view, endBuf, svlenBuf)
+    if not endR.ok:
+      warnSkip(skUnresolvableEnd, ws, chrom, pos1, curId,
+               "missing both INFO/END and INFO/SVLEN")
+      return
+    if endR.endPos <= pos1:
+      warnSkip(skEndLePos, ws, chrom, pos1, curId,
+               "END=" & $endR.endPos & " <= POS=" & $pos1)
+      return
+    let svR = resolveSvlen(view, endR.endPos, svlenBuf)
+    if not svR.ok:
+      warnSkip(skUnresolvableEnd, ws, chrom, pos1, curId,
+               "could not resolve SVLEN")
+      return
+    let endDerived = endR.endPos - pos1
+    var sv = svR.svlen
+    if endR.fromInfo and svR.fromInfo and inconsistencyExceedsTenPct(sv, endDerived):
+      warnInconsistency(ws, chrom, pos1, curId,
+                        "INFO/SVLEN=" & $sv & " vs END-POS=" & $endDerived)
+      sv = endDerived
+    endPos = endR.endPos
+    svlen  = sv
+    binIdx = binIndexFor(svlen)
+
+  # Synthesize ID if missing
+  if curId.len == 0:
+    let newId = synthesizeId(chrom, pos1, svt, lineno)
+    discard bcf_update_id(hdr, rec, newId.cstring)
+    inc ws.syntheticId
+
+  inc ws.nKept
+  (ok: true, svt: svt, endPos: endPos, svlen: svlen, binIdx: binIdx,
+   bndChr2: bndChr2, bndPos2: bndPos2)
+
+proc emitSummary*(ws: WarnState) =
   let nSkipped = ws.nRead - ws.nKept
   logWarn(ws.callset & " summary: read " & $ws.nRead &
           " records, kept " & $ws.nKept & ", skipped " & $nSkipped)
@@ -297,11 +424,9 @@ proc captureChromOrder*(h: vcf.Header): seq[string] =
 proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
                     extraKeepInfo: openArray[string] = [],
                     ioThreads:    int  = 0;
-                    noIndex:      bool = false;
-                    keepPassQual: bool = false): PreprocOutput =
+                    noIndex:      bool = false): PreprocOutput =
   ## Stream vcfPath, normalize each record, and write per-SVTYPE BCFs.
   ## When noIndex=false (default), all temp BCFs are CSI-indexed on return.
-  ## When keepPassQual=true, QUAL is preserved in the slim BCF (default: blanked).
   ## Inputs may be VCF.gz or BCF.
   ##
   ## extraKeepInfo: additional INFO field names that survive the slim step.
@@ -486,11 +611,10 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
         result.populatedBins[svt] = {}
       result.populatedBins[svt].incl(uint8(binIdx))
 
-      # REF/ALT are unused by matchcore — blank them to shrink the record.
-      # QUAL is blanked unless keepPassQual=true (collapse needs it for rep selection).
+      # REF/ALT and QUAL are unused by matchcore — blank them to shrink the
+      # record.
       discard bcf_update_alleles_str(vcf.header.hdr, v.c, "N\t.")
-      if not keepPassQual:
-        v.c.qual = cast[cfloat](bcf_float_missing.uint32)
+      v.c.qual = cast[cfloat](bcf_float_missing.uint32)
 
       discard writers[key].write_variant(v)
       if not noIndex:

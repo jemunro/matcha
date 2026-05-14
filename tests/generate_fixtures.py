@@ -466,21 +466,77 @@ def col(chrom, pos, rid, svtype, svlen, end, qual=".", filt="PASS"):
             "svtype": svtype, "svlen": svlen, "end": end}
 
 
-# Delly: some PASS, one LowQual, one singleton, one DUP
-RECORDS_COLLAPSE_DELLY = [
+# Caller1: some PASS, one LowQual, one singleton, one DUP
+RECORDS_COLLAPSE_CALLER1 = [
     col("chr1", 1000,  "DEL_D_01", "DEL", 1000, 2000,  qual=50,  filt="PASS"),
     col("chr1", 3000,  "DEL_D_02", "DEL", 1000, 4000,  qual=30,  filt="LowQual"),
     col("chr1", 5000,  "DEL_D_03", "DEL", 1000, 6000,  qual=40,  filt="PASS"),
     col("chr1", 9000,  "DUP_D_01", "DUP", 1000, 10000, qual=50,  filt="PASS"),
 ]
 
-# Manta: all PASS, one singleton, same positions as Delly (some exact, some shifted)
-RECORDS_COLLAPSE_MANTA = [
+# Caller2: all PASS, one singleton, same positions as Caller1 (some exact, some shifted)
+RECORDS_COLLAPSE_CALLER2 = [
     col("chr1", 1000,  "DEL_M_01", "DEL", 1000, 2000,  qual=80,  filt="PASS"),
     col("chr1", 3100,  "DEL_M_02", "DEL", 1000, 4100,  qual=80,  filt="PASS"),
     col("chr1", 7000,  "DEL_M_03", "DEL", 1000, 8000,  qual=80,  filt="PASS"),
     col("chr1", 9000,  "DUP_M_01", "DUP", 1000, 10000, qual=80,  filt="PASS"),
 ]
+
+# 1-sample collapse fixtures: same records as the 0-sample fixtures plus a
+# FORMAT/GT column and a single sample. CT05 verifies the 1-sample success
+# path (output carries a single sample column named after caller 0's sample).
+COLLAPSE_HEADER_1S = """\
+##fileformat=VCFv4.2
+##FILTER=<ID=PASS,Description="All filters passed">
+##FILTER=<ID=LowQual,Description="Low quality call">
+##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">
+##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="Difference in length between REF and ALT alleles">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##contig=<ID=chr1,length=248956422>
+##contig=<ID=chr2,length=242193529>
+##contig=<ID=chrX,length=156040895>
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE1"""
+
+# 2-sample collapse fixture: two sample columns; must be rejected by collapse.
+COLLAPSE_HEADER_2S = """\
+##fileformat=VCFv4.2
+##FILTER=<ID=PASS,Description="All filters passed">
+##FILTER=<ID=LowQual,Description="Low quality call">
+##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">
+##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="Difference in length between REF and ALT alleles">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##contig=<ID=chr1,length=248956422>
+##contig=<ID=chr2,length=242193529>
+##contig=<ID=chrX,length=156040895>
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE1\tSAMPLE2"""
+
+
+def write_collapse_vcf_with_samples(records, path, header, sample_cols):
+    """Write a collapse fixture with FORMAT/GT columns. `sample_cols` is a list
+    of (record-index -> GT-string) lists, one per sample column. Records are
+    bcftools-sorted, bgzipped, and CSI-indexed."""
+    lines = [header]
+    for i, r in enumerate(records):
+        qual = r.get("qual", ".")
+        filt = r.get("filter", "PASS")
+        gts  = [str(col[i]) for col in sample_cols]
+        # FORMAT is just "GT" since GT is the only FORMAT field carried.
+        cols = [
+            r["chrom"], str(r["pos"]), r["id"], r["ref"], r["alt"],
+            str(qual), filt, r["info"], "GT",
+        ] + gts
+        lines.append("\t".join(cols))
+    vcf_text = "\n".join(lines) + "\n"
+    subprocess.run(
+        ["bcftools", "sort", "-O", "z", "-o", path, "-"],
+        input=vcf_text.encode(),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["bcftools", "index", path], check=True, capture_output=True)
+
 
 # Multiallelic fixture: one record with two ALTs to test the error path.
 MULTIALLELIC_HEADER = """\
@@ -528,7 +584,8 @@ def main():
     chrom_order = {c: i for i, c in enumerate(["chr1", "chr2", "chrX"])}
     def sort_key(row):
         # (chrom-order, svtype-string, posA, idA, posB)
-        return (chrom_order.get(row[0], 999), row[7], int(row[1]), row[3], int(row[4]))
+        # Row schema: [chromA, posA, endA, idA, chromB, posB, endB, idB, svtype, sim]
+        return (chrom_order.get(row[0], 999), row[8], int(row[1]), row[3], int(row[5]))
 
     # Expected TSVs for three threshold scenarios. Under the new CLI rule
     # exactly one of --min-overlap / --min-jaccard is active per run; the
@@ -555,14 +612,45 @@ def main():
     write_expected_tsv(self_rows, self_path)
     print(f"  {self_path}: {len(self_rows)} rows (--self, overlap>=0.5 + BND slop=100)")
 
-    print("Writing collapse_delly.vcf.gz ...")
-    write_vcf_gz(RECORDS_COLLAPSE_DELLY,
-                 os.path.join(out, "collapse_delly.vcf.gz"),
+    print("Writing collapse_caller1.vcf.gz ...")
+    write_vcf_gz(RECORDS_COLLAPSE_CALLER1,
+                 os.path.join(out, "collapse_caller1.vcf.gz"),
                  header=COLLAPSE_HEADER)
-    print("Writing collapse_manta.vcf.gz ...")
-    write_vcf_gz(RECORDS_COLLAPSE_MANTA,
-                 os.path.join(out, "collapse_manta.vcf.gz"),
+    print("Writing collapse_caller2.vcf.gz ...")
+    write_vcf_gz(RECORDS_COLLAPSE_CALLER2,
+                 os.path.join(out, "collapse_caller2.vcf.gz"),
                  header=COLLAPSE_HEADER)
+
+    # 1-sample variants of the collapse fixtures. Same records and ordering,
+    # plus one sample column "SAMPLE1" carrying distinct GT values per record
+    # (so a CT test can spot if GT round-trips correctly through the merged
+    # BCF → final output path).
+    caller1_1s_gt = ["0/1", "0/0", "1/1", "0/1"]  # one per Caller1 record
+    caller2_1s_gt = ["1/1", "0/1", "0/0", "1/1"]  # one per Caller2 record
+    print("Writing collapse_caller1_1sample.vcf.gz ...")
+    write_collapse_vcf_with_samples(
+        RECORDS_COLLAPSE_CALLER1,
+        os.path.join(out, "collapse_caller1_1sample.vcf.gz"),
+        COLLAPSE_HEADER_1S,
+        [caller1_1s_gt],
+    )
+    print("Writing collapse_caller2_1sample.vcf.gz ...")
+    write_collapse_vcf_with_samples(
+        RECORDS_COLLAPSE_CALLER2,
+        os.path.join(out, "collapse_caller2_1sample.vcf.gz"),
+        COLLAPSE_HEADER_1S,
+        [caller2_1s_gt],
+    )
+
+    # 2-sample variant: same records as the Caller1 fixture but two sample
+    # columns. matcha collapse must reject this (single-sample assumption).
+    print("Writing collapse_caller1_2sample.vcf.gz ...")
+    write_collapse_vcf_with_samples(
+        RECORDS_COLLAPSE_CALLER1,
+        os.path.join(out, "collapse_caller1_2sample.vcf.gz"),
+        COLLAPSE_HEADER_2S,
+        [caller1_1s_gt, caller2_1s_gt],
+    )
 
     print("Writing collapse_multiallelic.vcf.gz ...")
     vcf_text = MULTIALLELIC_HEADER + "\n"
