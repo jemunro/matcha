@@ -24,7 +24,7 @@ Three phases per invocation (collapse adds two more):
 - **MATCHA_BOFF**: BGZF virtual offset of the source record, stored as `Number=2 Integer` (high32, low32). Doubles as a stable record identity used (a) as the join key during per-mode resolution against the slim BCFs, (b) by anno's phase 3 to `bgzf_seek` back into the original input, and (c) by collapse for canonical pair keys and clustering.
 - **Self-mode dedup**: `aOff < bOff` filter on `MATCHA_BOFF` eliminates symmetric pairs and self-self. The filter is baked into `matchcore` itself (gated on `cfg.selfMode`); no adapter-side work needed. Interval work queue prunes `binsB` to `{b ≥ binA}`.
 - **BND always in bin 0**: BND records are point events, not size-binned. They always land in `(svBND, 0)` temp BCFs and bypass `adjacentBins`.
-- **Slim BCF keep-sets**: SVTYPE-specific — intervals `{END, MATCHA_BOFF}`, BND `{CHR2, POS2, MATCHA_BOFF}`. Anno passes `extraKeepInfo` to preprocess the database with the user-requested DB INFO fields preserved on the slim B records (so DB resolution never has to re-open the original). SVTYPE and SVLEN are not written (SVTYPE is encoded in the filename; SVLEN is derivable and matchcore never reads it). REF, ALT, and QUAL are also blanked (`N`, `.`, missing) since matchcore never reads them — except in collapse mode, where `keepPassQual=true` preserves QUAL for representative selection. Two slim header templates are built once per run (`buildSlimHdr`) — all FORMAT defs and non-keep INFO defs stripped — and duped per writer.
+- **Slim BCF keep-sets**: SVTYPE-specific — intervals `{END, MATCHA_BOFF}`, BND `{CHR2, POS2, MATCHA_BOFF}`. Anno passes `extraKeepInfo` to preprocess the database with the user-requested DB INFO fields preserved on the slim B records (so DB resolution never has to re-open the original). SVTYPE and SVLEN are not written (SVTYPE is encoded in the filename; SVLEN is derivable and matchcore never reads it). REF, ALT, and QUAL are also blanked (`N`, `.`, missing) since matchcore never reads them. Two slim header templates are built once per run (`buildSlimHdr`) — all FORMAT defs and non-keep INFO defs stripped — and duped per writer.
 - **Minimal matchcore contract**: `streamJobPairs` and `streamBndJobPairs` return `seq[MatchPair]` (24-byte POD: `aOff`, `bOff`, `sim`). No generic parameters, no `extract`/`emit` callbacks, no per-mode payload cache. Per-mode logic lives in `match.nim` and `anno.nim` resolvers.
 
 ---
@@ -110,15 +110,14 @@ Two pool entry points share the same machinery:
 `matcha collapse` runs over N single-sample caller VCF/BCFs and produces one representative record per cluster. Steps (see [src/matcha/collapse.nim](src/matcha/collapse.nim)):
 
 1. **`resolveHeaders`** (`mergecore.nim`) — analyse N input headers, build a `MergedHeader` with conflict resolution for INFO/FORMAT defs that disagree across callers.
-2. **Per-caller preproc** — `preprocessVcf(..., noIndex=true, keepPassQual=true)` for each caller. QUAL is preserved (representative selection may need it); the merged slim BCFs are the only ones indexed.
-3. **`mergeSortSlimBcfs`** — k-way merge per `(svtype, bin)` across callers into one merged slim BCF per key. An internal INFO field `MATCHA_CALLER_IDX` tags each record with its source-caller index for later provenance.
-4. **Pass 1 — self-match** — `runMatchPairJobsWithPool` (self-mode, no resolution) over the merged slim BCFs returns `seq[MatchPair]` directly. `buildSimilarityMap` builds a canonical `Table[(aOff, bOff), sim]`.
-5. **Pass 2 — `exploreMerged`** — sequential scan of the merged slim BCFs to enumerate every offset and capture PASS/QUAL for representative selection.
-6. **Clustering** — union-find over the similarity map yields components; each component is then agglomeratively clustered (`--linkage` average/single/complete) at the threshold.
-7. **Representative selection** — `selectRepresentative` walks the `--priority` cascade (`PASS, QUAL, CENTRE, ORDER`); `ORDER` is always appended as the final tiebreaker.
-8. **Output** — re-open each original caller file, `bgzf_seek` to representative offsets, translate headers to the output, populate `SOURCE` / `SOURCELIST` / `N_SOURCE` / `N_MERGED`, sort by `(chromOrder, POS)`, write VCF/BCF + optional CSI.
+2. **`integratedMerge`** — fused preproc+merge in one `synced_bcf_reader` (`bcf_srs_t`) pass: streams all N callers in lockstep, normalizes each record, applies INFO/FORMAT renames (conflict resolution), filters to user-selected fields, writes per-(svtype, bin) merged slim BCFs. Uses a shared `htsThreadPool` for parallel BGZF I/O across all readers and writers. MATCHA_BOFF stores a composite (callerIdx, bgzfOffset) token.
+3. **Pass 1 — self-match** — `runMatchPairJobsWithPool` (self-mode, no resolution) over the merged slim BCFs returns `seq[MatchPair]` directly. `buildSimilarityMap` builds a canonical `Table[(aOff, bOff), sim]`.
+4. **Pass 2 — `exploreMerged`** — sequential scan of the merged slim BCFs to enumerate every offset and capture PASS/QUAL for representative selection.
+5. **Clustering** — union-find over the similarity map yields components; each component is then agglomeratively clustered (`--linkage` average/single/complete) at the threshold.
+6. **Representative selection** — `selectRepresentative` walks the `--priority` cascade (`PASS, QUAL, CENTRE, ORDER`); `ORDER` is always appended as the final tiebreaker.
+7. **Output** — re-open each original caller file, `bgzf_seek` to representative offsets, translate headers to the output, populate `SOURCE` / `SOURCELIST` / `N_SOURCE` / `N_MERGED`, sort by `(chromOrder, POS)`, write VCF/BCF + optional CSI.
 
-Threading: preproc is currently sequential across callers; matching reuses the same thread pool as `matcha match`.
+Threading: preproc+merge runs in one integrated streaming pass (`integratedMerge`) with a shared `htsThreadPool`; matching reuses the same thread pool as `matcha match`.
 
 ---
 
@@ -130,13 +129,14 @@ Threading: preproc is currently sequential across callers; matching reuses the s
 | [src/matcha/utils.nim](src/matcha/utils.nim) | Shared types: `SvType`, `Metric`, `MatchResult`, `MatchConfig`, `OutputHeader`, `formatMatchResult` |
 | [src/matcha/intervals.nim](src/matcha/intervals.nim) | `reciprocalOverlap`, `jaccard` |
 | [src/matcha/bins.nim](src/matcha/bins.nim) | `binIndexFor`, `adjacentBins`, `TiledBuffer`, `BufferedRec` |
-| [src/matcha/preproc.nim](src/matcha/preproc.nim) | Normalize → per-(svtype,bin) BCF + work queue; BND ALT parsing; `extraKeepInfo` (anno); `keepPassQual` (collapse); `MATCHA_BOFF` encoding |
+| [src/matcha/preproc.nim](src/matcha/preproc.nim) | Normalize → per-(svtype,bin) BCF + work queue; BND ALT parsing; `extraKeepInfo` (anno); `MATCHA_BOFF` encoding |
 | [src/matcha/matchcore.nim](src/matcha/matchcore.nim) | `streamJobPairs` (interval, tiled-buffer) and `streamBndJobPairs` (BND, deque+delta), both returning `seq[MatchPair]`. Slim-BCF INFO decode helpers (`readBoff`, `readPos2`, `readChr2`, `extractEnd`). |
 | [src/matcha/match.nim](src/matcha/match.nim) | match-mode adapter: slim-BCF resolution → `MatchResult`, thread pools (`runMatchJobsWithPool`, `runMatchPairJobsWithPool`), TSV output |
 | [src/matcha/anno.nim](src/matcha/anno.nim) | anno-mode: expression parser, `applyAggFunc`, slim-B DB INFO extraction, output VCF assembly |
-| [src/matcha/mergecore.nim](src/matcha/mergecore.nim) | Header merge, k-way merge of slim BCFs, `buildSimilarityMap`, union-find components, agglomerative clustering, `selectRepresentative` |
-| [src/matcha/collapse.nim](src/matcha/collapse.nim) | collapse-mode driver: per-caller preproc, Pass 1 matching, Pass 2 exploration, clustering, output assembly |
-| [src/matcha/log.nim](src/matcha/log.nim) | Verbose logging (stderr, timestamped) |
+| [src/matcha/mergecore.nim](src/matcha/mergecore.nim) | Header merge (`resolveHeaders`), `buildSimilarityMap`, union-find components, agglomerative clustering, `selectRepresentative` |
+| [src/matcha/collapse.nim](src/matcha/collapse.nim) | collapse-mode driver: `integratedMerge` (fused preproc+merge via `synced_bcf_reader`), Pass 1 matching, Pass 2 exploration, clustering, output assembly |
+| [src/matcha/log.nim](src/matcha/log.nim) | Verbose/warn/error logging (stderr, timestamped); `warnCap` throttle |
+| [src/matcha/synced_bcf_reader.nim](src/matcha/synced_bcf_reader.nim) | FFI bindings for htslib `bcf_srs_t`; `newVariantView`/`setRecView`; [csrc/synced_bcf_wrap.c](csrc/synced_bcf_wrap.c) macro wrappers |
 
 ---
 

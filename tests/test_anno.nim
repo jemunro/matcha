@@ -76,7 +76,7 @@ timed("A04", "parseAnnoExpr: MATCHA_* SRCFIELDs set matchaVar correctly"):
 proc mkMatch(posB: int64; sim: float64;
              payload: Table[string, seq[string]] = initTable[string, seq[string]]()
             ): AnnoMatch =
-  AnnoMatch(aOffset: 0, bOffset: posB, posB: posB,
+  AnnoMatch(aOffset: 0, posB: posB,
             similarity: sim, payload: payload)
 
 timed("A10", "applyAggFunc: max/min/mean over numeric DB field"):

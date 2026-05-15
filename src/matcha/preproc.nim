@@ -112,9 +112,6 @@ proc encodeBoff*(off: int64): seq[int32] {.inline.} =
   @[cast[int32]((off shr 32) and 0xFFFF_FFFF'i64),
     cast[int32](off and 0xFFFF_FFFF'i64)]
 
-proc decodeBoff*(arr: seq[int32]): int64 {.inline.} =
-  (int64(arr[0]) shl 32) or (int64(arr[1]) and 0xFFFF_FFFF'i64)
-
 proc reasonStr(r: SkipReason): string =
   case r
   of skUnsupportedSvtype:   "unsupported_svtype"

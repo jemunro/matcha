@@ -30,10 +30,6 @@ type
     idB*:        string
     svtype*:     SvType
     similarity*: float64
-    aOffset*:    int64    ## BGZF virtual offset of A's source record (0 if unknown).
-                          ## Used by anno phase 3 to rejoin annotations against
-                          ## the original input. Not emitted in TSV output.
-    bOffset*:    int64    ## Same as aOffset, for B.
 
   MatchConfig* = object
     metric*:          Metric   ## Active interval metric (mOverlap | mJaccard).

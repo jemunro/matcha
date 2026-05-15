@@ -15,9 +15,7 @@ proc setVerbose*(b: bool) =
 proc logV*(msg: string) =
   if not gVerbose: return
   let el = epochTime() - gStart
-  stderr.writeLine("[" & formatFloat(el, ffDecimal, 3) & "s] " & msg)
-
-const PreprocWarnPrefix* = "[matcha preproc WARN] "
+  stderr.writeLine("[INFO " & formatFloat(el, ffDecimal, 3) & "s] " & msg)
 
 var gQuiet = false
 
@@ -30,7 +28,12 @@ proc logWarn*(msg: string) =
   ## Emit a warning to stderr (independent of -v/--verbose). Suppressed
   ## when setQuiet(true) has been called (test runs).
   if gQuiet: return
-  stderr.writeLine(PreprocWarnPrefix & msg)
+  let el = epochTime() - gStart
+  stderr.writeLine("[WARN " & formatFloat(el, ffDecimal, 3) & "s] " & msg)
+
+proc logError*(msg: string) =
+  let el = epochTime() - gStart
+  stderr.writeLine("[ERROR " & formatFloat(el, ffDecimal, 3) & "s] " & msg)
 
 proc warnCap*(): int =
   ## Per-reason cap for per-record warnings. Override via MATCHA_WARN_CAP.

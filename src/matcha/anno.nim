@@ -61,7 +61,6 @@ type
 
   AnnoMatch* = object
     aOffset*:    int64
-    bOffset*:    int64
     posB*:       int64
     similarity*: float64
     payload*:    Table[string, seq[string]]  ## DB srcField → stringified values
@@ -260,7 +259,7 @@ proc resolveAnnoPairs(job: MatchJob; pairs: seq[MatchPair];
   for p in pairs:
     let f = fieldsB[p.bOff]
     result.add(AnnoMatch(
-      aOffset:    p.aOff, bOffset: p.bOff, posB: f.posB,
+      aOffset:    p.aOff, posB: f.posB,
       similarity: p.sim, payload: f.payload,
     ))
 

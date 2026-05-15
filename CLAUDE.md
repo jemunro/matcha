@@ -22,10 +22,11 @@ python3 tests/generate_fixtures.py   # regenerate fixtures (needs bcftools + bgz
 | `utils.nim` | Shared types: `SvType`, `Metric`, `MatchResult`, `MatchConfig`, `OutputHeader`, `formatMatchResult` |
 | `intervals.nim` | `reciprocalOverlap`, `jaccard` |
 | `bins.nim` | `binIndexFor`, `adjacentBins`, `TiledBuffer`, `BufferedRec` |
-| `preproc.nim` | Normalize → per-(svtype,bin) temp BCF + work queue; `extraKeepInfo` (anno); `keepPassQual` (collapse); `MATCHA_BOFF` encoding |
+| `preproc.nim` | Normalize → per-(svtype,bin) temp BCF + work queue; `extraKeepInfo` (anno); `MATCHA_BOFF` encoding |
 | `matchcore.nim` | `streamJobPairs` (interval) and `streamBndJobPairs` (BND) — both return `seq[MatchPair]` (aOff, bOff, sim). Slim-BCF decode helpers. |
 | `match.nim` | match-mode adapter: slim-BCF resolution → `MatchResult`, thread pools (`runMatchJobsWithPool`, `runMatchPairJobsWithPool`), TSV output |
 | `anno.nim` | anno-mode: expression parser, `applyAggFunc`, slim-B DB INFO resolution, output VCF assembly |
-| `mergecore.nim` | header merge, k-way slim-BCF merge, `buildSimilarityMap`, union-find, agglomerative clustering, `selectRepresentative` |
-| `collapse.nim` | collapse-mode driver: per-caller preproc, two-pass matching, clustering, representative output |
-| `log.nim` | Verbose logging (stderr, timestamped) |
+| `mergecore.nim` | header merge (`resolveHeaders`), `buildSimilarityMap`, union-find, agglomerative clustering, `selectRepresentative` |
+| `collapse.nim` | collapse-mode driver: `integratedMerge` (fused preproc+merge via `synced_bcf_reader`), self-match, clustering, representative output |
+| `log.nim` | Verbose/warn/error logging (stderr, timestamped); `warnCap` throttle |
+| `synced_bcf_reader.nim` | FFI bindings for htslib `bcf_srs_t`; `newVariantView`/`setRecView`; `csrc/synced_bcf_wrap.c` macro wrappers |

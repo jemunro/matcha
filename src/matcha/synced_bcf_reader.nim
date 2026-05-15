@@ -22,19 +22,11 @@ proc bcf_sr_add_reader*(sr: ptr bcf_srs_t; fname: cstring): cint
     {.cdecl, importc: "bcf_sr_add_reader", dynlib: libname.}
 proc bcf_sr_next_line*(sr: ptr bcf_srs_t): cint
     {.cdecl, importc: "bcf_sr_next_line", dynlib: libname.}
-proc bcf_sr_seek*(sr: ptr bcf_srs_t; sq: cstring; pos: int64): cint
-    {.cdecl, importc: "bcf_sr_seek", dynlib: libname.}
-proc bcf_sr_set_threads*(sr: ptr bcf_srs_t; n: cint): cint
-    {.cdecl, importc: "bcf_sr_set_threads", dynlib: libname.}
 
 # ---- bcf_sr_set_opt with variadic support -----------------------------------
 
 const
-  BCF_SR_REQUIRE_IDX*     = 0.cint
-  BCF_SR_PAIR_LOGIC*      = 1.cint
-  BCF_SR_ALLOW_NO_IDX*    = 2.cint
-  BCF_SR_REGIONS_OVERLAP* = 3.cint
-  BCF_SR_TARGETS_OVERLAP* = 4.cint
+  BCF_SR_REQUIRE_IDX* = 0.cint
 
 proc bcf_sr_set_opt*(sr: ptr bcf_srs_t; opt: cint): cint
     {.varargs, cdecl, importc: "bcf_sr_set_opt", dynlib: libname.}

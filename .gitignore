@@ -19,3 +19,4 @@
 nimble.develop
 nimble.paths
 nimbledeps
+.claude/settings.local.json

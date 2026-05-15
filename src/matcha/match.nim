@@ -58,7 +58,6 @@ proc resolveIntervalPairs(job: MatchJob; pairs: seq[MatchPair]): seq[MatchResult
       posB:       fB.pos, endB: fB.endP, idB: fB.id,
       svtype:     job.svtype,
       similarity: p.sim,
-      aOffset:    p.aOff, bOffset: p.bOff,
     ))
 
 proc resolveBndPairs(job: MatchJob; pairs: seq[MatchPair]): seq[MatchResult] =
@@ -78,7 +77,6 @@ proc resolveBndPairs(job: MatchJob; pairs: seq[MatchPair]): seq[MatchResult] =
       posB:       fB.pos, endB: 0, idB: fB.id,
       svtype:     svBND,
       similarity: p.sim,
-      aOffset:    p.aOff, bOffset: p.bOff,
     ))
 
 # ---------------------------------------------------------------------------

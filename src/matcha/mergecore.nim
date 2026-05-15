@@ -11,10 +11,10 @@
 ##   clusterAll            — full pipeline: components → agglomerate each
 ##   selectRepresentative  — priority-cascade representative selection
 
-import std/[sequtils, strutils, tables]
+import std/[os, sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
-import matchcore
+import utils, matchcore, preproc, synced_bcf_reader
 
 # ---------------------------------------------------------------------------
 # Types
@@ -476,3 +476,361 @@ proc clusterAll*(allOffsets: seq[int64];
   for offsets in byComp.values:
     for cl in agglomerateComponent(offsets, simMap, linkage, threshold):
       result.add(cl)
+
+# ---------------------------------------------------------------------------
+# integratedMerge — fused preproc + merge in one synced_bcf_reader pass
+# ---------------------------------------------------------------------------
+
+type
+  MergeStreamConfig* = object
+    ## Configuration for integratedMerge; decoupled from CollapseConfig so the
+    ## same streaming kernel can be reused by matcha merge.
+    formatFields*: seq[string]   ## FORMAT fields to carry; empty = no FORMAT
+    nThreads*:     int
+    tmpDir*:       string
+
+# Header utility: collect ##FILTER=<...> lines from a header.
+proc collectFilterLines*(h: ptr bcf_hdr_t): seq[string] =
+  let hrecs = cast[ptr UncheckedArray[ptr bcf_hrec_t]](h.hrec)
+  for i in 0 ..< h.nhrec.int:
+    let hr = hrecs[i]
+    if hr.`type` != BCF_HEADER_TYPE.BCF_HL_FLT.cint: continue
+    let keys = cast[ptr UncheckedArray[cstring]](hr.keys)
+    let vals = cast[ptr UncheckedArray[cstring]](hr.vals)
+    var line = "##FILTER=<"
+    for j in 0 ..< hr.nkeys.int:
+      if j > 0: line &= ","
+      line &= $keys[j] & "=" & $vals[j]
+    line &= ">"
+    result.add(line)
+
+const AlwaysKeepInMerged* = ["SVTYPE", "SVLEN", "END", "CHR2", "POS2",
+                              "SOURCE", "SOURCELIST", "N_SOURCE", "N_MERGED",
+                              "MATCHA_BOFF"]
+
+proc keepInfoForMerged*(name: string; infoFilter: seq[string]): bool =
+  ## Keep set for INFO fields in the merged slim BCFs.
+  ## - Always keeps matcha-internal + matchcore-required fields.
+  ## - With infoFilter empty: keep all non-internal fields.
+  ## - With infoFilter set: keep listed fields (or their *_<caller> renames).
+  if name == "MATCHA_CALLER_IDX": return false  # legacy internal
+  for n in AlwaysKeepInMerged:
+    if name == n: return true
+  if infoFilter.len == 0: return true
+  for tok in infoFilter:
+    if name == tok or name.startsWith(tok & "_"): return true
+  false
+
+proc btToHt(bt: cint): cint =
+  if bt == BCF_BT_FLOAT: BCF_HT_REAL.cint
+  elif bt == BCF_BT_CHAR: BCF_HT_STR.cint
+  else: BCF_HT_INT.cint
+
+proc applyInfoRename*(srcHdr: ptr bcf_hdr_t; rec: ptr bcf1_t;
+                      origName, newName: string;
+                      buf: var pointer; bufN: var cint) =
+  let info = bcf_get_info(srcHdr, rec, origName.cstring)
+  if info == nil: return
+  let htType = btToHt(info.`type`)
+  let n = bcf_get_info_values(srcHdr, rec, origName.cstring,
+                              buf.addr, bufN.addr, htType)
+  if n > 0:
+    discard bcf_update_info(srcHdr, rec, newName.cstring, buf, n.cint, htType)
+  discard bcf_update_info(srcHdr, rec, origName.cstring, nil, 0.cint, htType)
+
+proc applyFmtRename*(srcHdr: ptr bcf_hdr_t; rec: ptr bcf1_t;
+                     origName, newName: string;
+                     buf: var pointer; bufN: var cint) =
+  let fmt = bcf_get_fmt(srcHdr, rec, origName.cstring)
+  if fmt == nil: return
+  let htType = btToHt(fmt.`type`)
+  let n = bcf_get_format_values(srcHdr, rec, origName.cstring,
+                                buf.addr, bufN.addr, htType)
+  if n > 0:
+    discard bcf_update_format(srcHdr, rec, newName.cstring, buf, n.cint, htType)
+  discard bcf_update_format(srcHdr, rec, origName.cstring, nil, 0.cint, htType)
+
+proc augmentSrcHdrForRenames*(srcHdr: ptr bcf_hdr_t; ci: int;
+                               mh: MergedHeader) =
+  ## For each renamed INFO/FORMAT field this caller writes under, append the
+  ## renamed def to srcHdr so subsequent bcf_update_info/_format calls have
+  ## the field's Number/Type available. Must be done before any rename write.
+  for origName, res in mh.infoRes.pairs:
+    if res.kind != fcIncompatibleInfo: continue
+    if ci notin res.renames: continue
+    let newName = res.renames[ci]
+    for hi in collectHrecs(srcHdr, BCF_HEADER_TYPE.BCF_HL_INFO.cint):
+      if hi.id == origName:
+        discard bcf_hdr_append(srcHdr,
+          ("##INFO=<ID=" & newName & ",Number=" & hi.number & ",Type=" & hi.typ &
+           ",Description=\"" & hi.desc & "\">").cstring)
+        break
+  for origName, res in mh.fmtRes.pairs:
+    if res.kind != fcIncompatibleFmt: continue
+    if ci notin res.renames: continue
+    let newName = res.renames[ci]
+    for hi in collectHrecs(srcHdr, BCF_HEADER_TYPE.BCF_HL_FMT.cint):
+      if hi.id == origName:
+        discard bcf_hdr_append(srcHdr,
+          ("##FORMAT=<ID=" & newName & ",Number=" & hi.number & ",Type=" & hi.typ &
+           ",Description=\"" & hi.desc & "\">").cstring)
+        break
+  # Also ensure SOURCE / MATCHA_BOFF / SV defs exist for the authoritative
+  # writes issued against srcHdr in the per-record loop.
+  proc ensureInfo(h: ptr bcf_hdr_t; name, num, typ, desc: string) =
+    for hi in collectHrecs(h, BCF_HEADER_TYPE.BCF_HL_INFO.cint):
+      if hi.id == name: return
+    discard bcf_hdr_append(h,
+      ("##INFO=<ID=" & name & ",Number=" & num & ",Type=" & typ &
+       ",Description=\"" & desc & "\">").cstring)
+  ensureInfo(srcHdr, "MATCHA_BOFF", "2", "Integer", "matcha-internal identity token")
+  ensureInfo(srcHdr, "SOURCE",      "1", "String",  "Representative caller name")
+  ensureInfo(srcHdr, "SVTYPE",      "1", "String",  "Type of structural variant")
+  ensureInfo(srcHdr, "SVLEN",       "1", "Integer", "Length of the SV")
+  ensureInfo(srcHdr, "END",         "1", "Integer", "End position of the SV")
+  ensureInfo(srcHdr, "CHR2",        "1", "String",  "Chromosome of mate breakend")
+  ensureInfo(srcHdr, "POS2",        "1", "Integer", "Position of mate breakend")
+  discard bcf_hdr_sync(srcHdr)
+
+type IntegratedMergeResult* = object
+  paths*:          Table[SvtypeBin, string]
+  populatedBins*:  Table[SvType, set[uint8]]
+  chromsBySvtype*: Table[SvType, HashSet[string]]
+
+proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
+                      finalHdr: ptr bcf_hdr_t;
+                      cfg: MergeStreamConfig;
+                      chromOrder: seq[string]): IntegratedMergeResult =
+  ## Stream all N caller VCFs via one synced_bcf_reader, normalize each
+  ## record, filter INFO/FORMAT to the user-selected fields, write per-
+  ## (svtype, bin) merged slim BCFs. finalHdr is pre-built by the caller
+  ## (collapse builds it with buildFinalHdr; merge will supply its own).
+
+  # 1. Init synced_bcf_reader + thread pool.
+  let sr = bcf_sr_init()
+  if sr == nil:
+    raise newException(IOError, "bcf_sr_init failed")
+  discard bcf_sr_set_opt(sr, BCF_SR_REQUIRE_IDX)
+
+  let nThr = max(1, cfg.nThreads)
+  var tpool = htsThreadPool(pool: nil, qsize: 0)
+  if nThr >= 2:
+    tpool.pool = hts_tpool_init(nThr.cint)
+
+  for caller in callers:
+    if bcf_sr_add_reader(sr, caller.path.cstring) == 0:
+      let msg = $bcf_sr_strerror(srs_errnum(sr))
+      bcf_sr_destroy(sr)
+      if tpool.pool != nil: hts_tpool_destroy(tpool.pool)
+      raise newException(IOError, "cannot open: " & caller.path & " (" & msg & ")")
+
+  let nreaders = srs_nreaders(sr).int
+
+  # Attach thread pool to each reader's underlying file.
+  if tpool.pool != nil:
+    for i in 0 ..< nreaders:
+      discard hts_set_opt(srs_get_file(sr, i.cint),
+                          srs_hts_opt_thread_pool(), tpool.addr)
+
+  # Subset samples on each reader's header (one sample per caller for
+  # collapse, or none).
+  for ci in 0 ..< nreaders:
+    let srcHdr = srs_get_header(sr, ci.cint)
+    if cfg.formatFields.len == 0:
+      discard bcf_hdr_set_samples(srcHdr, cstring(nil), 0.cint)
+    else:
+      let nsamp = bcf_hdr_nsamples(srcHdr).int
+      if nsamp > 0:
+        let firstSample = $cast[cstringArray](srcHdr.samples)[0]
+        discard bcf_hdr_set_samples(srcHdr, firstSample.cstring, 0.cint)
+      else:
+        discard bcf_hdr_set_samples(srcHdr, cstring(nil), 0.cint)
+    augmentSrcHdrForRenames(srcHdr, ci, mh)
+
+  # Per-caller WarnState + record counter.
+  var wsList: seq[WarnState]
+  var recCounter = newSeq[int64](nreaders)
+  for i in 0 ..< nreaders:
+    wsList.add(initWarnState(callers[i].name))
+
+  # Keep sets derived from finalHdr: post-filter records contain exactly the
+  # fields finalHdr defines → bcf_translate is clean.
+  var infoKeepSet, fmtKeepSet: HashSet[string]
+  for hi in collectHrecs(finalHdr, BCF_HEADER_TYPE.BCF_HL_INFO.cint):
+    infoKeepSet.incl(hi.id)
+  for hi in collectHrecs(finalHdr, BCF_HEADER_TYPE.BCF_HL_FMT.cint):
+    fmtKeepSet.incl(hi.id)
+
+  # Reusable Variant view over the synced reader's records.
+  let view = newVariantView()
+  var svtypeBuf: string
+  var endBuf, svlenBuf: seq[int32]
+  var renameBuf: pointer = nil
+  var renameN:   cint    = 0
+
+  # Lazy-opened writers + CSI indexes per (svtype, bin).
+  var writers:    Table[SvtypeBin, VCF]
+  var indexes:    Table[SvtypeBin, ptr hts_idx_t]
+  var writerHdrs: Table[SvtypeBin, ptr bcf_hdr_t]
+
+  try:
+    # 2. Stream records.
+    while bcf_sr_next_line(sr) > 0:
+      for ci in 0 ..< nreaders:
+        if srs_has_line(sr, ci.cint) == 0: continue
+        let srcHdr = srs_get_header(sr, ci.cint)
+        let rawRec = srs_get_line(sr, ci.cint)
+
+        let counter = recCounter[ci]
+        inc recCounter[ci]
+
+        let rec = bcf_dup(rawRec)
+
+        let nr = normalizeRecord(srcHdr, rec, counter.int + 1,
+                                 wsList[ci], view, svtypeBuf, endBuf, svlenBuf,
+                                 callers[ci].path)
+        if not nr.ok:
+          bcf_destroy(rec)
+          continue
+
+        # 2a. Apply INFO renames.
+        for origName, res in mh.infoRes.pairs:
+          if res.kind != fcIncompatibleInfo: continue
+          if ci notin res.renames: continue
+          applyInfoRename(srcHdr, rec, origName, res.renames[ci],
+                          renameBuf, renameN)
+
+        # 2b. Apply FORMAT renames.
+        for origName, res in mh.fmtRes.pairs:
+          if res.kind != fcIncompatibleFmt: continue
+          if ci notin res.renames: continue
+          applyFmtRename(srcHdr, rec, origName, res.renames[ci],
+                         renameBuf, renameN)
+
+        # 2c+2d. Filter INFO and FORMAT fields.
+        discard bcf_unpack(rec, BCF_UN_ALL.cint)
+        let idPairs = cast[ptr UncheckedArray[bcf_idpair_t]](srcHdr.id[BCF_DT_ID])
+        var infoToDel: seq[string]
+        let nInfo = rec.n_info.int
+        if nInfo > 0:
+          let infoArr = cast[ptr UncheckedArray[bcf_info_t]](rec.d.info)
+          for i in 0 ..< nInfo:
+            let key = infoArr[i].key
+            if key < 0: continue
+            let nm = $idPairs[key].key
+            if nm notin infoKeepSet: infoToDel.add(nm)
+        for nm in infoToDel:
+          discard bcf_update_info(srcHdr, rec, nm.cstring,
+                                  nil, 0.cint, BCF_HT_INT.cint)
+        var fmtToDel: seq[string]
+        let nFmt = rec.n_fmt.int
+        if nFmt > 0:
+          let fmtArr = cast[ptr UncheckedArray[bcf_fmt_t]](rec.d.fmt)
+          for i in 0 ..< nFmt:
+            let id = fmtArr[i].id
+            if id < 0: continue
+            let nm = $idPairs[id].key
+            if nm notin fmtKeepSet: fmtToDel.add(nm)
+        for nm in fmtToDel:
+          discard bcf_update_format(srcHdr, rec, nm.cstring,
+                                    nil, 0.cint, BCF_HT_INT.cint)
+
+        # 2e. Authoritative writes for END / CHR2 / POS2 / SVTYPE / SVLEN.
+        var svtStr = $nr.svt
+        discard bcf_update_info(srcHdr, rec, "SVTYPE".cstring,
+                                svtStr[0].addr, svtStr.len.cint, BCF_HT_STR.cint)
+        var svlenVal = nr.svlen.int32
+        discard bcf_update_info(srcHdr, rec, "SVLEN".cstring,
+                                svlenVal.addr, 1.cint, BCF_HT_INT.cint)
+        if nr.svt == svBND:
+          var chr2Str = nr.bndChr2
+          if chr2Str.len > 0:
+            discard bcf_update_info(srcHdr, rec, "CHR2".cstring,
+                                    chr2Str[0].addr, chr2Str.len.cint, BCF_HT_STR.cint)
+          var pos2Val = nr.bndPos2.int32
+          discard bcf_update_info(srcHdr, rec, "POS2".cstring,
+                                  pos2Val.addr, 1.cint, BCF_HT_INT.cint)
+        else:
+          var endVal = nr.endPos.int32
+          discard bcf_update_info(srcHdr, rec, "END".cstring,
+                                  endVal.addr, 1.cint, BCF_HT_INT.cint)
+
+        # 2f. Set SOURCE = caller name.
+        var srcStr = callers[ci].name
+        discard bcf_update_info(srcHdr, rec, "SOURCE".cstring,
+                                srcStr[0].addr, srcStr.len.cint, BCF_HT_STR.cint)
+
+        # 2g. Set MATCHA_BOFF = (callerIdx << 48) | counter.
+        let compositeOff = (ci.int64 shl 48) or counter
+        var boffPair = encodeBoff(compositeOff)
+        discard bcf_update_info(srcHdr, rec, "MATCHA_BOFF".cstring,
+                                boffPair[0].addr, 2.cint, BCF_HT_INT.cint)
+
+        # 2h. REF/ALT trim to keep records small (matchcore reads neither).
+        discard bcf_update_alleles_str(srcHdr, rec, "N,.".cstring)
+
+        # 2i. Track metadata + lazy-open writer.
+        if nr.svt notin result.populatedBins:
+          result.populatedBins[nr.svt] = {}
+        result.populatedBins[nr.svt].incl(uint8(nr.binIdx))
+        if nr.svt notin result.chromsBySvtype:
+          result.chromsBySvtype[nr.svt] = initHashSet[string]()
+        result.chromsBySvtype[nr.svt].incl(getChromName(srcHdr, rec.rid))
+
+        let key: SvtypeBin = (nr.svt, nr.binIdx)
+        if key notin writers:
+          let outPath = cfg.tmpDir / "matcha_" & $getCurrentProcessId() &
+                        "_M_" & $nr.svt & "_b" & $nr.binIdx & ".bcf"
+          var wtr: VCF
+          if not open(wtr, outPath, mode = "wb"):
+            raise newException(IOError, "cannot create merged BCF: " & outPath)
+          # Init wtr.header via a dummy source, then replace with dup of finalHdr
+          # (each writer owns its dup; finalHdr remains valid for writeOutput).
+          var dummy: VCF
+          discard open(dummy, callers[0].path)
+          wtr.copy_header(dummy.header)
+          dummy.close()
+          bcf_hdr_destroy(wtr.header.hdr)
+          let wHdr = bcf_hdr_dup(finalHdr)
+          wtr.header.hdr = wHdr
+          writerHdrs[key] = wHdr
+          if tpool.pool != nil:
+            discard hts_set_opt(vcfHtsFile(wtr),
+                                srs_hts_opt_thread_pool(), tpool.addr)
+          discard wtr.write_header()
+          writers[key] = wtr
+          result.paths[key] = outPath
+          let headerOff = uint64(bgzf_tell(bgzfHandle(wtr)))
+          let idx = hts_idx_init(0.cint, HTS_FMT_CSI.cint, headerOff,
+                                 14.cint, 5.cint)
+          if idx == nil:
+            raise newException(IOError, "cannot create CSI index: " & outPath)
+          indexes[key] = idx
+
+        # 2j. Translate field IDs to finalHdr space, write record, push to index.
+        discard bcf_translate(writerHdrs[key], srcHdr, rec)
+        discard bcf_write(vcfHtsFile(writers[key]), writerHdrs[key], rec)
+        let woff = uint64(bgzf_tell(bgzfHandle(writers[key])))
+        discard hts_idx_push(indexes[key], rec.rid, int64(rec.pos),
+                             nr.endPos, woff, 1.cint)
+
+        bcf_destroy(rec)
+
+  finally:
+    # Teardown order: destroy synced reader first (it owns reader file handles),
+    # then close writers (each holds its own dup of finalHdr), then destroy
+    # the shared thread pool last (after every htsFile* that referenced it).
+    bcf_sr_destroy(sr)
+    for key, wtr in writers.mpairs:
+      let finalOff = uint64(bgzf_tell(bgzfHandle(wtr)))
+      hts_idx_finish(indexes[key], finalOff)
+      wtr.close()  # bcf_hdr_destroy on wtr.header.hdr (the dup) — finalHdr is safe
+      let path = result.paths[key]
+      hts_idx_save(indexes[key], path.cstring, HTS_FMT_CSI.cint)
+      hts_idx_destroy(indexes[key])
+    if tpool.pool != nil: hts_tpool_destroy(tpool.pool)
+
+    if renameBuf != nil: c_free(renameBuf)
+
+  # Emit per-caller summaries.
+  for ws in wsList: emitSummary(ws)
