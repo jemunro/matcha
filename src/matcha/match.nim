@@ -7,7 +7,7 @@
 ## records up by INFO/MATCHA_BOFF. Slim BCFs are keep-set only (no FORMAT or
 ## samples) so this pass is cheap. svtype and chrom come from `job` directly.
 
-import std/[atomics, os, sets, tables]
+import std/[atomics, sets, tables]
 import hts
 import utils, preproc, log, matchcore
 
@@ -21,22 +21,15 @@ proc collectFields(path, chrom: string; needed: HashSet[int64];
                    bnd: bool): Table[int64, SlimFields] =
   ## Scan a slim BCF for `chrom`, capturing (POS, END, ID) keyed by
   ## MATCHA_BOFF for every record whose offset is in `needed`. For BND
-  ## records END is the POS+1 sentinel from preproc; return endP=0 so the
-  ## output renders as '.'.
-  var vcf: VCF
-  if not open(vcf, path):
-    raise newException(IOError, "cannot reopen slim BCF: " & path)
-  var endData, svlenData, boffData: seq[int32]
-  for v in vcf.query(chrom):
-    let off = readBoff(v, boffData)
-    if off notin needed: continue
+  ## records endP=0 so the output renders as '.'.
+  var endData, svlenData: seq[int32]
+  scanSlimBcf(path, chrom, needed):
     if bnd:
       result[off] = (v.POS, 0'i64, $v.ID)
     else:
       var endP: int64
       if not extractEnd(v, endData, svlenData, endP): continue
       result[off] = (v.POS, endP, $v.ID)
-  vcf.close()
 
 proc resolveIntervalPairs(job: MatchJob; pairs: seq[MatchPair]): seq[MatchResult] =
   if pairs.len == 0: return
@@ -54,7 +47,6 @@ proc resolveIntervalPairs(job: MatchJob; pairs: seq[MatchPair]): seq[MatchResult
     result.add(MatchResult(
       chromA:     job.chrom,
       posA:       fA.pos, endA: fA.endP, idA: fA.id,
-      chromB:     job.chrom,
       posB:       fB.pos, endB: fB.endP, idB: fB.id,
       svtype:     job.svtype,
       similarity: p.sim,
@@ -73,7 +65,6 @@ proc resolveBndPairs(job: MatchJob; pairs: seq[MatchPair]): seq[MatchResult] =
     result.add(MatchResult(
       chromA:     job.chrom,
       posA:       fA.pos, endA: 0, idA: fA.id,
-      chromB:     job.chrom,
       posB:       fB.pos, endB: 0, idB: fB.id,
       svtype:     svBND,
       similarity: p.sim,
@@ -209,11 +200,7 @@ proc runMatch*(cfg: MatchConfig) =
        (if cfg.outputPath != "": " to " & cfg.outputPath else: " to stdout"))
 
   # Clean up temp BCFs (per-(svtype, bin) files for both callsets).
-  # In self mode, filesB aliases filesA — skip the second loop.
-  for path in filesA.paths.values:
-    if fileExists(path):     removeFile(path)
-    if fileExists(path & ".csi"): removeFile(path & ".csi")
+  # In self mode, filesB aliases filesA — skip the second cleanup.
+  removeTempBcfs(filesA.paths)
   if not cfg.selfMode:
-    for path in filesB.paths.values:
-      if fileExists(path):     removeFile(path)
-      if fileExists(path & ".csi"): removeFile(path & ".csi")
+    removeTempBcfs(filesB.paths)

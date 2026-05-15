@@ -11,7 +11,7 @@
 ##      look up its match set in an in-memory map keyed by aOffset, apply
 ##      aggregation functions, and write the annotated record.
 
-import std/[algorithm, atomics, os, sequtils, sets, strutils, tables]
+import std/[algorithm, atomics, sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
 import utils, preproc, log, matchcore
@@ -229,18 +229,11 @@ proc collectBFields(path, chrom: string; needed: HashSet[int64];
   ## values for every record whose MATCHA_BOFF is in `needed`. The slim B
   ## BCFs already carry the user-requested DB fields (via preproc's
   ## extraKeepInfo), so no original-file seek is required.
-  var vcf: VCF
-  if not open(vcf, path):
-    raise newException(IOError, "cannot reopen slim B BCF: " & path)
-  var boffData: seq[int32]
   var iBuf: seq[int32]
   var fBuf: seq[float32]
   var sBuf: string
-  for v in vcf.query(chrom):
-    let off = readBoff(v, boffData)
-    if off notin needed: continue
+  scanSlimBcf(path, chrom, needed):
     result[off] = (v.POS, extractDbValues(v, dbFields, dbTypes, iBuf, fBuf, sBuf))
-  vcf.close()
 
 proc resolveAnnoPairs(job: MatchJob; pairs: seq[MatchPair];
                       dbFields: seq[string];
@@ -384,27 +377,26 @@ proc applyAggFunc*(e: AnnoExpr; matches: seq[AnnoMatch]): seq[string] =
 # Thread pool for matching phase
 # ---------------------------------------------------------------------------
 
-var gAnnoJobs:     seq[MatchJob]
-var gAnnoCfg:      AnnoConfig
-var gAnnoDbTypes:  Table[string, string]
-var gAnnoNext:     Atomic[int]
-var gAnnoResults:  seq[seq[AnnoMatch]]
+type AnnoPoolState = object
+  jobs:    seq[MatchJob]
+  cfg:     AnnoConfig
+  dbTypes: Table[string, string]
+  next:    Atomic[int]
+  results: seq[seq[AnnoMatch]]
 
-proc annoThreadWorker(dummy: int) {.thread.} =
+proc annoPoolWorker(state: ptr AnnoPoolState) {.thread.} =
   {.cast(gcsafe).}:
     while true:
-      let idx = gAnnoNext.fetchAdd(1, moRelaxed)
-      if idx >= gAnnoJobs.len: break
-      gAnnoResults[idx] = dispatchAnnoJob(gAnnoJobs[idx], gAnnoCfg, gAnnoDbTypes)
-      logV("anno job " & gAnnoJobs[idx].chrom & "/" & $gAnnoJobs[idx].svtype &
-           "/bin" & $gAnnoJobs[idx].binA &
-           ": " & $gAnnoResults[idx].len & " match(es)")
+      let idx = state.next.fetchAdd(1, moRelaxed)
+      if idx >= state.jobs.len: break
+      state.results[idx] = dispatchAnnoJob(state.jobs[idx], state.cfg, state.dbTypes)
+      let j = state.jobs[idx]
+      logV("anno job " & j.chrom & "/" & $j.svtype & "/bin" & $j.binA &
+           ": " & $state.results[idx].len & " match(es)")
 
 # ---------------------------------------------------------------------------
 # Output assembly (phase 3)
 # ---------------------------------------------------------------------------
-
-proc isStdoutPath(p: string): bool = p == "" or p == "-"
 
 proc validateOutputPath(p: string) =
   if isStdoutPath(p): return
@@ -509,17 +501,17 @@ proc runAnno*(cfg: var AnnoConfig) =
         logV("anno job " & j.chrom & "/" & $j.svtype & "/bin" & $j.binA &
              ": " & $jobResults[i].len & " match(es)")
     else:
-      gAnnoJobs = jobs
-      gAnnoCfg = cfg
-      gAnnoDbTypes = dbTypes
-      gAnnoResults = newSeq[seq[AnnoMatch]](jobs.len)
-      gAnnoNext.store(0, moRelaxed)
-      var threads = newSeq[Thread[int]](cfg.nThreads)
+      logV("starting " & $cfg.nThreads & " anno worker thread(s) for " &
+           $jobs.len & " job(s)")
+      var state = AnnoPoolState(jobs: jobs, cfg: cfg, dbTypes: dbTypes,
+                                results: newSeq[seq[AnnoMatch]](jobs.len))
+      state.next.store(0, moRelaxed)
+      var threads = newSeq[Thread[ptr AnnoPoolState]](cfg.nThreads)
       for i in 0 ..< cfg.nThreads:
-        createThread(threads[i], annoThreadWorker, i)
+        createThread(threads[i], annoPoolWorker, addr state)
       for i in 0 ..< cfg.nThreads:
         joinThread(threads[i])
-      jobResults = gAnnoResults
+      jobResults = state.results
 
   # Group matches by aOffset.
   var byAoff = initTable[int64, seq[AnnoMatch]]()
@@ -613,9 +605,5 @@ proc runAnno*(cfg: var AnnoConfig) =
     logV("indexed " & cfg.outputPath)
 
   # Clean up temp BCFs (A and B preproc artifacts).
-  for path in filesA.paths.values:
-    if fileExists(path):           removeFile(path)
-    if fileExists(path & ".csi"):  removeFile(path & ".csi")
-  for path in filesB.paths.values:
-    if fileExists(path):           removeFile(path)
-    if fileExists(path & ".csi"):  removeFile(path & ".csi")
+  removeTempBcfs(filesA.paths)
+  removeTempBcfs(filesB.paths)

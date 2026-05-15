@@ -707,6 +707,12 @@ proc buildWorkQueue*(a, b: PreprocOutput, cfg: MatchConfig): seq[MatchJob] =
   jobs.sort(cmpJobs)
   result = jobs
 
+proc removeTempBcfs*(paths: Table[SvtypeBin, string]) =
+  ## Delete per-(svtype, bin) BCF temp files and their CSI indexes.
+  for path in paths.values:
+    if fileExists(path):          removeFile(path)
+    if fileExists(path & ".csi"): removeFile(path & ".csi")
+
 # ---------------------------------------------------------------------------
 # Parallel preprocessing helper (shared by match and anno)
 # ---------------------------------------------------------------------------

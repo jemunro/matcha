@@ -10,7 +10,7 @@
 ## Self-mode dedup (aOff < bOff filter, dropping the trivial X-vs-X case) is
 ## baked in via cfg.selfMode; anno never sets it.
 
-import std/[algorithm, deques, sequtils, tables]
+import std/[algorithm, deques, sequtils, sets, tables]
 import hts
 import intervals, preproc, bins, utils
 
@@ -53,6 +53,26 @@ proc extractEnd*(v: Variant; endData, svlenData: var seq[int32];
   if v.info().get("SVLEN", svlenData) == Status.OK and svlenData.len > 0:
     outEnd = v.POS + abs(int64(svlenData[0])); return true
   false
+
+# ---------------------------------------------------------------------------
+# Shared slim-BCF scan template
+# ---------------------------------------------------------------------------
+
+template scanSlimBcf*(path, chrom: string; needed: HashSet[int64];
+                      body: untyped) =
+  ## Open a slim BCF, query `chrom`, iterate records whose MATCHA_BOFF is in
+  ## `needed`, and execute `body` for each matched record.
+  ## Injects into `body`: `v` (Variant) and `off` (int64, the MATCHA_BOFF).
+  block:
+    var vcf: VCF
+    if not open(vcf, path):
+      raise newException(IOError, "cannot reopen slim BCF: " & path)
+    var boffScratch: seq[int32]
+    for v {.inject.} in vcf.query(chrom):
+      let off {.inject.} = readBoff(v, boffScratch)
+      if off notin needed: continue
+      body
+    vcf.close()
 
 # ---------------------------------------------------------------------------
 # Interval matching

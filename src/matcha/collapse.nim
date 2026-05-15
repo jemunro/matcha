@@ -225,8 +225,6 @@ type
     nSource:    int
     nMerged:    int
 
-proc isStdoutPath(p: string): bool = p == "" or p == "-" or p == "/dev/stdout"
-
 proc writeOutput(cfg: CollapseConfig;
                  finalHdr: ptr bcf_hdr_t;
                  chromOrder: seq[string];
@@ -264,7 +262,7 @@ proc writeOutput(cfg: CollapseConfig;
   # is always dropped.
   let infoFilter = cfg.infoFields
   proc keepInfoOut(name: string): bool =
-    if name == "MATCHA_BOFF" or name == "MATCHA_CALLER_IDX": return false
+    if name == "MATCHA_BOFF": return false
     if name in ["SOURCE", "SOURCELIST", "N_SOURCE", "N_MERGED"]: return true
     if infoFilter.len == 0: return true
     for tok in infoFilter:
@@ -461,7 +459,5 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
   writeOutput(cfg, finalHdr, chromOrder, im.paths, finalClusters)
 
   # Clean up: merged slim BCFs + CSI indexes, and finalHdr.
-  for path in im.paths.values:
-    if fileExists(path):          removeFile(path)
-    if fileExists(path & ".csi"): removeFile(path & ".csi")
+  removeTempBcfs(im.paths)
   bcf_hdr_destroy(finalHdr)

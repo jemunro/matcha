@@ -513,7 +513,6 @@ proc keepInfoForMerged*(name: string; infoFilter: seq[string]): bool =
   ## - Always keeps matcha-internal + matchcore-required fields.
   ## - With infoFilter empty: keep all non-internal fields.
   ## - With infoFilter set: keep listed fields (or their *_<caller> renames).
-  if name == "MATCHA_CALLER_IDX": return false  # legacy internal
   for n in AlwaysKeepInMerged:
     if name == n: return true
   if infoFilter.len == 0: return true
@@ -613,7 +612,7 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
   discard bcf_sr_set_opt(sr, BCF_SR_REQUIRE_IDX)
 
   let nThr = max(1, cfg.nThreads)
-  var tpool = htsThreadPool(pool: nil, qsize: 0)
+  var tpool = htsThreadPool(pool: nil)
   if nThr >= 2:
     tpool.pool = hts_tpool_init(nThr.cint)
 

@@ -57,7 +57,6 @@ proc bcf_translate*(dst_hdr, src_hdr: ptr bcf_hdr_t; line: ptr bcf1_t): cint
 
 type htsThreadPool* {.bycopy.} = object
   pool*:  pointer
-  qsize*: cint
 
 proc hts_tpool_init*(n: cint): pointer
     {.cdecl, importc: "hts_tpool_init", dynlib: libname.}

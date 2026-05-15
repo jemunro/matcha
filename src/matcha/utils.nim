@@ -8,8 +8,8 @@ type
     svDUP = "DUP"
     svINV = "INV"
     svBND = "BND"
-    svINS = "INS"
-    svTRA = "TRA"
+    svINS = "INS"      ## out of scope — silently skipped in preproc
+    svTRA = "TRA"      ## out of scope — warned and skipped in preproc
     svUNKNOWN = "UNKNOWN"
 
   Metric* = enum
@@ -20,11 +20,10 @@ type
     mJaccard = "jaccard"
 
   MatchResult* = object
-    chromA*:     string
+    chromA*:     string   ## shared by both sides — match jobs are per-chromosome
     posA*:       int64
     endA*:       int64    ## ignored for svBND rows; emitted as "." in output
     idA*:        string
-    chromB*:     string
     posB*:       int64
     endB*:       int64    ## ignored for svBND rows; emitted as "." in output
     idB*:        string
@@ -49,6 +48,10 @@ const SupportedSvTypes* = {svDEL, svDUP, svINV, svBND}
 const OutputHeader* =
   "#CHROM_A\tPOS_A\tEND_A\tID_A\tCHROM_B\tPOS_B\tEND_B\tID_B\tSVTYPE\tSIMILARITY"
 
+proc isStdoutPath*(p: string): bool =
+  ## True when `p` refers to standard output (empty, "-", or "/dev/stdout").
+  p == "" or p == "-" or p == "/dev/stdout"
+
 proc parseSvType*(s: string): SvType =
   case s.toUpperAscii
   of "DEL": svDEL
@@ -65,5 +68,5 @@ proc formatMatchResult*(r: MatchResult): string =
   let endAStr = if r.svtype == svBND: "." else: $r.endA
   let endBStr = if r.svtype == svBND: "." else: $r.endB
   r.chromA & "\t" & $r.posA & "\t" & endAStr & "\t" & r.idA & "\t" &
-  r.chromB & "\t" & $r.posB & "\t" & endBStr & "\t" & r.idB & "\t" & $r.svtype & "\t" &
+  r.chromA & "\t" & $r.posB & "\t" & endBStr & "\t" & r.idB & "\t" & $r.svtype & "\t" &
   formatFloat(r.similarity, ffDecimal, 6)
