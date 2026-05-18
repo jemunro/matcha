@@ -36,12 +36,12 @@ timed("M01", "binary available"):
       quit(1)
   doAssert fileExists(BinPath), "binary not found: " & BinPath
 
-# M02 — no threshold exits non-zero with informative error (on stderr)
+# M02 — no threshold flag: defaults to --min-jaccard 0.75
 timed("M02", "no threshold flag: exits non-zero, mentions flag names"):
-  let (outp, code) = runMerged("match " & FixtureA & " " & FixtureB)
-  doAssert code != 0, "should exit non-zero without threshold"
-  doAssert "min-overlap" in outp or "min-jaccard" in outp,
-    "error should mention threshold flags, got: " & outp
+  let (outp, code) = run("match " & FixtureA & " " & FixtureB)
+  doAssert code == 0, "should exit 0 with default threshold, got: " & outp
+  doAssert "##matcha_metric=jaccard" in outp,
+    "default metric should be jaccard, got preamble: " & outp
 
 # M02b — passing BOTH --min-overlap and --min-jaccard is an error (xor).
 timed("M02b", "both thresholds: mutually exclusive error"):
@@ -312,9 +312,9 @@ timed("B02", "BND inter-chrom identical: sim=1.0"):
       found = true
   doAssert found, "BND_A_20/BND_B_20 missing"
 
-# B03 — BND_A_21 / BND_B_21 offsets: sim=0.6 default slop.
-timed("B03", "BND offset 50/30: sim=0.60 at default slop 100"):
-  let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+# B03 — BND_A_21 / BND_B_21 offsets d1=50, d2=30: sim=(200-50-30)/200=0.6 at slop=100.
+timed("B03", "BND offset 50/30: sim=0.60 at slop 100"):
+  let (outp, code) = run("match --min-overlap 0.5 --bnd-slop 100 " & FixtureA & " " & FixtureB)
   doAssert code == 0
   var found = false
   for row in parseTsv(outp):
@@ -367,7 +367,7 @@ timed("B07", "preproc warn-skips malformed BND and TRA on stderr"):
   doAssert "unsupported_tra" in outp or "TRA_A_25" in outp,
     "expected warn-skip for TRA_A_25, got stderr:\n" & outp
 
-# B08 — --self pairs BND_A_27a / BND_A_27b once (sim=0.80, aOff<bOff).
+# B08 — --self pairs BND_A_27a / BND_A_27b once (d1=d2=20, slop=50: sim=0.60).
 timed("B08", "--self: BND mate pair appears exactly once"):
   let (outp, code) = run("match --self --min-overlap 0.5 " & FixtureA)
   doAssert code == 0, "exit " & $code & ": " & outp
@@ -380,7 +380,7 @@ timed("B08", "--self: BND mate pair appears exactly once"):
       inc count
       simVal = parseFloat(row[7])
   doAssert count == 1, "expected 1 row for BND_A_27a/27b, got " & $count
-  doAssert abs(simVal - 0.8) < 1e-5, "self-pair sim != 0.8: " & $simVal
+  doAssert abs(simVal - 0.6) < 1e-5, "self-pair sim != 0.6: " & $simVal
 
 # B09 — Mixed DEL+BND callset: both DEL and BND rows appear in one run.
 timed("B09", "mixed DEL+BND run produces both kinds of rows"):

@@ -39,7 +39,7 @@ type
   MatchConfig* = object
     metric*:          Metric   ## Active interval metric (mOverlap | mJaccard).
     threshold*:       float64  ## Minimum score for the active metric (0.0-1.0).
-    bndSlop*:         int      ## --bnd-slop (default 100); both breakends of a
+    bndSlop*:         int      ## --bnd-slop (default 50); both breakends of a
                                ## BND pair must lie within this many bp.
     nThreads*:        int
     tmpDir*:          string

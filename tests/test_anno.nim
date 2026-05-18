@@ -179,10 +179,9 @@ timed("A31", "no -a expression: hard error"):
   doAssert "-a" in outp or "expression" in outp,
     "error should mention missing -a: " & outp
 
-timed("A32", "no threshold: hard error"):
-  let (outp, code) = runMerged("anno -a X=max\\(AF\\) " & FixtureA & " " & FixtureDB)
-  doAssert code != 0
-  doAssert "min-overlap" in outp or "min-jaccard" in outp
+timed("A32", "no threshold: uses default --min-jaccard 0.75"):
+  let (outp, code) = run("anno -a X=max\\(AF\\) " & FixtureA & " " & FixtureDB)
+  doAssert code == 0, "should exit 0 with default threshold, got: " & outp
 
 timed("A33", "unknown DB SRCFIELD: hard error"):
   let (outp, code) = runMerged("anno -a X=max\\(NOPE\\) --min-overlap 0.5 " &
