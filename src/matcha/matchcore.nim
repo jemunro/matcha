@@ -48,11 +48,13 @@ proc extractEnd*(v: Variant; endData, svlenData: var seq[int32];
 # Interval matching
 # ---------------------------------------------------------------------------
 
-proc singletonPair(job: MatchJob; srcIndex: int32; posA: int64): MatchPair =
+proc singletonPair(job: MatchJob; srcIndex: int32; posA: int64;
+                   passA: bool; qualQ: uint16; callerIdxA: int16): MatchPair =
   MatchPair(srcIndexA: srcIndex, srcIndexB: NO_MATCH,
             posA: int32(posA), posB: 0, sim: 0.0f32,
             fileIdxA: job.fileIdxA, fileIdxB: int16(NO_MATCH),
-            chromIdx: job.chromIdx, svtype: int8(job.svtype))
+            chromIdx: job.chromIdx, svtype: int8(job.svtype),
+            passA: passA, qualQ: qualQ, callerIdxA: callerIdxA)
 
 proc streamJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
   ## Drive the per-job match: stream A from the per-(svtype, binA) BCF
@@ -74,7 +76,7 @@ proc streamJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
   for binB in sortedBinsB:
     buffers[binB] = initTiledBuffer(binRange(binB).hi, job.chrom)
 
-  var endData, svlenData, idxData: seq[int32]
+  var endData, svlenData, idxData, ciData: seq[int32]
 
   proc fetchTile(binB, tileIdx: int): seq[BufferedRec] =
     if binB notin vcfsB:
@@ -99,8 +101,12 @@ proc streamJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
   for va in vcfA.query(job.chrom):
     var endA: int64
     if not extractEnd(va, endData, svlenData, endA): continue
-    let posA      = va.POS
-    let srcIndexA = readSrcIndex(va, idxData)
+    let posA       = va.POS
+    let srcIndexA  = readSrcIndex(va, idxData)
+    let passA      = ($va.FILTER == "PASS")
+    let qualQ      = quantizeQual(va.QUAL.float32)
+    let callerIdxA = (if va.info().get("CALLER_IDX", ciData) == Status.OK and
+                        ciData.len > 0: int16(ciData[0]) else: 0'i16)
 
     var anyMatch = false
     for binB in sortedBinsB:
@@ -121,11 +127,12 @@ proc streamJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
           sim:       float32(sim),
           fileIdxA:  job.fileIdxA, fileIdxB: cand.fileIdx,
           chromIdx:  job.chromIdx, svtype: int8(job.svtype),
+          passA: passA, qualQ: qualQ, callerIdxA: callerIdxA,
         ))
         anyMatch = true
 
     if cfg.emitSingletons and not anyMatch:
-      result.add(singletonPair(job, srcIndexA, posA))
+      result.add(singletonPair(job, srcIndexA, posA, passA, qualQ, callerIdxA))
 
     for binB, buf in buffers.mpairs:
       buf.evict(posA)
@@ -161,20 +168,24 @@ proc streamBndJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
   var cache = initDeque[BndCacheRec]()
   var cacheEnd: int64 = low(int64)
 
-  var idxData, pos2Data: seq[int32]
+  var idxData, pos2Data, ciData: seq[int32]
   var chr2Data: string
   let twoSlop = float64(2 * slop)
   let bFileIdx = job.binsB[0].fileIdx
 
   for va in vcfA.query(job.chrom):
-    let posA      = va.POS
-    let srcIndexA = readSrcIndex(va, idxData)
+    let posA       = va.POS
+    let srcIndexA  = readSrcIndex(va, idxData)
     let p2A = readPos2(va, pos2Data)
     if not p2A.ok: continue
     let c2A = readChr2(va, chr2Data)
     if not c2A.ok: continue
     let pos2A = p2A.pos2
     let chr2A = c2A.chr2
+    let passA      = ($va.FILTER == "PASS")
+    let qualQ      = quantizeQual(va.QUAL.float32)
+    let callerIdxA = (if va.info().get("CALLER_IDX", ciData) == Status.OK and
+                        ciData.len > 0: int16(ciData[0]) else: 0'i16)
 
     let winLo = posA - slop.int64 + 1
     let winHi = posA + slop.int64
@@ -220,11 +231,12 @@ proc streamBndJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
         sim:       float32(sim),
         fileIdxA:  job.fileIdxA, fileIdxB: cand.fileIdx,
         chromIdx:  job.chromIdx, svtype: int8(job.svtype),
+        passA: passA, qualQ: qualQ, callerIdxA: callerIdxA,
       ))
       anyMatch = true
 
     if cfg.emitSingletons and not anyMatch:
-      result.add(singletonPair(job, srcIndexA, posA))
+      result.add(singletonPair(job, srcIndexA, posA, passA, qualQ, callerIdxA))
 
   vcfA.close()
   vcfB.close()

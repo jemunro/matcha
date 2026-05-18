@@ -131,7 +131,7 @@ proc writeOutput(cfg: CollapseConfig;
                  chromOrder: seq[string];
                  mergedPaths: Table[SvtypeBin, string];
                  finalClusters: seq[seq[int32]];
-                 passQualMap: Table[int32, tuple[hasPASS: bool; qual: float32; callerIdx: int32]]) =
+                 passQualMap: Table[int32, tuple[hasPASS: bool; qual: uint16; callerIdx: int32]]) =
   ## Stream merged BCFs, identify cluster representatives by SRC_INDEX,
   ## set provenance fields, apply output-time INFO filter, sort by coordinate,
   ## write final VCF/BCF.
@@ -141,10 +141,10 @@ proc writeOutput(cfg: CollapseConfig;
   for cl in finalClusters:
     if cl.len == 0: continue
     let repIdx = cl[0]
-    let repCallerIdx = passQualMap.getOrDefault(repIdx, (false, 0f32, 0'i32)).callerIdx
+    let repCallerIdx = passQualMap.getOrDefault(repIdx, (false, 0'u16, 0'i32)).callerIdx
     var callerIdxSeen: seq[int32]
     for idx in cl:
-      let ci = passQualMap.getOrDefault(idx, (false, 0f32, 0'i32)).callerIdx
+      let ci = passQualMap.getOrDefault(idx, (false, 0'u16, 0'i32)).callerIdx
       if ci notin callerIdxSeen: callerIdxSeen.add(ci)
     var callers: seq[string]
     callers.add(cfg.callers[repCallerIdx].name)
@@ -336,7 +336,7 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
     selfMode:       true,
     emitSingletons: true,
   )
-  let cpr = selfMatchAndCluster(mergedPreproc, chromOrder, matchCfg,
+  let cpr = selfMatchAndCluster(mergedPreproc, matchCfg,
                                  cfg.linkage, cfg.threshold, cfg.priority,
                                  "collapse self-match")
 

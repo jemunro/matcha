@@ -22,19 +22,24 @@ type
     mJaccard = "jaccard"
 
   MatchPair* = object
-    ## 28-byte match record produced by matchcore.
-    ## Layout: 4+4+4+4+4+2+2+2+1+1(pad) = 28 bytes.
+    ## 32-byte match record produced by matchcore.
+    ## Layout: 4+4+4+4+4+2+2+2+1+1+2+2 = 32 bytes.
     ## posA/posB enable CSI `chrom:pos-pos` queries for O(1) slim-BCF resolution;
     ## SRC_INDEX is the tiebreaker when multiple SVs share a position.
-    srcIndexA*: int32   ## Sequential index of A record (identity + join key).
-    srcIndexB*: int32   ## Sequential index of B record; NO_MATCH for singletons.
-    posA*:      int32   ## POS of A record — for CSI resolution query.
-    posB*:      int32   ## POS of B record; 0 for singletons.
-    sim*:       float32 ## Similarity score in [0,1]; 0.0 for singletons.
-    fileIdxA*:  int16   ## Index into the run's slim-BCF file list for A.
-    fileIdxB*:  int16   ## Index into the run's slim-BCF file list for B; NO_MATCH for singletons.
-    chromIdx*:  int16   ## Index into chromOrder (chrom shared by A and B in a job).
-    svtype*:    int8    ## SvType cast to int8; read back as SvType(pair.svtype).
+    ## passA/qualQ/callerIdxA are A-side provenance fields used by collapse/merge
+    ## to build passQualMap without a second slim-BCF pass.
+    srcIndexA*:  int32   ## Sequential index of A record (identity + join key).
+    srcIndexB*:  int32   ## Sequential index of B record; NO_MATCH for singletons.
+    posA*:       int32   ## POS of A record — for CSI resolution query.
+    posB*:       int32   ## POS of B record; 0 for singletons.
+    sim*:        float32 ## Similarity score in [0,1]; 0.0 for singletons.
+    fileIdxA*:   int16   ## Index into the run's slim-BCF file list for A.
+    fileIdxB*:   int16   ## Index into the run's slim-BCF file list for B; NO_MATCH for singletons.
+    chromIdx*:   int16   ## Index into chromOrder (chrom shared by A and B in a job).
+    svtype*:     int8    ## SvType cast to int8; read back as SvType(pair.svtype).
+    passA*:      bool    ## True iff FILTER == "PASS" for A record.
+    qualQ*:      uint16  ## QUAL of A record, Q14.2 quantized (val = qualQ / 4.0).
+    callerIdxA*: int16   ## CALLER_IDX INFO of A record; 0 if absent (match/anno mode).
 
   MatchConfig* = object
     metric*:          Metric   ## Active interval metric (mOverlap | mJaccard).
@@ -71,3 +76,13 @@ proc parseSvType*(s: string): SvType =
   of "INS": svINS
   of "TRA": svTRA
   else: svUNKNOWN
+
+const QualQScale* = 4'f32  ## Q14.2: 0.25 precision, range [0, 16383.75]
+
+proc quantizeQual*(q: float32): uint16 {.inline.} =
+  ## Encode a VCF QUAL value into a uint16 using Q14.2 fixed-point.
+  ## Monotonic under >, so uint16 comparisons rank identically to float comparisons.
+  let v = q * QualQScale
+  if v <= 0: 0'u16
+  elif v >= 65535: 65535'u16
+  else: uint16(v)

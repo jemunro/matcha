@@ -220,7 +220,7 @@ type
     sid:        string
     callerIdx:  int32
     hasPASS:    bool
-    qual:       float32
+    qual:       uint16
 
   BufferedRow = object
     chromOrderIdx: int
@@ -287,7 +287,7 @@ proc writeMergeOutput(cfg: MergeConfig;
                      mergedPaths: Table[SvtypeBin, string];
                      fileList: seq[string];
                      locByIdx: Table[int32, tuple[chromIdx: int16; pos: int32; fileIdx: int16]];
-                     passQualMap: Table[int32, tuple[hasPASS: bool; qual: float32; callerIdx: int32]];
+                     passQualMap: Table[int32, tuple[hasPASS: bool; qual: uint16; callerIdx: int32]];
                      finalClusters: seq[seq[int32]];
                      callerNames: seq[string];
                      emitCallers: bool) =
@@ -350,7 +350,7 @@ proc writeMergeOutput(cfg: MergeConfig;
             ciBuf[0]
           else: 0'i32
         let pq = passQualMap.getOrDefault(idx,
-                   (hasPASS: false, qual: 0f32, callerIdx: ciVal))
+                   (hasPASS: false, qual: 0'u16, callerIdx: ciVal))
         let dup = bcf_dup(v.c)
         let memIdx = allRecs.len
         allRecs.add(MemberRec(rec: dup, sid: sid, callerIdx: pq.callerIdx,
@@ -814,7 +814,7 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
     selfMode:       true,
     emitSingletons: true,
   )
-  let cpr = selfMatchAndCluster(mergedPreproc, chromOrder, matchCfg,
+  let cpr = selfMatchAndCluster(mergedPreproc, matchCfg,
                                  cfgMut.linkage, cfgMut.threshold,
                                  cfgMut.priority, "merge self-match")
 

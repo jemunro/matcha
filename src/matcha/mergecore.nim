@@ -14,7 +14,7 @@
 import std/[os, sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
-import utils, preproc, matchcore, match, log, synced_bcf_reader
+import utils, preproc, match, log, synced_bcf_reader
 
 # ---------------------------------------------------------------------------
 # Types
@@ -451,12 +451,12 @@ proc agglomerateComponent*(offsets: seq[int32];
 
 proc selectRepresentative*(cluster: seq[int32];
                             simMap: Table[(int32, int32), float64];
-                            passQualMap: Table[int32, tuple[hasPASS: bool; qual: float32; callerIdx: int32]];
+                            passQualMap: Table[int32, tuple[hasPASS: bool; qual: uint16; callerIdx: int32]];
                             priority: seq[PriorityCriterion]): int32 =
   ## Pick the representative record from a cluster using the priority cascade.
-  ## callerIdx comes from passQualMap (populated from CALLER_IDX INFO field in slim BCF).
-  ## Missing passQualMap entries default to (hasPASS=false, qual=0.0, callerIdx=high(int32)).
-  let missing = (hasPASS: false, qual: 0f32, callerIdx: high(int32))
+  ## callerIdx comes from passQualMap (populated from MatchPair.callerIdxA).
+  ## Missing passQualMap entries default to (hasPASS=false, qual=0, callerIdx=high(int32)).
+  let missing = (hasPASS: false, qual: 0'u16, callerIdx: high(int32))
   if cluster.len == 1: return cluster[0]
 
   var candidates = cluster
@@ -541,11 +541,10 @@ type
   ClusterPipelineResult* = object
     finalClusters*: seq[seq[int32]]  ## each cluster: representative first
     locByIdx*:      Table[int32, tuple[chromIdx: int16; pos: int32; fileIdx: int16]]
-    passQualMap*:   Table[int32, tuple[hasPASS: bool; qual: float32; callerIdx: int32]]
+    passQualMap*:   Table[int32, tuple[hasPASS: bool; qual: uint16; callerIdx: int32]]
     fileList*:      seq[string]      ## file index → slim BCF path
 
 proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
-                          chromOrder: seq[string];
                           matchCfg: MatchConfig;
                           linkage: LinkageMethod;
                           threshold: float64;
@@ -576,32 +575,14 @@ proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
 
   let clusters = clusterAll(allOffsets, simMap, linkage, threshold)
 
-  # Grouped CSI sweep for PASS/QUAL/CALLER_IDX per cluster member.
-  var allMemberIdxs: HashSet[int32]
-  for cl in clusters:
-    for idx in cl: allMemberIdxs.incl(idx)
-  var idxData, ciData: seq[int32]
-  var membersByFile: Table[int16, seq[int32]]
-  for idx in allMemberIdxs:
-    let loc = result.locByIdx[idx]
-    membersByFile.mgetOrPut(loc.fileIdx, @[]).add(idx)
-  for fileIdx, members in membersByFile.pairs:
-    var vcf: VCF
-    if not open(vcf, fileList[fileIdx]):
-      raise newException(IOError, "cannot open merged BCF: " & fileList[fileIdx])
-    for idx in members:
-      let loc = result.locByIdx[idx]
-      let region = chromOrder[loc.chromIdx] & ":" & $loc.pos & "-" & $loc.pos
-      for v in vcf.query(region):
-        if readSrcIndex(v, idxData) != idx: continue
-        let ci =
-          if v.info().get("CALLER_IDX", ciData) == Status.OK and ciData.len > 0:
-            ciData[0]
-          else: 0'i32
-        result.passQualMap[idx] = (hasPASS: $v.FILTER == "PASS",
-                                    qual: v.QUAL.float32, callerIdx: ci)
-        break
-    vcf.close()
+  # Build passQualMap from MatchPair metadata stamped by matchcore.
+  # Every offset appears as srcIndexA in at least one pair (emitSingletons=true
+  # guarantees a singleton entry for unmatched records), so A-side fields suffice.
+  for p in allPairs:
+    if p.srcIndexA notin result.passQualMap:
+      result.passQualMap[p.srcIndexA] = (hasPASS: p.passA,
+                                          qual: p.qualQ,
+                                          callerIdx: int32(p.callerIdxA))
 
   for cl in clusters:
     let rep = selectRepresentative(cl, simMap, result.passQualMap, priority)
