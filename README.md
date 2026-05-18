@@ -163,10 +163,9 @@ Within each cluster, the representative record is picked by walking the `--prior
 
 Per-cluster INFO fields added to the output:
 
-- `SOURCE` — name of the caller providing the representative record.
-- `SOURCELIST` — names of all callers contributing to the cluster (CLI order).
-- `N_SOURCE` — distinct input callsets in the cluster.
-- `N_MERGED` — total records merged into the cluster (≥ `N_SOURCE`).
+- `CALLERS` — caller names in the cluster: representative first, followed by others in CLI order.
+- `N_CALLERS` — distinct input callsets in the cluster.
+- `N_MERGED` — total records merged into the cluster (≥ `N_CALLERS`).
 
 Conflict-resolved INFO fields (e.g. differing `SVLEN` across callers) and FORMAT fields configured via `--info` / `--format` are carried through from the representative record.
 

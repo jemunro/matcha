@@ -151,11 +151,9 @@ proc buildFinalHdr(callers: seq[CallerInput]; mh: MergedHeader;
     "##INFO=<ID=CALLER_IDX,Number=1,Type=Integer,Description=\"matcha-internal: caller index (0-based)\">".cstring)
   # Provenance INFO defs.
   discard bcf_hdr_append(result,
-    "##INFO=<ID=SOURCE,Number=1,Type=String,Description=\"Representative caller name\">".cstring)
+    "##INFO=<ID=CALLERS,Number=.,Type=String,Description=\"Caller names in cluster: representative first, then others (CLI order)\">".cstring)
   discard bcf_hdr_append(result,
-    "##INFO=<ID=SOURCELIST,Number=.,Type=String,Description=\"All caller names in cluster (CLI order)\">".cstring)
-  discard bcf_hdr_append(result,
-    "##INFO=<ID=N_SOURCE,Number=1,Type=Integer,Description=\"Distinct input callsets in cluster\">".cstring)
+    "##INFO=<ID=N_CALLERS,Number=1,Type=Integer,Description=\"Distinct input callsets in cluster\">".cstring)
   discard bcf_hdr_append(result,
     "##INFO=<ID=N_MERGED,Number=1,Type=Integer,Description=\"Total records merged into cluster\">".cstring)
   discard bcf_hdr_append(result,
@@ -203,9 +201,9 @@ type
     rec:           ptr bcf1_t  ## owned; caller must bcf_destroy
 
   ClusterProv = object
-    sourceList: seq[string]
-    nSource:    int
-    nMerged:    int
+    callers:   seq[string]  # representative first, then others (CLI order)
+    nCallers:  int
+    nMerged:   int
 
 proc writeOutput(cfg: CollapseConfig;
                  finalHdr: ptr bcf_hdr_t;
@@ -222,17 +220,22 @@ proc writeOutput(cfg: CollapseConfig;
   for cl in finalClusters:
     if cl.len == 0: continue
     let repIdx = cl[0]
+    let repCallerIdx = passQualMap.getOrDefault(repIdx, (false, 0f32, 0'i32)).callerIdx
     var callerIdxSeen: seq[int32]
     for idx in cl:
       let ci = passQualMap.getOrDefault(idx, (false, 0f32, 0'i32)).callerIdx
       if ci notin callerIdxSeen: callerIdxSeen.add(ci)
-    callerIdxSeen.sort()
-    var sourceList: seq[string]
-    for ci in callerIdxSeen: sourceList.add(cfg.callers[ci].name)
+    var callers: seq[string]
+    callers.add(cfg.callers[repCallerIdx].name)
+    var others: seq[int32]
+    for ci in callerIdxSeen:
+      if ci != repCallerIdx: others.add(ci)
+    others.sort()
+    for ci in others: callers.add(cfg.callers[ci].name)
     repProv[repIdx] = ClusterProv(
-      sourceList: sourceList,
-      nSource:    sourceList.len,
-      nMerged:    cl.len,
+      callers:  callers,
+      nCallers: callerIdxSeen.len,
+      nMerged:  cl.len,
     )
 
   # chrom → header-order index for sort.
@@ -243,7 +246,7 @@ proc writeOutput(cfg: CollapseConfig;
   let infoFilter = cfg.infoFields
   proc keepInfoOut(name: string): bool =
     if name in ["SRC_INDEX", "CALLER_IDX"]: return false
-    if name in ["SOURCE", "SOURCELIST", "N_SOURCE", "N_MERGED"]: return true
+    if name in ["CALLERS", "N_CALLERS", "N_MERGED"]: return true
     if infoFilter.len == 0:
       return name in ["SVTYPE", "SVLEN", "END", "CHR2", "POS2"]
     for tok in infoFilter:
@@ -263,10 +266,10 @@ proc writeOutput(cfg: CollapseConfig;
       if si notin repProv: continue
       let prov = repProv[si]
 
-      var slStr = prov.sourceList.join(",")
-      discard v.info.set("SOURCELIST", slStr)
-      var nSrc = prov.nSource.int32
-      discard v.info.set("N_SOURCE", nSrc)
+      var callersStr = prov.callers.join(",")
+      discard v.info.set("CALLERS", callersStr)
+      var nCallers = prov.nCallers.int32
+      discard v.info.set("N_CALLERS", nCallers)
       var nMrg = prov.nMerged.int32
       discard v.info.set("N_MERGED", nMrg)
 

@@ -511,7 +511,7 @@ proc collectFilterLines*(h: ptr bcf_hdr_t): seq[string] =
     result.add(line)
 
 const AlwaysKeepInMerged* = ["SVTYPE", "SVLEN", "END", "CHR2", "POS2",
-                              "SOURCE", "SOURCELIST", "N_SOURCE", "N_MERGED",
+                              "CALLERS", "N_CALLERS", "N_MERGED",
                               "SRC_INDEX", "CALLER_IDX"]
 
 proc keepInfoForMerged*(name: string; infoFilter: seq[string]): bool =
@@ -580,7 +580,7 @@ proc augmentSrcHdrForRenames*(srcHdr: ptr bcf_hdr_t; ci: int;
           ("##FORMAT=<ID=" & newName & ",Number=" & hi.number & ",Type=" & hi.typ &
            ",Description=\"" & hi.desc & "\">").cstring)
         break
-  # Also ensure SOURCE / SRC_INDEX / CALLER_IDX / SV defs exist for the
+  # Also ensure SRC_INDEX / CALLER_IDX / SV defs exist for the
   # authoritative writes issued against srcHdr in the per-record loop.
   proc ensureInfo(h: ptr bcf_hdr_t; name, num, typ, desc: string) =
     for hi in collectHrecs(h, BCF_HEADER_TYPE.BCF_HL_INFO.cint):
@@ -590,7 +590,6 @@ proc augmentSrcHdrForRenames*(srcHdr: ptr bcf_hdr_t; ci: int;
        ",Description=\"" & desc & "\">").cstring)
   ensureInfo(srcHdr, "SRC_INDEX",  "1", "Integer", "matcha-internal: sequential record index")
   ensureInfo(srcHdr, "CALLER_IDX", "1", "Integer", "matcha-internal: caller index (0-based)")
-  ensureInfo(srcHdr, "SOURCE",     "1", "String",  "Representative caller name")
   ensureInfo(srcHdr, "SVTYPE",      "1", "String",  "Type of structural variant")
   ensureInfo(srcHdr, "SVLEN",       "1", "Integer", "Length of the SV")
   ensureInfo(srcHdr, "END",         "1", "Integer", "End position of the SV")
@@ -761,12 +760,7 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
           discard bcf_update_info(srcHdr, rec, "END".cstring,
                                   endVal.addr, 1.cint, BCF_HT_INT.cint)
 
-        # 2f. Set SOURCE = caller name.
-        var srcStr = callers[ci].name
-        discard bcf_update_info(srcHdr, rec, "SOURCE".cstring,
-                                srcStr[0].addr, srcStr.len.cint, BCF_HT_STR.cint)
-
-        # 2g. Write SRC_INDEX (global sequential) and CALLER_IDX (which caller).
+        # 2f. Write SRC_INDEX (global sequential) and CALLER_IDX (which caller).
         var srcIdxVal = globalSrcIndex
         inc globalSrcIndex
         var callerIdxVal = ci.int32
@@ -823,7 +817,6 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
         bcf_destroy(rec)
 
   finally:
-    # Teardown order: destroy synced reader first (it owns reader file handles),
     # Teardown order: destroy synced reader first (it owns reader file handles),
     # then close writers (each holds its own dup of finalHdr), then destroy
     # the shared thread pool last (after every htsFile* that referenced it).

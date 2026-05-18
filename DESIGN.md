@@ -105,7 +105,7 @@ Single shared atomic counter; workers `fetchAdd` to claim job indices and write 
 5. **Clustering** — union-find over the similarity map yields components; each component is then agglomeratively clustered (`--linkage` average/single/complete) at the threshold.
 6. **`passQualMap`** — targeted CSI queries (grouped by `fileIdx`) for all cluster members retrieve PASS/QUAL/CALLER_IDX from merged slim BCFs into `Table[int32, (hasPASS, qual, callerIdx)]`.
 7. **Representative selection** — `selectRepresentative` walks the `--priority` cascade (`PASS, QUAL, CENTRE, ORDER`); `callerIdx` from `passQualMap` drives `CENTRE` (prefer earlier CLI callers) and `ORDER`. `ORDER` is always appended as the final tiebreaker.
-8. **Output** — scan merged slim BCFs, pick representative records by SRC_INDEX, populate `SOURCE` / `SOURCELIST` / `N_SOURCE` / `N_MERGED`, drop internal INFO fields, sort by `(chromOrder, POS)`, write VCF/BCF + optional CSI.
+8. **Output** — scan merged slim BCFs, pick representative records by SRC_INDEX, populate `CALLERS` / `N_CALLERS` / `N_MERGED`, drop internal INFO fields, sort by `(chromOrder, POS)`, write VCF/BCF + optional CSI.
 
 Threading: preproc+merge runs in one integrated streaming pass (`integratedMerge`) with a shared `htsThreadPool`; matching reuses the same thread pool as `matcha match`.
 

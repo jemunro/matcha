@@ -358,7 +358,7 @@ proc collapseUsage(code: int = 1) =
   f.writeLine "Input names: positional args may be prefixed with 'Name:' (e.g. Delly:delly.bcf)."
   f.writeLine "If no name prefix is given, the basename without extension is used."
   f.writeLine ""
-  f.writeLine "Output INFO fields added: SOURCE, SOURCELIST, N_SOURCE, N_MERGED."
+  f.writeLine "Output INFO fields added: CALLERS, N_CALLERS, N_MERGED."
   quit(code)
 
 proc parsePriority(s: string): seq[PriorityCriterion] =
