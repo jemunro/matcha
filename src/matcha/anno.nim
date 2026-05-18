@@ -333,21 +333,13 @@ proc applyAggFunc*(e: AnnoExpr; matches: seq[AnnoMatch]): seq[string] =
   case e.fn
   of afMax:
     if pooled.len == 0: return @[]
-    var m = parseFloatSafe(pooled[0])
-    for s in pooled[1 .. ^1]:
-      let v = parseFloatSafe(s)
-      if v > m: m = v
-    if e.matchaVar == mvCount or e.dbType == "Integer":
-      return @[$int(m)]
+    let m = pooled.mapIt(parseFloatSafe(it)).max
+    if e.matchaVar == mvCount or e.dbType == "Integer": return @[$int(m)]
     return @[formatFloat(m, ffDecimal, 6)]
   of afMin:
     if pooled.len == 0: return @[]
-    var m = parseFloatSafe(pooled[0])
-    for s in pooled[1 .. ^1]:
-      let v = parseFloatSafe(s)
-      if v < m: m = v
-    if e.matchaVar == mvCount or e.dbType == "Integer":
-      return @[$int(m)]
+    let m = pooled.mapIt(parseFloatSafe(it)).min
+    if e.matchaVar == mvCount or e.dbType == "Integer": return @[$int(m)]
     return @[formatFloat(m, ffDecimal, 6)]
   of afMean:
     if pooled.len == 0: return @[]

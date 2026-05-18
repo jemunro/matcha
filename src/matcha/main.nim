@@ -19,6 +19,16 @@ proc nextVal(p: var OptParser; flag: string): string =
   stderr.writeLine "error: --" & flag & " requires a value"
   quit(1)
 
+proc parseFloatOpt(v, flag: string): float64 =
+  try: parseFloat(v)
+  except ValueError:
+    stderr.writeLine "error: --" & flag & " must be a float, got: " & v; quit(1)
+
+proc parseIntOpt(v, flag: string): int =
+  try: parseInt(v)
+  except ValueError:
+    stderr.writeLine "error: --" & flag & " must be an integer, got: " & v; quit(1)
+
 proc usage(code: int = 1) =
   let f = if code == 0: stdout else: stderr
   f.writeLine "matcha v" & VERSION
@@ -83,39 +93,19 @@ proc runMatch(rawArgs: seq[string]) =
     of cmdShortOption, cmdLongOption:
       case p.key
       of "min-overlap":
-        let v = nextVal(p, "min-overlap")
-        try: cfg.threshold = parseFloat(v)
-        except ValueError:
-          stderr.writeLine "error: --min-overlap must be a float, got: " & v
-          quit(1)
-        cfg.metric = mOverlap
-        overlapSet = true
+        cfg.threshold = parseFloatOpt(nextVal(p, "min-overlap"), "min-overlap")
+        cfg.metric = mOverlap; overlapSet = true
       of "min-jaccard":
-        let v = nextVal(p, "min-jaccard")
-        try: cfg.threshold = parseFloat(v)
-        except ValueError:
-          stderr.writeLine "error: --min-jaccard must be a float, got: " & v
-          quit(1)
-        cfg.metric = mJaccard
-        jaccardSet = true
+        cfg.threshold = parseFloatOpt(nextVal(p, "min-jaccard"), "min-jaccard")
+        cfg.metric = mJaccard; jaccardSet = true
       of "bnd-slop":
-        let v = nextVal(p, "bnd-slop")
-        try: cfg.bndSlop = parseInt(v)
-        except ValueError:
-          stderr.writeLine "error: --bnd-slop must be an integer, got: " & v
-          quit(1)
+        cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
         if cfg.bndSlop <= 0:
-          stderr.writeLine "error: --bnd-slop must be > 0"
-          quit(1)
+          stderr.writeLine "error: --bnd-slop must be > 0"; quit(1)
       of "threads":
-        let v = nextVal(p, "threads")
-        try: cfg.nThreads = parseInt(v)
-        except ValueError:
-          stderr.writeLine "error: --threads must be an integer, got: " & v
-          quit(1)
+        cfg.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
         if cfg.nThreads < 1:
-          stderr.writeLine "error: --threads must be >= 1"
-          quit(1)
+          stderr.writeLine "error: --threads must be >= 1"; quit(1)
       of "tmp-dir":
         cfg.tmpDir = nextVal(p, "tmp-dir")
       of "output":
@@ -292,41 +282,21 @@ proc runAnnoCli(rawArgs: seq[string]) =
       of "o", "output":
         cfg.outputPath = nextVal(p, "o")
       of "min-overlap":
-        let v = nextVal(p, "min-overlap")
-        try: cfg.threshold = parseFloat(v)
-        except ValueError:
-          stderr.writeLine "error: --min-overlap must be a float, got: " & v
-          quit(1)
-        cfg.metric = mOverlap
-        overlapSet = true
+        cfg.threshold = parseFloatOpt(nextVal(p, "min-overlap"), "min-overlap")
+        cfg.metric = mOverlap; overlapSet = true
       of "min-jaccard":
-        let v = nextVal(p, "min-jaccard")
-        try: cfg.threshold = parseFloat(v)
-        except ValueError:
-          stderr.writeLine "error: --min-jaccard must be a float, got: " & v
-          quit(1)
-        cfg.metric = mJaccard
-        jaccardSet = true
+        cfg.threshold = parseFloatOpt(nextVal(p, "min-jaccard"), "min-jaccard")
+        cfg.metric = mJaccard; jaccardSet = true
       of "bnd-slop":
-        let v = nextVal(p, "bnd-slop")
-        try: cfg.bndSlop = parseInt(v)
-        except ValueError:
-          stderr.writeLine "error: --bnd-slop must be an integer, got: " & v
-          quit(1)
+        cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
         if cfg.bndSlop <= 0:
-          stderr.writeLine "error: --bnd-slop must be > 0"
-          quit(1)
+          stderr.writeLine "error: --bnd-slop must be > 0"; quit(1)
       of "overwrite":
         cfg.overwrite = true
       of "threads":
-        let v = nextVal(p, "threads")
-        try: cfg.nThreads = parseInt(v)
-        except ValueError:
-          stderr.writeLine "error: --threads must be an integer, got: " & v
-          quit(1)
+        cfg.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
         if cfg.nThreads < 1:
-          stderr.writeLine "error: --threads must be >= 1"
-          quit(1)
+          stderr.writeLine "error: --threads must be >= 1"; quit(1)
       of "tmp-dir":
         cfg.tmpDir = nextVal(p, "tmp-dir")
       of "v", "verbose":
@@ -430,22 +400,13 @@ proc runCollapseCli(rawArgs: seq[string]) =
     of cmdShortOption, cmdLongOption:
       case p.key
       of "min-overlap":
-        let v = nextVal(p, "min-overlap")
-        try: cfg.threshold = parseFloat(v)
-        except ValueError:
-          stderr.writeLine "error: --min-overlap must be a float, got: " & v; quit(1)
+        cfg.threshold = parseFloatOpt(nextVal(p, "min-overlap"), "min-overlap")
         cfg.metric = mOverlap; overlapSet = true
       of "min-jaccard":
-        let v = nextVal(p, "min-jaccard")
-        try: cfg.threshold = parseFloat(v)
-        except ValueError:
-          stderr.writeLine "error: --min-jaccard must be a float, got: " & v; quit(1)
+        cfg.threshold = parseFloatOpt(nextVal(p, "min-jaccard"), "min-jaccard")
         cfg.metric = mJaccard; jaccardSet = true
       of "bnd-slop":
-        let v = nextVal(p, "bnd-slop")
-        try: cfg.bndSlop = parseInt(v)
-        except ValueError:
-          stderr.writeLine "error: --bnd-slop must be an integer, got: " & v; quit(1)
+        cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
         if cfg.bndSlop <= 0:
           stderr.writeLine "error: --bnd-slop must be > 0"; quit(1)
       of "linkage":
@@ -466,10 +427,7 @@ proc runCollapseCli(rawArgs: seq[string]) =
       of "o", "output":
         cfg.outputPath = nextVal(p, "o")
       of "threads":
-        let v = nextVal(p, "threads")
-        try: cfg.nThreads = parseInt(v)
-        except ValueError:
-          stderr.writeLine "error: --threads must be an integer, got: " & v; quit(1)
+        cfg.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
         if cfg.nThreads < 1:
           stderr.writeLine "error: --threads must be >= 1"; quit(1)
       of "tmp-dir":

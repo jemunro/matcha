@@ -48,6 +48,12 @@ proc extractEnd*(v: Variant; endData, svlenData: var seq[int32];
 # Interval matching
 # ---------------------------------------------------------------------------
 
+proc singletonPair(job: MatchJob; srcIndex: int32; posA: int64): MatchPair =
+  MatchPair(srcIndexA: srcIndex, srcIndexB: NO_MATCH,
+            posA: int32(posA), posB: 0, sim: 0.0f32,
+            fileIdxA: job.fileIdxA, fileIdxB: int16(NO_MATCH),
+            chromIdx: job.chromIdx, svtype: int8(job.svtype))
+
 proc streamJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
   ## Drive the per-job match: stream A from the per-(svtype, binA) BCF
   ## restricted to job.chrom, fetch B candidates lazily through TiledBuffers,
@@ -119,13 +125,7 @@ proc streamJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
         anyMatch = true
 
     if cfg.emitSingletons and not anyMatch:
-      result.add(MatchPair(
-        srcIndexA: srcIndexA, srcIndexB: NO_MATCH,
-        posA:      int32(posA), posB: 0,
-        sim:       0.0f32,
-        fileIdxA:  job.fileIdxA, fileIdxB: int16(NO_MATCH),
-        chromIdx:  job.chromIdx, svtype: int8(job.svtype),
-      ))
+      result.add(singletonPair(job, srcIndexA, posA))
 
     for binB, buf in buffers.mpairs:
       buf.evict(posA)
@@ -224,13 +224,7 @@ proc streamBndJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
       anyMatch = true
 
     if cfg.emitSingletons and not anyMatch:
-      result.add(MatchPair(
-        srcIndexA: srcIndexA, srcIndexB: NO_MATCH,
-        posA:      int32(posA), posB: 0,
-        sim:       0.0f32,
-        fileIdxA:  job.fileIdxA, fileIdxB: int16(NO_MATCH),
-        chromIdx:  job.chromIdx, svtype: int8(job.svtype),
-      ))
+      result.add(singletonPair(job, srcIndexA, posA))
 
   vcfA.close()
   vcfB.close()

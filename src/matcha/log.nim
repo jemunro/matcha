@@ -12,10 +12,12 @@ let gStart = epochTime()
 proc setVerbose*(b: bool) =
   gVerbose = b
 
+proc elapsedTag(level: string): string =
+  "[" & level & " " & formatFloat(epochTime() - gStart, ffDecimal, 3) & "s] "
+
 proc logV*(msg: string) =
   if not gVerbose: return
-  let el = epochTime() - gStart
-  stderr.writeLine("[INFO " & formatFloat(el, ffDecimal, 3) & "s] " & msg)
+  stderr.writeLine(elapsedTag("INFO") & msg)
 
 var gQuiet = false
 
@@ -28,12 +30,10 @@ proc logWarn*(msg: string) =
   ## Emit a warning to stderr (independent of -v/--verbose). Suppressed
   ## when setQuiet(true) has been called (test runs).
   if gQuiet: return
-  let el = epochTime() - gStart
-  stderr.writeLine("[WARN " & formatFloat(el, ffDecimal, 3) & "s] " & msg)
+  stderr.writeLine(elapsedTag("WARN") & msg)
 
 proc logError*(msg: string) =
-  let el = epochTime() - gStart
-  stderr.writeLine("[ERROR " & formatFloat(el, ffDecimal, 3) & "s] " & msg)
+  stderr.writeLine(elapsedTag("ERROR") & msg)
 
 proc warnCap*(): int =
   ## Per-reason cap for per-record warnings. Override via MATCHA_WARN_CAP.
