@@ -2,7 +2,7 @@
 ## Entry point is src/matcha.nim which includes this file.
 
 import std/[os, parseopt, sequtils, strutils]
-import utils, match, anno, collapse, mergecore, log
+import utils, match, anno, collapse, merge, mergecore, log
 
 const NimblePkgVersion {.strdefine.} = "dev"
 const VERSION = NimblePkgVersion
@@ -39,6 +39,7 @@ proc usage(code: int = 1) =
   f.writeLine "  match      Find pairwise matches between two SV callsets"
   f.writeLine "  anno       Annotate a callset with INFO fields from a database VCF"
   f.writeLine "  collapse   Cluster equivalent SVs from multiple callers, emit one representative"
+  f.writeLine "  merge      Merge per-sample SV callsets into a cohort multi-sample pVCF"
   f.writeLine ""
   f.writeLine "Flags:"
   f.writeLine "  --version       show version"
@@ -470,6 +471,132 @@ proc runCollapseCli(rawArgs: seq[string]) =
 
   runCollapse(cfg, cmdLine)
 
+proc mergeUsage(code: int = 1) =
+  let f = if code == 0: stdout else: stderr
+  f.writeLine "Usage:"
+  f.writeLine "  matcha merge [options] [Name:]callset1.bcf [Name:]callset2.bcf ..."
+  f.writeLine ""
+  f.writeLine "Merge per-sample SV callsets (≥2 inputs, exactly 1 sample each, distinct"
+  f.writeLine "sample IDs) into a multi-sample cohort pVCF. One row per cluster; FORMAT"
+  f.writeLine "columns per sample; cohort INFO AC/AN/AF computed from assembled GTs."
+  f.writeLine ""
+  f.writeLine "Options:"
+  f.writeLine "  --min-overlap FLOAT           minimum reciprocal overlap (0.0-1.0)"
+  f.writeLine "  --min-jaccard FLOAT           minimum Jaccard index (0.0-1.0)"
+  f.writeLine "  --bnd-slop INT                max breakend offset for BND (default: 50)"
+  f.writeLine "  --linkage average|single|complete  agglomerative linkage (default: average)"
+  f.writeLine "  --priority CRITERIA           comma-separated: PASS,QUAL,CENTRE,ORDER"
+  f.writeLine "                                default: PASS,CENTRE,ORDER (drives representative)"
+  f.writeLine "  --format FIELDS               comma-separated FORMAT fields to carry"
+  f.writeLine "                                default: GT (auto-added if absent)"
+  f.writeLine "  --info FIELDS                 comma-separated INFO fields to keep from rep"
+  f.writeLine "                                default: only auto-extracted + cohort + CALLERS"
+  f.writeLine "  -o, --output PATH             output file (.vcf | .vcf.gz | .bcf)"
+  f.writeLine "                                default: uncompressed VCF to stdout"
+  f.writeLine "  --threads INT                 worker threads (default: 1)"
+  f.writeLine "  --tmp-dir PATH                temp directory (default: system temp)"
+  f.writeLine "  -v, --verbose                 verbose logging to stderr"
+  f.writeLine "  -h, --help                    show this help"
+  f.writeLine ""
+  f.writeLine "Default metric: --min-jaccard 0.75. Specify --min-overlap or --min-jaccard to override."
+  f.writeLine ""
+  f.writeLine "Input names: positional args may be prefixed with 'Name:' (e.g. S1:s1.bcf)."
+  f.writeLine "If no name prefix is given, the basename without extension is used."
+  f.writeLine ""
+  f.writeLine "Output INFO fields added: AC, AN, AF (always); CALLERS, N_CALLERS (when inputs had them)."
+  quit(code)
+
+proc runMergeCli(rawArgs: seq[string]) =
+  var cfg = MergeConfig(
+    nThreads:     1,
+    bndSlop:      50,
+    metric:       mJaccard,
+    threshold:    0.75,
+    linkage:      lmAverage,
+    priority:     @[pcPass, pcCentre, pcOrder],
+    formatFields: @["GT"],
+  )
+  var positionals: seq[string]
+  var overlapSet, jaccardSet: bool
+  var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
+  while true:
+    p.next()
+    case p.kind
+    of cmdEnd: break
+    of cmdShortOption, cmdLongOption:
+      case p.key
+      of "min-overlap":
+        cfg.threshold = parseFloatOpt(nextVal(p, "min-overlap"), "min-overlap")
+        cfg.metric = mOverlap; overlapSet = true
+      of "min-jaccard":
+        cfg.threshold = parseFloatOpt(nextVal(p, "min-jaccard"), "min-jaccard")
+        cfg.metric = mJaccard; jaccardSet = true
+      of "bnd-slop":
+        cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
+        if cfg.bndSlop <= 0:
+          stderr.writeLine "error: --bnd-slop must be > 0"; quit(1)
+      of "linkage":
+        let v = nextVal(p, "linkage").toLowerAscii
+        case v
+        of "average":  cfg.linkage = lmAverage
+        of "single":   cfg.linkage = lmSingle
+        of "complete": cfg.linkage = lmComplete
+        else:
+          stderr.writeLine "error: --linkage must be average, single, or complete"
+          quit(1)
+      of "priority":
+        cfg.priority = parsePriority(nextVal(p, "priority"))
+      of "format":
+        cfg.formatFields = nextVal(p, "format").split(',').mapIt(it.strip)
+      of "info":
+        cfg.infoFields = nextVal(p, "info").split(',').mapIt(it.strip)
+      of "o", "output":
+        cfg.outputPath = nextVal(p, "o")
+      of "threads":
+        cfg.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
+        if cfg.nThreads < 1:
+          stderr.writeLine "error: --threads must be >= 1"; quit(1)
+      of "tmp-dir":
+        cfg.tmpDir = nextVal(p, "tmp-dir")
+      of "v", "verbose": setVerbose(true)
+      of "h", "help":    mergeUsage(0)
+      else:
+        stderr.writeLine "error: unknown option: --" & p.key
+        mergeUsage()
+    of cmdArgument:
+      positionals.add(p.key)
+
+  if overlapSet and jaccardSet:
+    stderr.writeLine "error: --min-overlap and --min-jaccard are mutually exclusive"
+    mergeUsage()
+  if positionals.len < 2:
+    stderr.writeLine "error: merge requires at least 2 input files (got " &
+      $positionals.len & ")"
+    mergeUsage()
+
+  for arg in positionals:
+    let colonIdx = arg.find(':')
+    var name, path: string
+    if colonIdx >= 0:
+      name = arg[0 ..< colonIdx]
+      path = arg[colonIdx + 1 .. ^1]
+    else:
+      path = arg
+      name = splitFile(path).name
+    if name.len == 0: name = splitFile(path).name
+    cfg.callers.add(CallerInput(name: name, path: path))
+
+  for caller in cfg.callers:
+    if not fileExists(caller.path):
+      stderr.writeLine "error: input file not found: " & caller.path
+      quit(1)
+
+  if cfg.tmpDir == "":
+    cfg.tmpDir = getTempDir()
+
+  let cmdLine = "matcha merge " & rawArgs.join(" ")
+  runMerge(cfg, cmdLine)
+
 proc mainEntry*() =
   var args = commandLineParams()
   while args.len > 0 and (args[0] == "-v" or args[0] == "--verbose"):
@@ -484,6 +611,8 @@ proc mainEntry*() =
     runAnnoCli(args[1 .. ^1])
   of "collapse":
     runCollapseCli(args[1 .. ^1])
+  of "merge":
+    runMergeCli(args[1 .. ^1])
   of "--version":
     echo "matcha v" & VERSION
   of "--help", "-h":

@@ -111,6 +111,66 @@ Threading: preproc+merge runs in one integrated streaming pass (`integratedMerge
 
 ---
 
+## Merge pipeline
+
+`matcha merge` produces a cohort multi-sample pVCF from N single-sample SV
+callsets (typically `matcha collapse` outputs). Steps (see
+[src/matcha/merge.nim](src/matcha/merge.nim)):
+
+1. **`validateMergeInputs`** — open each input; enforce exactly 1 sample
+   column per file; reject duplicate sample IDs. Returns
+   `sampleIdByCaller` in CLI order.
+2. **GT auto-add** — if `--format` omits `GT`, prepend it (cohort
+   AC/AN/AF requires GT).
+3. **`resolveHeaders`** — same as collapse: build a `MergedHeader` from
+   the N input headers with conflict resolution.
+4. **`buildSlimHdr`** — header for the slim BCF writers. 1 dummy sample
+   column `SAMPLE`, plus `FORMAT/SID` (`Number=1,Type=String`) carrying
+   the source sample's ID, plus user `--format` fields and standard SV
+   INFO defs.
+5. **`buildOutputHdr`** — header for the final pVCF. N sample columns
+   named from `sampleIdByCaller`, plus cohort `AC`/`AN`/`AF` INFO defs,
+   plus conditional `CALLERS` / `N_CALLERS` (only when any input header
+   declares `INFO/CALLERS`). No `FORMAT/SID` (slim-internal only) and no
+   `N_MERGED` (collapse-only).
+6. **`integratedMerge`** with `stampSID=true` and `preserveBndAlt=true`:
+   - Each slim record carries `FORMAT/SID = sampleIdByCaller[ci]`.
+   - BND records keep their source ALT verbatim (bracket form encodes
+     strand orientation not derivable from CHR2/POS2). Non-BND records
+     continue to blank REF/ALT to `N,.`.
+7. **Self-match → cluster** — identical pipeline to collapse: pair
+   matchcore (selfMode + emitSingletons), `buildSimilarityMap`,
+   `clusterAll`, targeted CSI sweep for `passQualMap`,
+   `selectRepresentative`.
+8. **`writeMergeOutput`** — per cluster:
+   - Retrieve each cluster member's slim record via CSI; read
+     `FORMAT/SID` to determine output sample column.
+   - Build a fresh `bcf1_t` in `outputHdr` space:
+     - CHROM, POS, ID, QUAL, FILTER from representative.
+     - REF=`N`; ALT reconstructed (`<DEL>`/`<DUP>`/`<INV>` from SVTYPE;
+       BND uses representative's preserved bracket-form ALT).
+     - INFO copied from representative through `keepInfoForMergeOut` filter.
+     - FORMAT per-field: read each member's `K`-element data; build
+       `N × maxK` buffer; copy member's data into its sample column,
+       fill missing samples with appropriate sentinels (`bcf_gt_missing=0`
+       for GT, `bcf_int32_missing` for other ints, NaN-tagged missing for
+       floats, `.` for strings).
+     - Cohort INFO: AC/AN/AF computed from the assembled GT array
+       (BCF-encoded; `bcf_gt_missing` skipped, otherwise allele =
+       `(v shr 1) - 1`).
+     - CALLERS union: when any cluster member's slim record carries
+       `INFO/CALLERS` (e.g. from a prior `matcha collapse` run), union the
+       caller names preserving representative-first order; `N_CALLERS` =
+       distinct count.
+   - Same-sample cluster collisions (rare, not blocked at clustering)
+     are resolved at this stage: when two cluster members share a
+     sample ID, the priority cascade picks one for that column and a
+     throttled warning is emitted.
+   - Sort buffer by `(chromOrderIdx, pos)`; write to output VCF/BCF +
+     optional CSI.
+
+---
+
 ## Module map
 
 | File | Responsibility |
@@ -125,6 +185,7 @@ Threading: preproc+merge runs in one integrated streaming pass (`integratedMerge
 | [src/matcha/anno.nim](src/matcha/anno.nim) | anno-mode: expression parser, `applyAggFunc`, per-match chr:pos CSI B retrieval, SRC_INDEX counter phase-3 join, output VCF assembly |
 | [src/matcha/mergecore.nim](src/matcha/mergecore.nim) | Header merge (`resolveHeaders`), `buildSimilarityMap`, union-find components, agglomerative clustering, `selectRepresentative` |
 | [src/matcha/collapse.nim](src/matcha/collapse.nim) | collapse-mode driver: `integratedMerge` (fused preproc+merge via `synced_bcf_reader`), self-match with singleton emission, `locByIdx`/`passQualMap` via CSI, clustering, output assembly |
+| [src/matcha/merge.nim](src/matcha/merge.nim) | merge-mode driver: cohort pVCF across N single-sample inputs. Reuses `integratedMerge` (with `stampSID=true`, `preserveBndAlt=true`), self-match, clustering. Builds two headers — `slimHdr` (1 dummy `SAMPLE` column + `FORMAT/SID`) for slim BCF writers, `outputHdr` (N samples + AC/AN/AF) for the final pVCF. Output assembly fetches each cluster member's slim record by CSI, routes its FORMAT into the column named by `FORMAT/SID`, and computes AC/AN/AF from the assembled GT array. |
 | [src/matcha/log.nim](src/matcha/log.nim) | Verbose/warn/error logging (stderr, timestamped); `warnCap` throttle |
 | [src/matcha/synced_bcf_reader.nim](src/matcha/synced_bcf_reader.nim) | FFI bindings for htslib `bcf_srs_t`; `newVariantView`/`setRecView`; [csrc/synced_bcf_wrap.c](csrc/synced_bcf_wrap.c) macro wrappers |
 

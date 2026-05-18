@@ -28,3 +28,4 @@ task test, "Run all tests":
   exec "nim c --hints:off -r tests/test_match.nim"
   exec "nim c --hints:off -r tests/test_anno.nim"
   exec "nim c --hints:off -r tests/test_collapse.nim"
+  exec "nim c --hints:off -r tests/test_merge.nim"

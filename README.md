@@ -9,7 +9,7 @@ Compiled, efficient structural variant (SV) matching and annotation tool written
 | `matcha match` — pairwise matching between two SV callsets | complete |
 | `matcha anno` — annotate a query callset from a population database VCF | complete |
 | `matcha collapse` — cluster SVs from multiple callers within one sample, emit one representative per cluster | complete |
-| `matcha merge` — merge SVs across samples into a cohort pVCF | planned |
+| `matcha merge` — merge SVs across samples into a cohort pVCF | complete |
 
 DEL/DUP/INV match by coordinate + size (reciprocal overlap or Jaccard). BND records match by breakend proximity. INS is out of scope (silent skip). Genotypes are ignored.
 
@@ -168,6 +168,61 @@ Per-cluster INFO fields added to the output:
 - `N_MERGED` — total records merged into the cluster (≥ `N_CALLERS`).
 
 Conflict-resolved INFO fields (e.g. differing `SVLEN` across callers) and FORMAT fields configured via `--info` / `--format` are carried through from the representative record.
+
+---
+
+## matcha merge
+
+Merge per-sample SV callsets (typically `matcha collapse` outputs) into a single
+multi-sample cohort pVCF: one row per cluster, per-sample FORMAT columns,
+cohort INFO (AC/AN/AF) computed from the assembled GTs.
+
+```
+matcha merge [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
+
+  --min-overlap FLOAT           (exactly one of these two is required)
+  --min-jaccard FLOAT
+  --bnd-slop INT                default 50
+  --linkage average|single|complete   agglomerative linkage (default: average)
+  --priority CRITERIA           tiebreak cascade for representative selection
+                                default: PASS,CENTRE,ORDER
+  --format FIELDS               comma-separated FORMAT fields to carry per sample
+                                default: GT (auto-added if absent)
+  --info FIELDS                 comma-separated INFO fields to keep from representative
+                                default: only auto-extracted + cohort + CALLERS
+  -o, --output PATH             output (.vcf | .vcf.gz | .bcf); default stdout VCF
+  --threads INT                 default 1
+  --tmp-dir PATH
+  -v, --verbose
+  -h, --help
+```
+
+### Input requirements
+
+- ≥ 2 input files.
+- Each input must have **exactly 1 sample column**; multi-sample inputs are rejected.
+- All sample IDs across inputs must be **distinct**; collisions are rejected.
+
+### Output
+
+- N sample columns named with each input's own sample ID, in CLI order.
+- Per-cluster cohort INFO fields:
+  - `AC` (`Number=A,Integer`) — alt allele count across called genotypes.
+  - `AN` (`Number=1,Integer`) — total alleles called (sums over non-missing GTs).
+  - `AF` (`Number=A,Float`) — `AC / AN`; missing (`AF=.`) when `AN == 0`.
+- When any input record carries `INFO/CALLERS`, the output also emits:
+  - `CALLERS` — union across cluster members (representative caller first).
+  - `N_CALLERS` — distinct count.
+- Missing samples are written as `GT=./.` with missing values for other carried FORMAT fields.
+- For BND records, the original bracket-form ALT (`N[chr:pos[` etc.) is preserved.
+
+### Notes
+
+- Same-sample collisions inside a single cluster are **not blocked** — if two records from
+  the same sample happen to cluster together, the priority cascade (PASS → QUAL → ORDER)
+  picks one per sample column and a throttled warning is emitted.
+- `GT` is silently added to `--format` when absent so cohort AC/AN/AF can be computed.
+- `N_MERGED` (collapse-specific) is not emitted.
 
 ---
 

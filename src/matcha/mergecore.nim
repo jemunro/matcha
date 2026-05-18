@@ -14,7 +14,7 @@
 import std/[os, sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
-import utils, preproc, synced_bcf_reader
+import utils, preproc, matchcore, match, log, synced_bcf_reader
 
 # ---------------------------------------------------------------------------
 # Types
@@ -60,6 +60,51 @@ type
 # Canonical pair key: always (min, max) so (a,b) and (b,a) collide.
 proc pairKey*(a, b: int32): (int32, int32) {.inline.} =
   if a <= b: (a, b) else: (b, a)
+
+# ---------------------------------------------------------------------------
+# BCF sentinel constants and low-level helpers (no nim binding for the C macros)
+# ---------------------------------------------------------------------------
+
+const
+  bcfInt32Missing*      = low(int32)               ## INT32_MIN
+  bcfInt32VectorEnd*    = low(int32) + 1'i32       ## INT32_MIN + 1
+  bcfFloatMissingU32*   = 0x7F800001'u32           ## NaN-tagged missing
+  bcfFloatVectorEndU32* = 0x7F800002'u32
+
+proc bcfFloatMissing*(): float32 {.inline.} =
+  cast[float32](bcfFloatMissingU32)
+
+proc bcfFloatVectorEnd*(): float32 {.inline.} =
+  cast[float32](bcfFloatVectorEndU32)
+
+proc hdrInt2Id*(hdr: ptr bcf_hdr_t; typ: cint; id: cint): cstring {.inline.} =
+  ## hts-nim keeps bcf_hdr_int2id private; replicate it here.
+  let arr = cast[ptr UncheckedArray[bcf_idpair_t]](hdr.id[typ])
+  arr[id].key
+
+proc infoFieldIds*(h: ptr bcf_hdr_t): HashSet[string] =
+  ## Set of all INFO IDs declared on `h`.
+  let hrecs = cast[ptr UncheckedArray[ptr bcf_hrec_t]](h.hrec)
+  for i in 0 ..< h.nhrec.int:
+    let hr = hrecs[i]
+    if hr.`type` != BCF_HEADER_TYPE.BCF_HL_INFO.cint: continue
+    let keys = cast[ptr UncheckedArray[cstring]](hr.keys)
+    let vals = cast[ptr UncheckedArray[cstring]](hr.vals)
+    for j in 0 ..< hr.nkeys.int:
+      if $keys[j] == "ID":
+        result.incl($vals[j]); break
+
+proc fmtFieldIds*(h: ptr bcf_hdr_t): HashSet[string] =
+  ## Set of all FORMAT IDs declared on `h`.
+  let hrecs = cast[ptr UncheckedArray[ptr bcf_hrec_t]](h.hrec)
+  for i in 0 ..< h.nhrec.int:
+    let hr = hrecs[i]
+    if hr.`type` != BCF_HEADER_TYPE.BCF_HL_FMT.cint: continue
+    let keys = cast[ptr UncheckedArray[cstring]](hr.keys)
+    let vals = cast[ptr UncheckedArray[cstring]](hr.vals)
+    for j in 0 ..< hr.nkeys.int:
+      if $keys[j] == "ID":
+        result.incl($vals[j]); break
 
 # ---------------------------------------------------------------------------
 # Header access helpers (low-level bcf_hrec_t traversal)
@@ -484,6 +529,90 @@ proc clusterAll*(allOffsets: seq[int32];
       result.add(cl)
 
 # ---------------------------------------------------------------------------
+# selfMatchAndCluster — full post-integratedMerge pipeline.
+#
+# Both `matcha collapse` and `matcha merge` share this body: self-match the
+# merged slim BCFs with singleton emission, build the similarity map and
+# location lookup, cluster, fetch PASS/QUAL/CALLER_IDX per cluster member
+# via grouped CSI queries, and select representatives.
+# ---------------------------------------------------------------------------
+
+type
+  ClusterPipelineResult* = object
+    finalClusters*: seq[seq[int32]]  ## each cluster: representative first
+    locByIdx*:      Table[int32, tuple[chromIdx: int16; pos: int32; fileIdx: int16]]
+    passQualMap*:   Table[int32, tuple[hasPASS: bool; qual: float32; callerIdx: int32]]
+    fileList*:      seq[string]      ## file index → slim BCF path
+
+proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
+                          chromOrder: seq[string];
+                          matchCfg: MatchConfig;
+                          linkage: LinkageMethod;
+                          threshold: float64;
+                          priority: seq[PriorityCriterion];
+                          modeTag = "self-match"): ClusterPipelineResult =
+  let (jobs, fileList) = buildWorkQueue(mergedPreproc, mergedPreproc, matchCfg)
+  logV(modeTag & ": " & $jobs.len & " job(s)")
+  var allPairs: seq[MatchPair]
+  for jrs in runMatchPairJobsWithPool(jobs, matchCfg):
+    for mp in jrs: allPairs.add(mp)
+  logV(modeTag & ": " & $allPairs.len & " pair(s)")
+
+  let simMap = buildSimilarityMap(allPairs)
+  var seenOffsets: HashSet[int32]
+  var allOffsets: seq[int32]
+  result.locByIdx = initTable[int32,
+                              tuple[chromIdx: int16; pos: int32; fileIdx: int16]]()
+  for p in allPairs:
+    if p.srcIndexA notin seenOffsets:
+      seenOffsets.incl(p.srcIndexA)
+      allOffsets.add(p.srcIndexA)
+      result.locByIdx[p.srcIndexA] = (p.chromIdx, p.posA, p.fileIdxA)
+    if p.srcIndexB != NO_MATCH and p.srcIndexB notin seenOffsets:
+      seenOffsets.incl(p.srcIndexB)
+      allOffsets.add(p.srcIndexB)
+      result.locByIdx[p.srcIndexB] = (p.chromIdx, p.posB, p.fileIdxB)
+  logV(modeTag & ": " & $allOffsets.len & " unique record(s)")
+
+  let clusters = clusterAll(allOffsets, simMap, linkage, threshold)
+
+  # Grouped CSI sweep for PASS/QUAL/CALLER_IDX per cluster member.
+  var allMemberIdxs: HashSet[int32]
+  for cl in clusters:
+    for idx in cl: allMemberIdxs.incl(idx)
+  var idxData, ciData: seq[int32]
+  var membersByFile: Table[int16, seq[int32]]
+  for idx in allMemberIdxs:
+    let loc = result.locByIdx[idx]
+    membersByFile.mgetOrPut(loc.fileIdx, @[]).add(idx)
+  for fileIdx, members in membersByFile.pairs:
+    var vcf: VCF
+    if not open(vcf, fileList[fileIdx]):
+      raise newException(IOError, "cannot open merged BCF: " & fileList[fileIdx])
+    for idx in members:
+      let loc = result.locByIdx[idx]
+      let region = chromOrder[loc.chromIdx] & ":" & $loc.pos & "-" & $loc.pos
+      for v in vcf.query(region):
+        if readSrcIndex(v, idxData) != idx: continue
+        let ci =
+          if v.info().get("CALLER_IDX", ciData) == Status.OK and ciData.len > 0:
+            ciData[0]
+          else: 0'i32
+        result.passQualMap[idx] = (hasPASS: $v.FILTER == "PASS",
+                                    qual: v.QUAL.float32, callerIdx: ci)
+        break
+    vcf.close()
+
+  for cl in clusters:
+    let rep = selectRepresentative(cl, simMap, result.passQualMap, priority)
+    var ordered = @[rep]
+    for idx in cl:
+      if idx != rep: ordered.add(idx)
+    result.finalClusters.add(ordered)
+  logV(modeTag & ": " & $result.finalClusters.len & " cluster(s)")
+  result.fileList = fileList
+
+# ---------------------------------------------------------------------------
 # integratedMerge — fused preproc + merge in one synced_bcf_reader pass
 # ---------------------------------------------------------------------------
 
@@ -491,9 +620,12 @@ type
   MergeStreamConfig* = object
     ## Configuration for integratedMerge; decoupled from CollapseConfig so the
     ## same streaming kernel can be reused by matcha merge.
-    formatFields*: seq[string]   ## FORMAT fields to carry; empty = no FORMAT
-    nThreads*:     int
-    tmpDir*:       string
+    formatFields*:      seq[string]   ## FORMAT fields to carry; empty = no FORMAT
+    nThreads*:          int
+    tmpDir*:            string
+    stampSID*:          bool          ## merge mode: write FORMAT/SID per record
+    sampleIdByCaller*:  seq[string]   ## merge mode: SID value for caller ci
+    preserveBndAlt*:    bool          ## merge mode: keep source BND ALT verbatim
 
 # Header utility: collect ##FILTER=<...> lines from a header.
 proc collectFilterLines*(h: ptr bcf_hdr_t): seq[string] =
@@ -513,6 +645,85 @@ proc collectFilterLines*(h: ptr bcf_hdr_t): seq[string] =
 const AlwaysKeepInMerged* = ["SVTYPE", "SVLEN", "END", "CHR2", "POS2",
                               "CALLERS", "N_CALLERS", "N_MERGED",
                               "SRC_INDEX", "CALLER_IDX"]
+
+# ---------------------------------------------------------------------------
+# Header skeleton builders — shared by collapse.buildFinalHdr,
+# merge.buildSlimHdr, and merge.buildOutputHdr. Each callsite handles its
+# mode-specific additions (sample columns, cohort/provenance INFO defs,
+# `##source` / `##matcha_cmdline` lines) on top.
+# ---------------------------------------------------------------------------
+
+proc addContigsUnion*(hdr: ptr bcf_hdr_t; callers: seq[CallerInput]) =
+  ## Append `##contig=<ID=...>` for every contig seen across callers; first
+  ## caller wins for order.
+  var seen: HashSet[string]
+  for caller in callers:
+    var vcf: VCF
+    if not open(vcf, caller.path): continue
+    var n: cint = 0
+    let names = bcf_hdr_seqnames(vcf.header.hdr, n.addr)
+    if names != nil:
+      for i in 0 ..< n.int:
+        let c = $names[i]
+        if c notin seen:
+          seen.incl(c)
+          discard bcf_hdr_append(hdr, ("##contig=<ID=" & c & ">").cstring)
+      free(names)
+    vcf.close()
+
+proc addFiltersUnion*(hdr: ptr bcf_hdr_t; callers: seq[CallerInput]) =
+  ## Append the union of `##FILTER=<...>` lines across callers (first occurrence
+  ## wins; duplicates from later callers are dropped).
+  var seen: HashSet[string]
+  for caller in callers:
+    var vcf: VCF
+    if not open(vcf, caller.path): continue
+    for line in collectFilterLines(vcf.header.hdr):
+      if line notin seen:
+        seen.incl(line)
+        discard bcf_hdr_append(hdr, line.cstring)
+    vcf.close()
+
+proc addStandardSvInfoDefs*(hdr: ptr bcf_hdr_t) =
+  ## Append SVTYPE/SVLEN/END/CHR2/POS2 INFO defs that aren't already declared.
+  let have = infoFieldIds(hdr)
+  if "SVTYPE" notin have:
+    discard bcf_hdr_append(hdr,
+      "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">".cstring)
+  if "SVLEN" notin have:
+    discard bcf_hdr_append(hdr,
+      "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length of the SV (absolute value)\">".cstring)
+  if "END" notin have:
+    discard bcf_hdr_append(hdr,
+      "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the SV (1-based, inclusive)\">".cstring)
+  if "CHR2" notin have:
+    discard bcf_hdr_append(hdr,
+      "##INFO=<ID=CHR2,Number=1,Type=String,Description=\"Chromosome of mate breakend\">".cstring)
+  if "POS2" notin have:
+    discard bcf_hdr_append(hdr,
+      "##INFO=<ID=POS2,Number=1,Type=Integer,Description=\"Position of mate breakend\">".cstring)
+
+proc addHeaderLinesFiltered*(hdr: ptr bcf_hdr_t; mh: MergedHeader;
+                              keepInfo: proc (id: string): bool {.closure.};
+                              keepFmt:  proc (id: string): bool {.closure.}) =
+  ## Walk `mh.headerLines` (synthesized ##INFO=<...> / ##FORMAT=<...>) and
+  ## append those whose ID satisfies the relevant predicate. Non-ID lines
+  ## are appended unconditionally.
+  for line in mh.headerLines:
+    let idStart = line.find("ID=")
+    if idStart < 0:
+      discard bcf_hdr_append(hdr, line.cstring)
+      continue
+    let idEnd = line.find(',', idStart + 3)
+    let fieldId =
+      if idEnd > 0: line[idStart + 3 ..< idEnd]
+      else:         line[idStart + 3 ..< line.len - 1]
+    if line.startsWith("##FORMAT"):
+      if keepFmt(fieldId):
+        discard bcf_hdr_append(hdr, line.cstring)
+    else:
+      if keepInfo(fieldId):
+        discard bcf_hdr_append(hdr, line.cstring)
 
 proc keepInfoForMerged*(name: string; infoFilter: seq[string]): bool =
   ## Keep set for INFO fields in the merged slim BCFs.
@@ -651,6 +862,17 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
       else:
         discard bcf_hdr_set_samples(srcHdr, cstring(nil), 0.cint)
     augmentSrcHdrForRenames(srcHdr, ci, mh)
+    if cfg.stampSID:
+      # SID FORMAT def must exist on srcHdr so bcf_update_format can resolve
+      # the key; also on finalHdr (which is the slimHdr in merge mode).
+      var sidPresent = false
+      for hi in collectHrecs(srcHdr, BCF_HEADER_TYPE.BCF_HL_FMT.cint):
+        if hi.id == "SID": sidPresent = true; break
+      if not sidPresent:
+        discard bcf_hdr_append(srcHdr,
+          ("##FORMAT=<ID=SID,Number=1,Type=String," &
+           "Description=\"matcha-internal: source sample ID\">").cstring)
+        discard bcf_hdr_sync(srcHdr)
 
   # Per-caller WarnState + lineno counter (for synthetic ID generation).
   # globalSrcIndex is a single counter across all callers for SRC_INDEX writes.
@@ -769,8 +991,22 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
         discard bcf_update_info(srcHdr, rec, "CALLER_IDX".cstring,
                                 callerIdxVal.addr, 1.cint, BCF_HT_INT.cint)
 
-        # 2h. REF/ALT trim to keep records small (matchcore reads neither).
-        discard bcf_update_alleles_str(srcHdr, rec, "N,.".cstring)
+        # 2g. Write FORMAT/SID (merge mode only) — source sample identity for
+        # the dummy single-sample slim record.
+        if cfg.stampSID and ci < cfg.sampleIdByCaller.len:
+          var sidArr: array[1, cstring]
+          sidArr[0] = cfg.sampleIdByCaller[ci].cstring
+          discard bcf_update_format_string(srcHdr, rec, "SID".cstring,
+                                           cast[cstringArray](sidArr[0].addr),
+                                           1.cint)
+
+        # 2h. REF/ALT trim to keep records small. For BND in merge mode we
+        # preserve the source ALT verbatim (strand orientation lives in the
+        # bracket form and is not derivable from CHR2/POS2 at output time).
+        if cfg.preserveBndAlt and nr.svt == svBND:
+          discard  # leave REF/ALT as the source had them
+        else:
+          discard bcf_update_alleles_str(srcHdr, rec, "N,.".cstring)
 
         # 2i. Track metadata + lazy-open writer.
         if nr.svt notin result.populatedBins:

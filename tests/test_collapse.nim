@@ -36,6 +36,9 @@ type ColRecord = object
   nSource, nMerged:  int
 
 proc parseCollapsed(vcfText: string): seq[ColRecord] =
+  ## Collapse emits CALLERS (Number=. comma-list, representative-first) +
+  ## N_CALLERS + N_MERGED. Map them to the legacy `source`/`sourceList`/
+  ## `nSource` field names the tests below were written against.
   for line in vcfText.splitLines:
     if line.len == 0 or line[0] == '#': continue
     let cols = line.split('\t')
@@ -50,10 +53,12 @@ proc parseCollapsed(vcfText: string): seq[ColRecord] =
       let kv = field.split('=', 1)
       if kv.len != 2: continue
       case kv[0]
-      of "SOURCE":     rec.source     = kv[1]
-      of "SOURCELIST": rec.sourceList = kv[1]
-      of "N_SOURCE":   rec.nSource    = parseInt(kv[1])
-      of "N_MERGED":   rec.nMerged    = parseInt(kv[1])
+      of "CALLERS":
+        rec.sourceList = kv[1]
+        let first = kv[1].split(',')
+        if first.len > 0: rec.source = first[0]
+      of "N_CALLERS": rec.nSource = parseInt(kv[1])
+      of "N_MERGED":  rec.nMerged = parseInt(kv[1])
     result.add(rec)
 
 proc collapseRun(extra = ""): (seq[ColRecord], int) =

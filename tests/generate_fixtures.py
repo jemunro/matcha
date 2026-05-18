@@ -329,8 +329,8 @@ def compute_expected(records_a, records_b, metric, threshold):
             if sim < threshold:
                 continue
             rows.append([
-                chrom, str(posA), str(endA), idA,
-                chrom, str(posB), str(endB), idB,
+                chrom, str(posA), idA,
+                chrom, str(posB), idB,
                 svtype, f"{sim:.6f}",
             ])
     return rows
@@ -358,14 +358,14 @@ def compute_self_expected(records, metric, threshold):
                 if sim < threshold:
                     continue
                 rows.append([
-                    chrom, str(a["pos"]), str(a["end"]), a["id"],
-                    chrom, str(b["pos"]), str(b["end"]), b["id"],
+                    chrom, str(a["pos"]), a["id"],
+                    chrom, str(b["pos"]), b["id"],
                     svtype, f"{sim:.6f}",
                 ])
     return rows
 
 
-def compute_bnd_expected(records_a, records_b, slop=100):
+def compute_bnd_expected(records_a, records_b, slop=50):
     """BND expected rows. Two BNDs match iff same CHROM_A, same CHR2, and
     both breakends are within slop (strict <). Similarity is
     (2*slop - |dPOS| - |dPOS2|) / (2*slop)."""
@@ -393,14 +393,14 @@ def compute_bnd_expected(records_a, records_b, slop=100):
             if sim <= 0:
                 continue
             rows.append([
-                ra["chrom"], str(ra["pos"]), ".", ra["id"],
-                ra["chrom"], str(rb["pos"]), ".", rb["id"], "BND",
+                ra["chrom"], str(ra["pos"]), ra["id"],
+                ra["chrom"], str(rb["pos"]), rb["id"], "BND",
                 f"{sim:.6f}",
             ])
     return rows
 
 
-def compute_self_bnd_expected(records, slop=100):
+def compute_self_bnd_expected(records, slop=50):
     by_chrom = {}
     for rec in records:
         if not bnd_matchable(rec):
@@ -426,8 +426,8 @@ def compute_self_bnd_expected(records, slop=100):
                 if sim <= 0:
                     continue
                 rows.append([
-                    chrom, str(a["pos"]), ".", a["id"],
-                    chrom, str(b["pos"]), ".", b["id"], "BND",
+                    chrom, str(a["pos"]), a["id"],
+                    chrom, str(b["pos"]), b["id"], "BND",
                     f"{sim:.6f}",
                 ])
     return rows
@@ -554,6 +554,105 @@ RECORDS_MULTIALLELIC = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Merge fixtures: 3 single-sample VCFs (S1/S2/S3) with overlapping cluster
+# structure spanning DEL/DUP/INV/BND. Designed so AC/AN/AF arithmetic is
+# exact and predictable for test_merge.nim.
+#
+# Cluster layout (jaccard >= 0.75):
+#   chr1:1000 DEL -1000bp  S1=0/1  S2=1/1  S3=0/0(at 1100, j=0.818)  → AC=3 AN=6
+#   chr1:3000 DEL -1000bp  S1=1/1  -       -                          → AC=2 AN=2
+#   chr1:9000 DUP +1000bp  S1=0/1  S2=0/0  -                          → AC=1 AN=4
+#   chr1:28000 INV +2000bp -       -       S3=0/1                     → AC=1 AN=2
+#   BND chr1:31000→chr1:32000 S1=0/1 S2=0/1 S3=1/1                    → AC=4 AN=6
+# ---------------------------------------------------------------------------
+
+MERGE_HEADER_BASE = """\
+##fileformat=VCFv4.2
+##FILTER=<ID=PASS,Description="All filters passed">
+##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">
+##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="Difference in length between REF and ALT alleles">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##contig=<ID=chr1,length=248956422>
+##contig=<ID=chr2,length=242193529>
+##contig=<ID=chrX,length=156040895>"""
+
+
+def merge_rec(chrom, pos, rid, svtype, svlen, end, gt, qual=".", filt="PASS"):
+    """Single-sample merge fixture record. `gt` is the literal FORMAT/GT string."""
+    sign = -1 if svtype == "DEL" else 1
+    alt  = f"<{svtype}>"
+    info = f"SVTYPE={svtype};SVLEN={sign * abs(svlen)};END={end}"
+    return {"chrom": chrom, "pos": pos, "id": rid, "ref": "N", "alt": alt,
+            "info": info, "qual": str(qual), "filter": filt, "gt": gt}
+
+
+def merge_bnd(chrom, pos, rid, chr2, pos2, gt, qual=".", filt="PASS"):
+    alt = f"N[{chr2}:{pos2}["
+    return {"chrom": chrom, "pos": pos, "id": rid, "ref": "N", "alt": alt,
+            "info": "SVTYPE=BND", "qual": str(qual), "filter": filt, "gt": gt}
+
+
+MERGE_S1 = [
+    merge_rec("chr1", 1000,  "DEL_S1_1",  "DEL", 1000, 2000,  "0/1"),
+    merge_rec("chr1", 3000,  "DEL_S1_2",  "DEL", 1000, 4000,  "1/1"),
+    merge_rec("chr1", 9000,  "DUP_S1_3",  "DUP", 1000, 10000, "0/1"),
+    merge_bnd("chr1", 31000, "BND_S1_4",  "chr1", 32000,      "0/1"),
+]
+MERGE_S2 = [
+    merge_rec("chr1", 1000,  "DEL_S2_1",  "DEL", 1000, 2000,  "1/1"),
+    merge_rec("chr1", 9000,  "DUP_S2_2",  "DUP", 1000, 10000, "0/0"),
+    merge_bnd("chr1", 31000, "BND_S2_3",  "chr1", 32000,      "0/1"),
+]
+MERGE_S3 = [
+    merge_rec("chr1", 1100,  "DEL_S3_1",  "DEL", 1000, 2100,  "0/0"),
+    merge_rec("chr1", 28000, "INV_S3_2",  "INV", 2000, 30000, "0/1"),
+    merge_bnd("chr1", 31000, "BND_S3_3",  "chr1", 32000,      "1/1"),
+]
+
+
+def write_single_sample_vcf(records, path, sample_id):
+    header = MERGE_HEADER_BASE + f"\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{sample_id}"
+    lines = [header]
+    for r in records:
+        cols = [r["chrom"], str(r["pos"]), r["id"], r["ref"], r["alt"],
+                r["qual"], r["filter"], r["info"], "GT", r["gt"]]
+        lines.append("\t".join(cols))
+    vcf_text = "\n".join(lines) + "\n"
+    subprocess.run(
+        ["bcftools", "sort", "-O", "z", "-o", path, "-"],
+        input=vcf_text.encode(), check=True, capture_output=True,
+    )
+    subprocess.run(["bcftools", "index", path], check=True, capture_output=True)
+
+
+# A 2-sample VCF (same records as S1 but with two sample columns) — used to
+# negative-test merge's "exactly 1 sample" enforcement.
+MERGE_HEADER_2S_LINE = "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tEXTRA"
+
+
+def write_merge_2sample(records, path):
+    header = MERGE_HEADER_BASE + "\n" + MERGE_HEADER_2S_LINE
+    lines = [header]
+    for r in records:
+        cols = [r["chrom"], str(r["pos"]), r["id"], r["ref"], r["alt"],
+                r["qual"], r["filter"], r["info"], "GT", r["gt"], "0/0"]
+        lines.append("\t".join(cols))
+    vcf_text = "\n".join(lines) + "\n"
+    subprocess.run(
+        ["bcftools", "sort", "-O", "z", "-o", path, "-"],
+        input=vcf_text.encode(), check=True, capture_output=True,
+    )
+    subprocess.run(["bcftools", "index", path], check=True, capture_output=True)
+
+
+# A clone of S1 with the SAME sample ID as S1 — used to negative-test the
+# "all sample IDs distinct" enforcement.
+def write_merge_s1_dup(records, path):
+    write_single_sample_vcf(records, path, sample_id="S1")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default="tests/fixtures")
@@ -584,19 +683,19 @@ def main():
     chrom_order = {c: i for i, c in enumerate(["chr1", "chr2", "chrX"])}
     def sort_key(row):
         # (chrom-order, svtype-string, posA, idA, posB)
-        # Row schema: [chromA, posA, endA, idA, chromB, posB, endB, idB, svtype, sim]
-        return (chrom_order.get(row[0], 999), row[8], int(row[1]), row[3], int(row[5]))
+        # Row schema: [chromA, posA, idA, chromB, posB, idB, svtype, sim]
+        return (chrom_order.get(row[0], 999), row[6], int(row[1]), row[2], int(row[4]))
 
     # Expected TSVs for three threshold scenarios. Under the new CLI rule
     # exactly one of --min-overlap / --min-jaccard is active per run; the
     # SIMILARITY column reports that metric for interval rows. BND rows
-    # always use slop=100 proximity and are merged into every scenario.
+    # always use slop=50 proximity (matcha default) and are merged into every scenario.
     scenarios = [
         ("default",      "overlap", 0.5),
         ("strict",       "overlap", 0.8),
         ("jaccard_only", "jaccard", 0.5),
     ]
-    bnd_rows = compute_bnd_expected(RECORDS_A, RECORDS_B, slop=100)
+    bnd_rows = compute_bnd_expected(RECORDS_A, RECORDS_B, slop=50)
     for name, metric, thr in scenarios:
         rows = compute_expected(RECORDS_A, RECORDS_B, metric, thr) + bnd_rows
         rows.sort(key=sort_key)
@@ -606,11 +705,11 @@ def main():
 
     # Self-mode expected output: --self --min-overlap 0.5 fixtureA.
     self_rows = (compute_self_expected(RECORDS_A, "overlap", 0.5) +
-                 compute_self_bnd_expected(RECORDS_A, slop=100))
+                 compute_self_bnd_expected(RECORDS_A, slop=50))
     self_rows.sort(key=sort_key)
     self_path = os.path.join(out, "expected", "expected_self.tsv")
     write_expected_tsv(self_rows, self_path)
-    print(f"  {self_path}: {len(self_rows)} rows (--self, overlap>=0.5 + BND slop=100)")
+    print(f"  {self_path}: {len(self_rows)} rows (--self, overlap>=0.5 + BND slop=50)")
 
     print("Writing collapse_caller1.vcf.gz ...")
     write_vcf_gz(RECORDS_COLLAPSE_CALLER1,
@@ -651,6 +750,19 @@ def main():
         COLLAPSE_HEADER_2S,
         [caller1_1s_gt, caller2_1s_gt],
     )
+
+    # Merge fixtures.
+    print("Writing merge_S1.vcf.gz ...")
+    write_single_sample_vcf(MERGE_S1, os.path.join(out, "merge_S1.vcf.gz"), "S1")
+    print("Writing merge_S2.vcf.gz ...")
+    write_single_sample_vcf(MERGE_S2, os.path.join(out, "merge_S2.vcf.gz"), "S2")
+    print("Writing merge_S3.vcf.gz ...")
+    write_single_sample_vcf(MERGE_S3, os.path.join(out, "merge_S3.vcf.gz"), "S3")
+    print("Writing merge_S1_dup.vcf.gz (sample-id collision case) ...")
+    write_merge_s1_dup(MERGE_S2,
+                       os.path.join(out, "merge_S1_dup.vcf.gz"))
+    print("Writing merge_2sample.vcf.gz (multi-sample reject case) ...")
+    write_merge_2sample(MERGE_S1, os.path.join(out, "merge_2sample.vcf.gz"))
 
     print("Writing collapse_multiallelic.vcf.gz ...")
     vcf_text = MULTIALLELIC_HEADER + "\n"

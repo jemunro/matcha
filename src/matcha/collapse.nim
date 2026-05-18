@@ -16,7 +16,7 @@
 import std/[algorithm, os, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
-import utils, preproc, match, matchcore, mergecore, log, synced_bcf_reader
+import utils, preproc, matchcore, mergecore, log, synced_bcf_reader
 
 # ---------------------------------------------------------------------------
 # CollapseConfig
@@ -37,34 +37,6 @@ type
     callers*:      seq[CallerInput]
 
 # ---------------------------------------------------------------------------
-# Header traversal helpers (used by buildFinalHdr)
-# ---------------------------------------------------------------------------
-
-proc infoFieldDefs(h: ptr bcf_hdr_t): seq[(string, string, string, string)] =
-  let hrecs = cast[ptr UncheckedArray[ptr bcf_hrec_t]](h.hrec)
-  for i in 0 ..< h.nhrec.int:
-    let hr = hrecs[i]
-    if hr.`type` != BCF_HEADER_TYPE.BCF_HL_INFO.cint: continue
-    let keys = cast[ptr UncheckedArray[cstring]](hr.keys)
-    let vals = cast[ptr UncheckedArray[cstring]](hr.vals)
-    var id, num, typ, desc = ""
-    for j in 0 ..< hr.nkeys.int:
-      case $keys[j]
-      of "ID":     id  = $vals[j]
-      of "Number": num = $vals[j]
-      of "Type":   typ = $vals[j]
-      of "Description":
-        let dv = $vals[j]
-        desc = if dv.len >= 2 and dv[0] == '"' and dv[^1] == '"':
-                 dv[1 ..< dv.len - 1]
-               else: dv
-    if id.len > 0: result.add((id, num, typ, desc))
-
-# ---------------------------------------------------------------------------
-# Pass 2 — enumerate allOffsets + PASS/QUAL from merged slim BCFs
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # buildFinalHdr — collapse-specific shared output header
 # ---------------------------------------------------------------------------
 
@@ -76,73 +48,22 @@ proc buildFinalHdr(callers: seq[CallerInput]; mh: MergedHeader;
   ## writeOutput. Eliminates `bcf_translate` at writeOutput time.
   result = bcf_hdr_init("w".cstring)
 
-  # Contigs: union from all callers (first caller wins for order).
-  var seenCtg: HashSet[string]
-  for caller in callers:
-    var vcf: VCF
-    if not open(vcf, caller.path): continue
-    var n: cint = 0
-    let names = bcf_hdr_seqnames(vcf.header.hdr, n.addr)
-    if names != nil:
-      for i in 0 ..< n.int:
-        let c = $names[i]
-        if c notin seenCtg:
-          seenCtg.incl(c)
-          discard bcf_hdr_append(result,
-            ("##contig=<ID=" & c & ">").cstring)
-      free(names)
-    vcf.close()
+  addContigsUnion(result, callers)
+  addFiltersUnion(result, callers)
 
-  # FILTER defs: merge from all callers.
-  var seenFlt: HashSet[string]
-  for caller in callers:
-    var vcf: VCF
-    if not open(vcf, caller.path): continue
-    for line in collectFilterLines(vcf.header.hdr):
-      if line notin seenFlt:
-        seenFlt.incl(line)
-        discard bcf_hdr_append(result, line.cstring)
-    vcf.close()
-
-  # INFO/FORMAT from mh.headerLines, filtered.
+  # INFO/FORMAT from mh.headerLines, filtered. INFO is kept only when
+  # cfg.infoFields is non-empty AND the field matches the user list (or is
+  # one of the always-keep matcha-internal/SV fields); standard SV defs are
+  # added below via addStandardSvInfoDefs for the empty-list case.
   let fmtKeep = toHashSet(cfg.formatFields)
-  for line in mh.headerLines:
-    let idStart = line.find("ID=")
-    if idStart < 0:
-      discard bcf_hdr_append(result, line.cstring)
-      continue
-    let idEnd = line.find(',', idStart + 3)
-    let fieldId =
-      if idEnd > 0: line[idStart + 3 ..< idEnd]
-      else:         line[idStart + 3 ..< line.len - 1]
-    if line.startsWith("##FORMAT"):
-      if fieldId in fmtKeep:
-        discard bcf_hdr_append(result, line.cstring)
-    else:
-      if cfg.infoFields.len > 0 and keepInfoForMerged(fieldId, cfg.infoFields):
-        discard bcf_hdr_append(result, line.cstring)
+  let userInfo = cfg.infoFields
+  addHeaderLinesFiltered(result, mh,
+    keepInfo = proc (id: string): bool =
+      userInfo.len > 0 and keepInfoForMerged(id, userInfo),
+    keepFmt  = proc (id: string): bool =
+      id in fmtKeep)
 
-  # Ensure standard SV INFO defs (in case callers' headers omit any).
-  let outHdr = result
-  proc hasInfo(name: string): bool =
-    for (id, _, _, _) in infoFieldDefs(outHdr):
-      if id == name: return true
-    false
-  if not hasInfo("SVTYPE"):
-    discard bcf_hdr_append(result,
-      "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">".cstring)
-  if not hasInfo("SVLEN"):
-    discard bcf_hdr_append(result,
-      "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length of the SV (absolute value)\">".cstring)
-  if not hasInfo("END"):
-    discard bcf_hdr_append(result,
-      "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the SV (1-based, inclusive)\">".cstring)
-  if not hasInfo("CHR2"):
-    discard bcf_hdr_append(result,
-      "##INFO=<ID=CHR2,Number=1,Type=String,Description=\"Chromosome of mate breakend\">".cstring)
-  if not hasInfo("POS2"):
-    discard bcf_hdr_append(result,
-      "##INFO=<ID=POS2,Number=1,Type=Integer,Description=\"Position of mate breakend\">".cstring)
+  addStandardSvInfoDefs(result)
 
   # Matcha-internal INFO defs (needed for bcf_translate during merge).
   discard bcf_hdr_append(result,
@@ -404,7 +325,7 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
     chromOrder:     chromOrder,
   )
 
-  # Phase 3: Pass 1 — self-match over merged slim BCFs (emitSingletons=true).
+  # Phase 3: self-match + cluster + representative selection (shared pipeline).
   logV("self-matching merged slim BCFs")
   let matchCfg = MatchConfig(
     metric:         cfg.metric,
@@ -415,72 +336,13 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
     selfMode:       true,
     emitSingletons: true,
   )
-  let (jobs, fileList) = buildWorkQueue(mergedPreproc, mergedPreproc, matchCfg)
-  logV("collapse self-match: " & $jobs.len & " job(s)")
-  let allPairs = block:
-    var r: seq[MatchPair]
-    for jrs in runMatchPairJobsWithPool(jobs, matchCfg):
-      for mp in jrs: r.add(mp)
-    r
-  logV("self-match: " & $allPairs.len & " pair(s)")
+  let cpr = selfMatchAndCluster(mergedPreproc, chromOrder, matchCfg,
+                                 cfg.linkage, cfg.threshold, cfg.priority,
+                                 "collapse self-match")
 
-  # Phase 4: Build allOffsets from MatchPairs; build locByIdx for retrieval.
-  let simMap = buildSimilarityMap(allPairs)
-  var seenOffsets: HashSet[int32]
-  var allOffsets: seq[int32]
-  var locByIdx: Table[int32, tuple[chromIdx: int16, pos: int32, fileIdx: int16]]
-  for p in allPairs:
-    if p.srcIndexA notin seenOffsets:
-      seenOffsets.incl(p.srcIndexA)
-      allOffsets.add(p.srcIndexA)
-      locByIdx[p.srcIndexA] = (p.chromIdx, p.posA, p.fileIdxA)
-    if p.srcIndexB != NO_MATCH and p.srcIndexB notin seenOffsets:
-      seenOffsets.incl(p.srcIndexB)
-      allOffsets.add(p.srcIndexB)
-      locByIdx[p.srcIndexB] = (p.chromIdx, p.posB, p.fileIdxB)
-  logV("unique records: " & $allOffsets.len)
-
-  # Phase 5: cluster.
-  let clusters = clusterAll(allOffsets, simMap, cfg.linkage, cfg.threshold)
-
-  # Build passQualMap via targeted CSI queries for all cluster members.
-  var allMemberIdxs: HashSet[int32]
-  for cl in clusters:
-    for idx in cl: allMemberIdxs.incl(idx)
-  var passQualMap: Table[int32, tuple[hasPASS: bool; qual: float32; callerIdx: int32]]
-  var idxData, ciData: seq[int32]
-  var membersByFile: Table[int16, seq[int32]]
-  for idx in allMemberIdxs:
-    let loc = locByIdx[idx]
-    membersByFile.mgetOrPut(loc.fileIdx, @[]).add(idx)
-  for fileIdx, members in membersByFile:
-    var vcf: VCF
-    if not open(vcf, fileList[fileIdx]):
-      raise newException(IOError, "cannot open merged BCF: " & fileList[fileIdx])
-    for idx in members:
-      let loc = locByIdx[idx]
-      let region = chromOrder[loc.chromIdx] & ":" & $loc.pos & "-" & $loc.pos
-      for v in vcf.query(region):
-        if readSrcIndex(v, idxData) != idx: continue
-        let ci = if v.info().get("CALLER_IDX", ciData) == Status.OK and ciData.len > 0:
-                   ciData[0] else: 0'i32
-        passQualMap[idx] = (hasPASS: $v.FILTER == "PASS",
-                            qual: v.QUAL.float32, callerIdx: ci)
-        break
-    vcf.close()
-
-  # Select representatives.
-  var finalClusters: seq[seq[int32]]
-  for cl in clusters:
-    let rep = selectRepresentative(cl, simMap, passQualMap, cfg.priority)
-    var ordered = @[rep]
-    for idx in cl:
-      if idx != rep: ordered.add(idx)
-    finalClusters.add(ordered)
-  logV("clusters: " & $finalClusters.len)
-
-  # Phase 6: write output.
-  writeOutput(cfg, finalHdr, chromOrder, im.paths, finalClusters, passQualMap)
+  # Phase 4: write output.
+  writeOutput(cfg, finalHdr, chromOrder, im.paths, cpr.finalClusters,
+              cpr.passQualMap)
 
   # Clean up: merged slim BCFs + CSI indexes, and finalHdr.
   removeTempBcfs(im.paths)
