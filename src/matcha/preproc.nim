@@ -7,7 +7,7 @@
 ##     disagreement when both INFO fields were independently provided).
 ##   * Synthesize ID if absent ("." or empty) → CHROM_POS_SVTYPE_LINENUMBER.
 ##   * Slim INFO to the per-SVTYPE keep-set:
-##     intervals → {END, MATCHA_BOFF}; BND → {CHR2, POS2, MATCHA_BOFF}.
+##     intervals → {END, SRC_INDEX}; BND → {CHR2, POS2, SRC_INDEX}.
 ##   * Compute size-bin via bins.binIndexFor(SVLEN).
 ##   * Write to a per-(SVTYPE, bin) BCF spanning all chroms; CSI-indexed.
 ##
@@ -22,17 +22,17 @@
 ##
 ## Per-record warnings are throttled at MATCHA_WARN_CAP (default 5) per reason.
 
-import std/[algorithm, os, sets, strutils, tables]
+import std/[algorithm, os, sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat  # BCF_ERR_CTG_UNDEF, BGZF, htsFile, bgzf_tell
 import utils, log, bins, synced_bcf_reader
 
 # hts-nim's VCF type keeps the underlying htsFile* private. We need access to
-# it (specifically vcf.hts.fp.bgzf) so we can call bgzf_tell to record each
-# record's source-file BGZF virtual offset during preprocessing. Rather than
-# patching vendored hts-nim, mirror enough of VCF's prefix to cast across.
-# Both inherit RootObj, so the type-info slot lines up; the very next slot is
-# `hts: ptr htsFile`. Layout is documented at vendor/hts-nim/src/hts/vcf.nim:19-26.
+# it (specifically vcf.hts.fp.bgzf) so we can call bgzf_tell for CSI index
+# building. Rather than patching vendored hts-nim, mirror enough of VCF's
+# prefix to cast across. Both inherit RootObj, so the type-info slot lines up;
+# the very next slot is `hts: ptr htsFile`.
+# Layout is documented at vendor/hts-nim/src/hts/vcf.nim:19-26.
 type
   VcfPriv = ref object of RootObj
     hts: ptr htsFile
@@ -52,12 +52,16 @@ type
     chromsBySvtype*: Table[SvType, HashSet[string]]   ## svtype → chroms seen
     chromOrder*:     seq[string]                      ## chroms in input header order
 
+  BinBEntry* = tuple[path: string; fileIdx: int16]
+
   MatchJob* = object
-    chrom*:   string
-    svtype*:  SvType
-    binA*:    int
-    pathA*:   string
-    binsB*:   Table[int, string]                      ## binB → B's path
+    chrom*:    string
+    chromIdx*: int16                                   ## Index into chromOrder (for MatchPair.chromIdx).
+    svtype*:   SvType
+    binA*:     int
+    pathA*:    string
+    fileIdxA*: int16                                   ## Index into the run's slim-BCF file list.
+    binsB*:    Table[int, BinBEntry]                   ## binB → (B's path, B's file index)
 
   SkipReason* = enum
     skUnsupportedSvtype
@@ -84,33 +88,27 @@ proc initWarnState*(callset: string): WarnState =
 # INFO fields kept in each class of temp BCF. SVTYPE is encoded in the filename;
 # SVLEN is derivable from END-POS and matchcore never reads it.
 const IntervalInfoDefs = [
-  ("END",         "1", "Integer", "End position of the SV (1-based, inclusive)"),
-  ("MATCHA_BOFF", "2", "Integer",
-   "matcha-internal: source-file BGZF virtual offset (high32, low32)"),
+  ("END",       "1", "Integer", "End position of the SV (1-based, inclusive)"),
+  ("SRC_INDEX", "1", "Integer", "matcha-internal: sequential record index from preproc"),
 ]
 const BndInfoDefs = [
-  ("CHR2",        "1", "String",  "Chromosome of mate breakend"),
-  ("POS2",        "1", "Integer", "Position of mate breakend"),
-  ("MATCHA_BOFF", "2", "Integer",
-   "matcha-internal: source-file BGZF virtual offset (high32, low32)"),
+  ("CHR2",      "1", "String",  "Chromosome of mate breakend"),
+  ("POS2",      "1", "Integer", "Position of mate breakend"),
+  ("SRC_INDEX", "1", "Integer", "matcha-internal: sequential record index from preproc"),
 ]
 
 # Standard SV INFO definitions to backfill when the input header omits them.
 # Without these, info.set() at write time fails because hts-nim resolves
 # the field's type via the (reader's) header. Applied to the INPUT VCF only.
 const SvInfoDefs = [
-  ("SVTYPE",      "1", "String",  "Type of structural variant"),
-  ("SVLEN",       "1", "Integer", "Length of the SV (absolute value, positive)"),
-  ("END",         "1", "Integer", "End position of the SV (1-based, inclusive)"),
-  ("CHR2",        "1", "String",  "Chromosome of mate breakend (BND/TRA)"),
-  ("POS2",        "1", "Integer", "Position of mate breakend (BND/TRA)"),
-  ("MATCHA_BOFF", "2", "Integer",
-   "matcha-internal: source-file BGZF virtual offset (high32, low32)"),
+  ("SVTYPE",    "1", "String",  "Type of structural variant"),
+  ("SVLEN",     "1", "Integer", "Length of the SV (absolute value, positive)"),
+  ("END",       "1", "Integer", "End position of the SV (1-based, inclusive)"),
+  ("CHR2",      "1", "String",  "Chromosome of mate breakend (BND/TRA)"),
+  ("POS2",      "1", "Integer", "Position of mate breakend (BND/TRA)"),
+  ("SRC_INDEX", "1", "Integer", "matcha-internal: sequential record index"),
 ]
 
-proc encodeBoff*(off: int64): seq[int32] {.inline.} =
-  @[cast[int32]((off shr 32) and 0xFFFF_FFFF'i64),
-    cast[int32](off and 0xFFFF_FFFF'i64)]
 
 proc reasonStr(r: SkipReason): string =
   case r
@@ -453,22 +451,17 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   var indexes: Table[SvtypeBin, ptr hts_idx_t]
   var ws = WarnState(cap: warnCap(), callset: "callset" & prefix)
   var lineno = 0
+  var srcIndex: int32 = 0  ## Increments for every record read (including skipped),
+                           ## so anno's sequential A-file walk produces matching values.
   var svtypeStr: string
   var endData, svlenData: seq[int32]
   var toDelete: seq[string]
 
   result.chromOrder = captureChromOrder(vcf.header)
 
-  # Capture the source-file BGZF virtual offset for each record.
-  # `bgzf_tell` at the bottom of the loop body returns the position of the
-  # *next* record (because the iterator's bcf_read for record N has already
-  # advanced past it before yielding). So we prime with one tell before the
-  # loop, then update unconditionally at the bottom. The `block recordBody`
-  # makes every skip path flow through that final update.
-  var nextOffset = int64(bgzf_tell(bgzfHandle(vcf)))
-
   for v in vcf:
-    let recordOffset = nextOffset
+    var curSrcIndex = srcIndex
+    inc srcIndex
     inc lineno
     inc ws.nRead
 
@@ -577,10 +570,6 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
         var endI32 = endPos.int32
         discard v.info.set("END", endI32)
 
-      # Encode the source-file offset as INFO/MATCHA_BOFF (Number=2, Integer)
-      var boffPair = encodeBoff(recordOffset)
-      discard v.info.set("MATCHA_BOFF", boffPair)
-
       # Lazily open per-(svtype, bin) writer.
       let key: SvtypeBin = (svt, binIdx)
       if key notin writers:
@@ -613,17 +602,16 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
       discard bcf_update_alleles_str(vcf.header.hdr, v.c, "N\t.")
       v.c.qual = cast[cfloat](bcf_float_missing.uint32)
 
+      # Write the sequential record index (same value whether or not this record
+      # was skipped — curSrcIndex matches what anno's counter will see).
+      discard v.info.set("SRC_INDEX", curSrcIndex)
+
       discard writers[key].write_variant(v)
       if not noIndex:
         let woff = uint64(bgzf_tell(bgzfHandle(writers[key])))
         discard hts_idx_push(indexes[key], v.c.rid, int64(v.c.pos), endPos, woff, 1)
       result.chromsBySvtype[svt].incl($v.CHROM)
       inc ws.nKept
-
-    # Position is now at the start of the next record; capture it for the
-    # next iteration. Runs unconditionally — every continue path inside the
-    # body uses `break recordBody` so we always reach this update.
-    nextOffset = int64(bgzf_tell(bgzfHandle(vcf)))
 
   vcf.close()
 
@@ -645,7 +633,8 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
        (if noIndex: " (no index)" else: " (CSI indexed)"))
   emitSummary(ws)
 
-proc buildWorkQueue*(a, b: PreprocOutput, cfg: MatchConfig): seq[MatchJob] =
+proc buildWorkQueue*(a, b: PreprocOutput,
+                     cfg: MatchConfig): tuple[jobs: seq[MatchJob], fileList: seq[string]] =
   ## Emit one MatchJob per (chrom, svtype, binA) where:
   ##   - chrom is in both A and B for this svtype
   ##   - binA exists in A
@@ -653,15 +642,30 @@ proc buildWorkQueue*(a, b: PreprocOutput, cfg: MatchConfig): seq[MatchJob] =
   ##     threshold (max of the supplied --min-overlap / --min-jaccard values).
   ##
   ## Each job carries the path of A's per-(svtype, binA) BCF plus a table
-  ## mapping each adjacent populated B bin → B's per-(svtype, binB) BCF path.
+  ## mapping each adjacent populated B bin → (B's path, B's file index).
+  ##
+  ## Also returns fileList: a deduplicated ordered list of all slim-BCF paths.
+  ## FILE_IDX values in MatchJob fields are indices into this list.
   ##
   ## Job order: chrom in input header order, then svtype string, then binA.
 
   let threshold = cfg.threshold
 
-  # Index of chrom → header order for sorting. Use A's chromOrder; fall back
-  # to alphabetical for any chrom not in A's header (shouldn't happen since
-  # A is always the source we group by).
+  # Build the global file list from all A and B paths in sorted key order.
+  var fileList: seq[string]
+  var pathToIdx: Table[string, int16]
+  for key in a.paths.keys.toSeq.sorted:
+    let p = a.paths[key]
+    if p notin pathToIdx:
+      pathToIdx[p] = fileList.len.int16
+      fileList.add(p)
+  for key in b.paths.keys.toSeq.sorted:
+    let p = b.paths[key]
+    if p notin pathToIdx:
+      pathToIdx[p] = fileList.len.int16
+      fileList.add(p)
+
+  # Index of chrom → header order for sorting.
   var chromIdx: Table[string, int]
   for i, c in a.chromOrder:
     chromIdx[c] = i
@@ -674,16 +678,15 @@ proc buildWorkQueue*(a, b: PreprocOutput, cfg: MatchConfig): seq[MatchJob] =
     let adj = adjacentBins(binA, threshold, b.populatedBins[svt])
     if adj.len == 0: continue
 
-    # In self mode, A and B are the same callset. Restrict binsB to
-    # binB >= binA so each cross-bin pair (binA, binB) is processed once
-    # rather than twice — same-bin pairs still need result-level dedup
-    # via aOff < bOff, but cross-bin pairs are naturally one-way here.
-    var binsB: Table[int, string]
+    # In self mode, restrict binsB to binB >= binA so each cross-bin pair is
+    # processed once. Same-bin pairs are deduped in matchcore via srcIndexA < srcIndexB.
+    var binsB: Table[int, BinBEntry]
     for binB in adj:
       if cfg.selfMode and binB < binA: continue
       let bKey: SvtypeBin = (svt, binB)
       if bKey in b.paths:
-        binsB[binB] = b.paths[bKey]
+        let bPath = b.paths[bKey]
+        binsB[binB] = (path: bPath, fileIdx: pathToIdx[bPath])
     if binsB.len == 0: continue
 
     let chromsA = a.chromsBySvtype[svt]
@@ -691,8 +694,9 @@ proc buildWorkQueue*(a, b: PreprocOutput, cfg: MatchConfig): seq[MatchJob] =
     for chrom in chromsA:
       if chrom notin chromsB: continue
       jobs.add(MatchJob(
-        chrom:  chrom, svtype: svt, binA: binA,
-        pathA:  pathA, binsB: binsB,
+        chrom:    chrom, chromIdx: int16(chromIdx.getOrDefault(chrom, 0)),
+        svtype:   svt, binA: binA,
+        pathA:    pathA, fileIdxA: pathToIdx[pathA], binsB: binsB,
       ))
 
   # Stable sort: chrom (header order), then svtype string, then binA.
@@ -705,7 +709,7 @@ proc buildWorkQueue*(a, b: PreprocOutput, cfg: MatchConfig): seq[MatchJob] =
     cmp(x.binA, y.binA)
 
   jobs.sort(cmpJobs)
-  result = jobs
+  result = (jobs: jobs, fileList: fileList)
 
 proc removeTempBcfs*(paths: Table[SvtypeBin, string]) =
   ## Delete per-(svtype, bin) BCF temp files and their CSI indexes.

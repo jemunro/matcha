@@ -5,15 +5,13 @@
 ##   2. buildFinalHdr  — build shared output header (collapse-specific provenance).
 ##   3. integratedMerge (mergecore) — stream all N caller VCFs in lockstep via
 ##      one bcf_srs_t, normalize + filter + write per-(svtype, bin) merged BCFs.
-##   4. runMatchPairJobsWithPool (self-mode) — Pass 1 matching over merged BCFs.
-##   5. exploreMerged — Pass 2: enumerate allOffsets + passQualMap.
-##   6. clusterAll → selectRepresentative — cluster and pick representatives.
-##   7. writeOutput — stream merged BCFs, buffer representative records,
+##      Each record gets SRC_INDEX (global sequential) and CALLER_IDX (caller idx).
+##   4. runMatchPairJobsWithPool (self-mode, emitSingletons=true) — Pass 1.
+##   5. Build allOffsets from MatchPairs (singletons included).
+##   6. Scan merged BCFs for cluster members → passQualMap (replaces exploreMerged).
+##   7. clusterAll → selectRepresentative — cluster and pick representatives.
+##   8. writeOutput — stream merged BCFs, buffer representative records,
 ##      apply output-time INFO filter, sort by coordinate, write final VCF/BCF.
-##
-## MATCHA_BOFF in collapse is an opaque identity token: `(callerIdx << 48) |
-## monotonic_counter`. It is no longer a real BGZF offset. matchcore's
-## `selectRepresentative` still works (high 16 bits = caller index).
 
 import std/[algorithm, os, sets, strutils, tables]
 import hts
@@ -65,25 +63,6 @@ proc infoFieldDefs(h: ptr bcf_hdr_t): seq[(string, string, string, string)] =
 # ---------------------------------------------------------------------------
 # Pass 2 — enumerate allOffsets + PASS/QUAL from merged slim BCFs
 # ---------------------------------------------------------------------------
-
-proc exploreMerged(mergedPaths: Table[SvtypeBin, string]):
-    tuple[allOffsets: seq[int64];
-          passQualMap: Table[int64, tuple[hasPASS: bool; qual: float32]]] =
-  var seen: HashSet[int64]
-  var boffScratch: seq[int32]
-  for path in mergedPaths.values:
-    var vcf: VCF
-    if not open(vcf, path):
-      raise newException(IOError, "cannot open merged slim BCF: " & path)
-    for v in vcf:
-      let off = readBoff(v, boffScratch)
-      if off in seen: continue
-      seen.incl(off)
-      result.allOffsets.add(off)
-      let hasPASS = $v.FILTER == "PASS"
-      let qual = v.QUAL.float32
-      result.passQualMap[off] = (hasPASS: hasPASS, qual: qual)
-    vcf.close()
 
 # ---------------------------------------------------------------------------
 # buildFinalHdr — collapse-specific shared output header
@@ -165,9 +144,12 @@ proc buildFinalHdr(callers: seq[CallerInput]; mh: MergedHeader;
     discard bcf_hdr_append(result,
       "##INFO=<ID=POS2,Number=1,Type=Integer,Description=\"Position of mate breakend\">".cstring)
 
-  # Provenance / matcha-internal INFO defs.
+  # Matcha-internal INFO defs (needed for bcf_translate during merge).
   discard bcf_hdr_append(result,
-    "##INFO=<ID=MATCHA_BOFF,Number=2,Type=Integer,Description=\"matcha-internal: composite identity token (callerIdx<<48 | counter)\">".cstring)
+    "##INFO=<ID=SRC_INDEX,Number=1,Type=Integer,Description=\"matcha-internal: sequential record index\">".cstring)
+  discard bcf_hdr_append(result,
+    "##INFO=<ID=CALLER_IDX,Number=1,Type=Integer,Description=\"matcha-internal: caller index (0-based)\">".cstring)
+  # Provenance INFO defs.
   discard bcf_hdr_append(result,
     "##INFO=<ID=SOURCE,Number=1,Type=String,Description=\"Representative caller name\">".cstring)
   discard bcf_hdr_append(result,
@@ -229,25 +211,25 @@ proc writeOutput(cfg: CollapseConfig;
                  finalHdr: ptr bcf_hdr_t;
                  chromOrder: seq[string];
                  mergedPaths: Table[SvtypeBin, string];
-                 finalClusters: seq[seq[int64]]) =
-  ## Stream merged BCFs, pick records whose MATCHA_BOFF marks them as cluster
-  ## representatives, set provenance fields, apply output-time INFO filter,
-  ## sort by coordinate, write final VCF/BCF. Records are already in finalHdr
-  ## field-ID space (merged BCFs were written with dups of finalHdr).
+                 finalClusters: seq[seq[int32]];
+                 passQualMap: Table[int32, tuple[hasPASS: bool; qual: float32; callerIdx: int32]]) =
+  ## Stream merged BCFs, identify cluster representatives by SRC_INDEX,
+  ## set provenance fields, apply output-time INFO filter, sort by coordinate,
+  ## write final VCF/BCF.
 
-  # Build repProv: compositeOff (representative) → ClusterProv.
-  var repProv: Table[int64, ClusterProv]
+  # Build repProv: representative SRC_INDEX → ClusterProv.
+  var repProv: Table[int32, ClusterProv]
   for cl in finalClusters:
     if cl.len == 0: continue
-    let repOff = cl[0]
-    var callerIdxSeen: seq[int]
-    for off in cl:
-      let ci = int(off shr 48)
+    let repIdx = cl[0]
+    var callerIdxSeen: seq[int32]
+    for idx in cl:
+      let ci = passQualMap.getOrDefault(idx, (false, 0f32, 0'i32)).callerIdx
       if ci notin callerIdxSeen: callerIdxSeen.add(ci)
     callerIdxSeen.sort()
     var sourceList: seq[string]
     for ci in callerIdxSeen: sourceList.add(cfg.callers[ci].name)
-    repProv[repOff] = ClusterProv(
+    repProv[repIdx] = ClusterProv(
       sourceList: sourceList,
       nSource:    sourceList.len,
       nMerged:    cl.len,
@@ -257,12 +239,10 @@ proc writeOutput(cfg: CollapseConfig;
   var chromIdx: Table[string, int]
   for i, c in chromOrder.pairs: chromIdx[c] = i
 
-  # Output-time INFO filter: drops always-keep-but-not-user-requested fields.
-  # Provenance (SOURCE/SOURCELIST/N_SOURCE/N_MERGED) is always kept; MATCHA_BOFF
-  # is always dropped.
+  # Output-time INFO filter: SRC_INDEX and CALLER_IDX are internal — always drop.
   let infoFilter = cfg.infoFields
   proc keepInfoOut(name: string): bool =
-    if name == "MATCHA_BOFF": return false
+    if name in ["SRC_INDEX", "CALLER_IDX"]: return false
     if name in ["SOURCE", "SOURCELIST", "N_SOURCE", "N_MERGED"]: return true
     if infoFilter.len == 0: return true
     for tok in infoFilter:
@@ -271,16 +251,16 @@ proc writeOutput(cfg: CollapseConfig;
 
   # Stream merged BCFs, collect representatives.
   var buf: seq[BufferedRep]
-  var boffScratch: seq[int32]
+  var idxData: seq[int32]
   for path in mergedPaths.values:
     var vcf: VCF
     if not open(vcf, path):
       raise newException(IOError, "cannot open merged BCF: " & path)
 
     for v in vcf:
-      let off = readBoff(v, boffScratch)
-      if off notin repProv: continue
-      let prov = repProv[off]
+      let si = readSrcIndex(v, idxData)
+      if si notin repProv: continue
+      let prov = repProv[si]
 
       var slStr = prov.sourceList.join(",")
       discard v.info.set("SOURCELIST", slStr)
@@ -420,17 +400,18 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
     chromOrder:     chromOrder,
   )
 
-  # Phase 3: Pass 1 — self-match over merged slim BCFs.
+  # Phase 3: Pass 1 — self-match over merged slim BCFs (emitSingletons=true).
   logV("self-matching merged slim BCFs")
   let matchCfg = MatchConfig(
-    metric:    cfg.metric,
-    threshold: cfg.threshold,
-    bndSlop:   cfg.bndSlop,
-    nThreads:  cfg.nThreads,
-    tmpDir:    cfg.tmpDir,
-    selfMode:  true,
+    metric:         cfg.metric,
+    threshold:      cfg.threshold,
+    bndSlop:        cfg.bndSlop,
+    nThreads:       cfg.nThreads,
+    tmpDir:         cfg.tmpDir,
+    selfMode:       true,
+    emitSingletons: true,
   )
-  let jobs = buildWorkQueue(mergedPreproc, mergedPreproc, matchCfg)
+  let (jobs, fileList) = buildWorkQueue(mergedPreproc, mergedPreproc, matchCfg)
   logV("collapse self-match: " & $jobs.len & " job(s)")
   let allPairs = block:
     var r: seq[MatchPair]
@@ -439,24 +420,63 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
     r
   logV("self-match: " & $allPairs.len & " pair(s)")
 
-  # Phase 4: Pass 2 — enumerate allOffsets + PASS/QUAL from merged BCFs.
+  # Phase 4: Build allOffsets from MatchPairs; build locByIdx for retrieval.
   let simMap = buildSimilarityMap(allPairs)
-  let (allOffsets, passQualMap) = exploreMerged(im.paths)
-  logV("offsets seen: " & $allOffsets.len)
+  var seenOffsets: HashSet[int32]
+  var allOffsets: seq[int32]
+  var locByIdx: Table[int32, tuple[chromIdx: int16, pos: int32, fileIdx: int16]]
+  for p in allPairs:
+    if p.srcIndexA notin seenOffsets:
+      seenOffsets.incl(p.srcIndexA)
+      allOffsets.add(p.srcIndexA)
+      locByIdx[p.srcIndexA] = (p.chromIdx, p.posA, p.fileIdxA)
+    if p.srcIndexB != NO_MATCH and p.srcIndexB notin seenOffsets:
+      seenOffsets.incl(p.srcIndexB)
+      allOffsets.add(p.srcIndexB)
+      locByIdx[p.srcIndexB] = (p.chromIdx, p.posB, p.fileIdxB)
+  logV("unique records: " & $allOffsets.len)
 
-  # Phase 5: cluster and select representatives.
+  # Phase 5: cluster.
   let clusters = clusterAll(allOffsets, simMap, cfg.linkage, cfg.threshold)
-  var finalClusters: seq[seq[int64]]
+
+  # Build passQualMap via targeted CSI queries for all cluster members.
+  var allMemberIdxs: HashSet[int32]
+  for cl in clusters:
+    for idx in cl: allMemberIdxs.incl(idx)
+  var passQualMap: Table[int32, tuple[hasPASS: bool; qual: float32; callerIdx: int32]]
+  var idxData, ciData: seq[int32]
+  var membersByFile: Table[int16, seq[int32]]
+  for idx in allMemberIdxs:
+    let loc = locByIdx[idx]
+    membersByFile.mgetOrPut(loc.fileIdx, @[]).add(idx)
+  for fileIdx, members in membersByFile:
+    var vcf: VCF
+    if not open(vcf, fileList[fileIdx]):
+      raise newException(IOError, "cannot open merged BCF: " & fileList[fileIdx])
+    for idx in members:
+      let loc = locByIdx[idx]
+      let region = chromOrder[loc.chromIdx] & ":" & $loc.pos & "-" & $loc.pos
+      for v in vcf.query(region):
+        if readSrcIndex(v, idxData) != idx: continue
+        let ci = if v.info().get("CALLER_IDX", ciData) == Status.OK and ciData.len > 0:
+                   ciData[0] else: 0'i32
+        passQualMap[idx] = (hasPASS: $v.FILTER == "PASS",
+                            qual: v.QUAL.float32, callerIdx: ci)
+        break
+    vcf.close()
+
+  # Select representatives.
+  var finalClusters: seq[seq[int32]]
   for cl in clusters:
     let rep = selectRepresentative(cl, simMap, passQualMap, cfg.priority)
     var ordered = @[rep]
-    for off in cl:
-      if off != rep: ordered.add(off)
+    for idx in cl:
+      if idx != rep: ordered.add(idx)
     finalClusters.add(ordered)
   logV("clusters: " & $finalClusters.len)
 
   # Phase 6: write output.
-  writeOutput(cfg, finalHdr, chromOrder, im.paths, finalClusters)
+  writeOutput(cfg, finalHdr, chromOrder, im.paths, finalClusters, passQualMap)
 
   # Clean up: merged slim BCFs + CSI indexes, and finalHdr.
   removeTempBcfs(im.paths)

@@ -53,9 +53,11 @@ proc adjacentBins*(binA: int, threshold: float64,
 
 type
   BufferedRec* = object
-    pos*:     int64
-    endPos*:  int64
-    bOffset*: int64   ## BGZF virtual offset into the original source file
+    ## Cached B record for TiledBuffer.
+    pos*:      int64   ## POS of the B record
+    endPos*:   int64   ## END of the B record
+    srcIndex*: int32   ## SRC_INDEX INFO field value (identity + self-mode dedup key)
+    fileIdx*:  int16   ## Index into the run's slim-BCF file list
 
   TiledBuffer* = object
     tileWidth*: int64

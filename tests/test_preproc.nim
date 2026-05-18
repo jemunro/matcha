@@ -5,7 +5,6 @@ echo "--------------- Test Preproc ---------------"
 
 import std/[os, sets, strutils, tables, tempfiles]
 import hts
-import hts/private/hts_concat
 import test_utils
 import matcha/utils
 import matcha/preproc
@@ -17,18 +16,6 @@ setQuiet(true)
 
 const FixtureA = "tests/fixtures/fixtureA.vcf.gz"
 const FixtureB = "tests/fixtures/fixtureB.vcf.gz"
-
-# Local bindings for the P15 round-trip test. bgzf_seek is not bound by
-# vendored hts-nim; the parallel struct mirrors hts-nim's VCF prefix so we
-# can reach its private htsFile* / BGZF* without patching the vendored copy.
-proc bgzf_seek(fp: ptr BGZF, pos: int64, whence: cint): int64
-  {.cdecl, importc: "bgzf_seek", dynlib: "libhts.so".}
-
-type VcfPrivT = ref object of RootObj
-  hts: ptr htsFile
-
-proc rawHts(v: VCF): ptr htsFile {.inline.} = cast[VcfPrivT](v).hts
-proc rawBgzf(v: VCF): ptr BGZF {.inline.} = cast[VcfPrivT](v).hts.fp.bgzf
 
 # Convenience: paths key for "this svtype, bin 0" — the bin all the 1000bp
 # fixture records land in.
@@ -125,7 +112,7 @@ timed("P05", "buildWorkQueue: every job (chrom, svtype, binA) is reachable in bo
   defer: removeDir(tmpDir)
   let ppA = preprocessVcf(FixtureA, tmpDir, "A")
   let ppB = preprocessVcf(FixtureB, tmpDir, "B")
-  let jobs = buildWorkQueue(ppA, ppB, baseCfg())
+  let (jobs, _) = buildWorkQueue(ppA, ppB, baseCfg())
   doAssert jobs.len > 0, "expected at least one job"
   for job in jobs:
     doAssert (job.svtype, job.binA) in ppA.paths,
@@ -145,7 +132,7 @@ timed("P06", "buildWorkQueue: jobs ordered by VCF header chrom order"):
   defer: removeDir(tmpDir)
   let ppA = preprocessVcf(FixtureA, tmpDir, "A")
   let ppB = preprocessVcf(FixtureB, tmpDir, "B")
-  let jobs = buildWorkQueue(ppA, ppB, baseCfg())
+  let (jobs, _) = buildWorkQueue(ppA, ppB, baseCfg())
   # Map chrom → index in A's header order; jobs' chroms must be monotonic.
   var idx: Table[string, int]
   for i, c in ppA.chromOrder: idx[c] = i
@@ -197,8 +184,8 @@ timed("P08", "preprocessVcf: temp BCF records have only keep-set INFO fields"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
-  let allowedInterval = ["END", "MATCHA_BOFF"].toHashSet
-  let allowedBnd      = ["CHR2", "POS2", "MATCHA_BOFF"].toHashSet
+  let allowedInterval = ["END", "SRC_INDEX"].toHashSet
+  let allowedBnd      = ["CHR2", "POS2", "SRC_INDEX"].toHashSet
   for key, path in pp.paths:
     let allowed = if key.svtype == svBND: allowedBnd else: allowedInterval
     for rec in readRecords(path):
@@ -284,55 +271,28 @@ timed("P14", "preprocessVcf: inconsistent END/SVLEN → SVLEN := END-POS (TC17)"
       break
   doAssert found, "DEL_A_17_inconsistent missing from (DEL, 0) BCF"
 
-# P15 — MATCHA_BOFF round-trip via bgzf_seek into the original input
-timed("P15", "MATCHA_BOFF: bgzf_seek round-trip into original input"):
+# P15 — SRC_INDEX is present on every slim BCF record and values are unique
+timed("P15", "preprocessVcf: SRC_INDEX present and unique on slim BCF records"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
 
   var slim: VCF
   doAssert open(slim, pp.delBin0), "cannot open slim DEL BCF"
-  var boffData: seq[int32]
-  var slimChrom: string
-  var slimPos: int64
-  var slimId: string
-  var found = false
+  var idxData: seq[int32]
+  var seen: seq[int32]
   for v in slim:
-    if $v.ID == "DEL_A_01":
-      doAssert v.info.get("MATCHA_BOFF", boffData) == Status.OK,
-        "MATCHA_BOFF missing on slim DEL_A_01"
-      doAssert boffData.len == 2,
-        "MATCHA_BOFF should be Number=2, got len=" & $boffData.len
-      slimChrom = $v.CHROM
-      slimPos = v.POS
-      slimId = $v.ID
-      found = true
-      break
+    doAssert v.info.get("SRC_INDEX", idxData) == Status.OK,
+      "SRC_INDEX missing on record " & $v.ID
+    doAssert idxData.len == 1,
+      "SRC_INDEX should be Number=1, got len=" & $idxData.len
+    doAssert idxData[0] >= 0,
+      "SRC_INDEX should be non-negative, got " & $idxData[0]
+    doAssert idxData[0] notin seen,
+      "SRC_INDEX " & $idxData[0] & " duplicated"
+    seen.add(idxData[0])
   slim.close()
-  doAssert found, "DEL_A_01 missing from slim DEL BCF"
-
-  let offset = (int64(boffData[0]) shl 32) or
-               (int64(boffData[1]) and 0xFFFFFFFF'i64)
-  doAssert offset > 0, "decoded MATCHA_BOFF should be positive, got " & $offset
-
-  var orig: VCF
-  doAssert open(orig, FixtureA), "cannot open original fixture"
-  doAssert bgzf_seek(rawBgzf(orig), offset, 0.cint) >= 0,
-    "bgzf_seek failed for offset " & $offset
-
-  var rec = newVariant()
-  rec.vcf = orig
-  doAssert bcf_read(rawHts(orig), orig.header.hdr, rec.c) >= 0,
-    "bcf_read at offset " & $offset & " failed"
-  discard bcf_unpack(rec.c, BCF_UN_STR.cint)
-
-  doAssert $rec.CHROM == slimChrom,
-    "CHROM mismatch: slim=" & slimChrom & " orig=" & $rec.CHROM
-  doAssert rec.POS == slimPos,
-    "POS mismatch: slim=" & $slimPos & " orig=" & $rec.POS
-  doAssert $rec.ID == slimId,
-    "ID mismatch: slim=" & slimId & " orig=" & $rec.ID
-  orig.close()
+  doAssert seen.len > 0, "no records in slim DEL BCF"
 
 # P16 — large SV lands in a non-zero bin (DEL_A_08 = 5000bp → bin 3)
 timed("P16", "preprocessVcf: 5000bp DEL_A_08 lands in (DEL, bin 3)"):

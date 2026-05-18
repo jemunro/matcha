@@ -14,7 +14,7 @@
 import std/[os, sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
-import utils, matchcore, preproc, synced_bcf_reader
+import utils, preproc, synced_bcf_reader
 
 # ---------------------------------------------------------------------------
 # Types
@@ -58,7 +58,7 @@ type
     warnings*: seq[string]
 
 # Canonical pair key: always (min, max) so (a,b) and (b,a) collide.
-proc pairKey*(a, b: int64): (int64, int64) {.inline.} =
+proc pairKey*(a, b: int32): (int32, int32) {.inline.} =
   if a <= b: (a, b) else: (b, a)
 
 # ---------------------------------------------------------------------------
@@ -251,15 +251,17 @@ proc resolveHeaders*(callers: seq[CallerInput]): MergedHeader =
 # Similarity map (from MatchPair seq)
 # ---------------------------------------------------------------------------
 
-proc buildSimilarityMap*(pairs: seq[MatchPair]): Table[(int64, int64), float64] =
+proc buildSimilarityMap*(pairs: seq[MatchPair]): Table[(int32, int32), float64] =
   ## Build canonical-pair → similarity table from match pairs.
-  ## Canonical key: (min(aOff,bOff), max(aOff,bOff)).
+  ## Canonical key: (min(srcIndexA, srcIndexB), max(...)).
+  ## Singletons (srcIndexB == NO_MATCH) are skipped — they have no B partner.
   for p in pairs:
-    let key = pairKey(p.aOff, p.bOff)
+    if p.srcIndexB == NO_MATCH: continue
+    let key = pairKey(p.srcIndexA, p.srcIndexB)
     # Keep highest similarity if duplicate pairs arrive (shouldn't happen, but be safe).
     let cur = result.getOrDefault(key, 0.0)
-    if p.sim > cur:
-      result[key] = p.sim
+    if float64(p.sim) > cur:
+      result[key] = float64(p.sim)
 
 # ---------------------------------------------------------------------------
 # Union-find → connected components
@@ -292,13 +294,13 @@ proc union(uf: var UnionFind; x, y: int) =
     uf.parent[ry] = rx
     inc uf.rank[rx]
 
-proc buildComponents*(simMap: Table[(int64, int64), float64];
-                      allOffsets: seq[int64]): Table[int64, int] =
+proc buildComponents*(simMap: Table[(int32, int32), float64];
+                      allOffsets: seq[int32]): Table[int32, int] =
   ## Union-find over pairs → offset→componentId table.
   ## Singletons get their own component. ComponentIds are not contiguous.
   let n = allOffsets.len
   if n == 0: return
-  var offIdx: Table[int64, int]
+  var offIdx: Table[int32, int]
   for i, off in allOffsets.pairs:
     offIdx[off] = i
   var uf = initUnionFind(n)
@@ -316,24 +318,24 @@ proc buildComponents*(simMap: Table[(int64, int64), float64];
 
 type
   ClusterState = object
-    ## During agglomeration: each cluster is a set of member offsets.
-    members: seq[int64]   ## offsets in this cluster
+    ## During agglomeration: each cluster is a set of member SRC_INDEX values.
+    members: seq[int32]
     size:    int
 
-proc agglomerateComponent*(offsets: seq[int64];
-                            simMap: Table[(int64, int64), float64];
+proc agglomerateComponent*(offsets: seq[int32];
+                            simMap: Table[(int32, int32), float64];
                             linkage: LinkageMethod;
-                            threshold: float64): seq[seq[int64]] =
+                            threshold: float64): seq[seq[int32]] =
   ## Agglomerative clustering of one connected component.
-  ## Returns a seq of clusters (each cluster = seq[int64] of member offsets).
+  ## Returns a seq of clusters (each cluster = seq[int32] of member SRC_INDEX values).
   ## Singletons that never exceed threshold are returned as single-element clusters.
   if offsets.len == 0: return
   if offsets.len == 1:
     return @[@[offsets[0]]]
 
   let n = offsets.len
-  # idx→offset, offset→idx
-  var offIdx: Table[int64, int]
+  # idx→SRC_INDEX, SRC_INDEX→idx
+  var offIdx: Table[int32, int]
   for i, off in offsets.pairs:
     offIdx[off] = i
 
@@ -348,7 +350,7 @@ proc agglomerateComponent*(offsets: seq[int64];
       clusterSim[i][j] = simMap.getOrDefault(key, 0.0)
 
   # Track active cluster membership. Start: each record is its own cluster.
-  var members = newSeq[seq[int64]](n)
+  var members = newSeq[seq[int32]](n)
   for i in 0 ..< n:
     members[i] = @[offsets[i]]
   var sizes = newSeq[int](n)
@@ -402,13 +404,14 @@ proc agglomerateComponent*(offsets: seq[int64];
 # Representative selection
 # ---------------------------------------------------------------------------
 
-proc selectRepresentative*(cluster: seq[int64];
-                            simMap: Table[(int64, int64), float64];
-                            passQualMap: Table[int64, tuple[hasPASS: bool; qual: float32]];
-                            priority: seq[PriorityCriterion]): int64 =
+proc selectRepresentative*(cluster: seq[int32];
+                            simMap: Table[(int32, int32), float64];
+                            passQualMap: Table[int32, tuple[hasPASS: bool; qual: float32; callerIdx: int32]];
+                            priority: seq[PriorityCriterion]): int32 =
   ## Pick the representative record from a cluster using the priority cascade.
-  ## callerIdx is decoded from the high 16 bits of each composite offset.
-  ## Missing passQualMap entries default to (hasPASS=false, qual=0.0).
+  ## callerIdx comes from passQualMap (populated from CALLER_IDX INFO field in slim BCF).
+  ## Missing passQualMap entries default to (hasPASS=false, qual=0.0, callerIdx=high(int32)).
+  let missing = (hasPASS: false, qual: 0f32, callerIdx: high(int32))
   if cluster.len == 1: return cluster[0]
 
   var candidates = cluster
@@ -418,22 +421,22 @@ proc selectRepresentative*(cluster: seq[int64];
     case crit
     of pcPass:
       let passOnes = candidates.filterIt(
-        passQualMap.getOrDefault(it, (false, 0f32)).hasPASS)
+        passQualMap.getOrDefault(it, missing).hasPASS)
       if passOnes.len > 0: candidates = passOnes
     of pcQual:
-      var bestQ = passQualMap.getOrDefault(candidates[0], (false, 0f32)).qual
-      for off in candidates:
-        let q = passQualMap.getOrDefault(off, (false, 0f32)).qual
+      var bestQ = passQualMap.getOrDefault(candidates[0], missing).qual
+      for idx in candidates:
+        let q = passQualMap.getOrDefault(idx, missing).qual
         if q > bestQ: bestQ = q
       candidates = candidates.filterIt(
-        passQualMap.getOrDefault(it, (false, 0f32)).qual >= bestQ)
+        passQualMap.getOrDefault(it, missing).qual >= bestQ)
     of pcCentre:
       var bestMean = -1.0
-      for off in candidates:
+      for idx in candidates:
         var total = 0.0; var count = 0
         for other in cluster:
-          if other == off: continue
-          total += simMap.getOrDefault(pairKey(off, other), 0.0); inc count
+          if other == idx: continue
+          total += simMap.getOrDefault(pairKey(idx, other), 0.0); inc count
         let mean = if count > 0: total / float64(count) else: 0.0
         if mean > bestMean: bestMean = mean
       candidates = candidates.filterIt(
@@ -445,32 +448,35 @@ proc selectRepresentative*(cluster: seq[int64];
           let m = if c > 0: t / float64(c) else: 0.0
           m >= bestMean - 1e-12)
     of pcOrder:
-      var bestIdx = high(int)
-      for off in candidates:
-        let ci = int(off shr 48)
-        if ci < bestIdx: bestIdx = ci
-      candidates = candidates.filterIt(int(it shr 48) == bestIdx)
+      var bestCi = high(int32)
+      for idx in candidates:
+        let ci = passQualMap.getOrDefault(idx, missing).callerIdx
+        if ci < bestCi: bestCi = ci
+      let bestCiFinal = bestCi
+      candidates = candidates.filterIt(
+        passQualMap.getOrDefault(it, missing).callerIdx == bestCiFinal)
 
-  # Final tiebreak: lowest callerIdx, then lowest compositeOff for determinism.
+  # Final tiebreak: lowest callerIdx, then lowest SRC_INDEX for determinism.
   var best = candidates[0]
-  for off in candidates:
-    let mci = int(off shr 48); let bci = int(best shr 48)
-    if mci < bci: best = off
-    elif mci == bci and off < best: best = off
+  for idx in candidates:
+    let mci = passQualMap.getOrDefault(idx, missing).callerIdx
+    let bci = passQualMap.getOrDefault(best, missing).callerIdx
+    if mci < bci: best = idx
+    elif mci == bci and idx < best: best = idx
   best
 
 # ---------------------------------------------------------------------------
 # Cluster all records
 # ---------------------------------------------------------------------------
 
-proc clusterAll*(allOffsets: seq[int64];
-                 simMap: Table[(int64, int64), float64];
+proc clusterAll*(allOffsets: seq[int32];
+                 simMap: Table[(int32, int32), float64];
                  linkage: LinkageMethod;
-                 threshold: float64): seq[seq[int64]] =
+                 threshold: float64): seq[seq[int32]] =
   ## Build connected components, then agglomerate each independently.
   ## Missing pairs within a component are treated as similarity 0.
   let compId = buildComponents(simMap, allOffsets)
-  var byComp: Table[int, seq[int64]]
+  var byComp: Table[int, seq[int32]]
   for off in allOffsets:
     byComp.mgetOrPut(compId.getOrDefault(off, -1), @[]).add(off)
   for offsets in byComp.values:
@@ -506,7 +512,7 @@ proc collectFilterLines*(h: ptr bcf_hdr_t): seq[string] =
 
 const AlwaysKeepInMerged* = ["SVTYPE", "SVLEN", "END", "CHR2", "POS2",
                               "SOURCE", "SOURCELIST", "N_SOURCE", "N_MERGED",
-                              "MATCHA_BOFF"]
+                              "SRC_INDEX", "CALLER_IDX"]
 
 proc keepInfoForMerged*(name: string; infoFilter: seq[string]): bool =
   ## Keep set for INFO fields in the merged slim BCFs.
@@ -574,16 +580,17 @@ proc augmentSrcHdrForRenames*(srcHdr: ptr bcf_hdr_t; ci: int;
           ("##FORMAT=<ID=" & newName & ",Number=" & hi.number & ",Type=" & hi.typ &
            ",Description=\"" & hi.desc & "\">").cstring)
         break
-  # Also ensure SOURCE / MATCHA_BOFF / SV defs exist for the authoritative
-  # writes issued against srcHdr in the per-record loop.
+  # Also ensure SOURCE / SRC_INDEX / CALLER_IDX / SV defs exist for the
+  # authoritative writes issued against srcHdr in the per-record loop.
   proc ensureInfo(h: ptr bcf_hdr_t; name, num, typ, desc: string) =
     for hi in collectHrecs(h, BCF_HEADER_TYPE.BCF_HL_INFO.cint):
       if hi.id == name: return
     discard bcf_hdr_append(h,
       ("##INFO=<ID=" & name & ",Number=" & num & ",Type=" & typ &
        ",Description=\"" & desc & "\">").cstring)
-  ensureInfo(srcHdr, "MATCHA_BOFF", "2", "Integer", "matcha-internal identity token")
-  ensureInfo(srcHdr, "SOURCE",      "1", "String",  "Representative caller name")
+  ensureInfo(srcHdr, "SRC_INDEX",  "1", "Integer", "matcha-internal: sequential record index")
+  ensureInfo(srcHdr, "CALLER_IDX", "1", "Integer", "matcha-internal: caller index (0-based)")
+  ensureInfo(srcHdr, "SOURCE",     "1", "String",  "Representative caller name")
   ensureInfo(srcHdr, "SVTYPE",      "1", "String",  "Type of structural variant")
   ensureInfo(srcHdr, "SVLEN",       "1", "Integer", "Length of the SV")
   ensureInfo(srcHdr, "END",         "1", "Integer", "End position of the SV")
@@ -646,9 +653,11 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
         discard bcf_hdr_set_samples(srcHdr, cstring(nil), 0.cint)
     augmentSrcHdrForRenames(srcHdr, ci, mh)
 
-  # Per-caller WarnState + record counter.
+  # Per-caller WarnState + lineno counter (for synthetic ID generation).
+  # globalSrcIndex is a single counter across all callers for SRC_INDEX writes.
   var wsList: seq[WarnState]
-  var recCounter = newSeq[int64](nreaders)
+  var perCallerLineno = newSeq[int](nreaders)
+  var globalSrcIndex: int32 = 0
   for i in 0 ..< nreaders:
     wsList.add(initWarnState(callers[i].name))
 
@@ -680,12 +689,10 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
         let srcHdr = srs_get_header(sr, ci.cint)
         let rawRec = srs_get_line(sr, ci.cint)
 
-        let counter = recCounter[ci]
-        inc recCounter[ci]
-
         let rec = bcf_dup(rawRec)
+        inc perCallerLineno[ci]
 
-        let nr = normalizeRecord(srcHdr, rec, counter.int + 1,
+        let nr = normalizeRecord(srcHdr, rec, perCallerLineno[ci],
                                  wsList[ci], view, svtypeBuf, endBuf, svlenBuf,
                                  callers[ci].path)
         if not nr.ok:
@@ -759,11 +766,14 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
         discard bcf_update_info(srcHdr, rec, "SOURCE".cstring,
                                 srcStr[0].addr, srcStr.len.cint, BCF_HT_STR.cint)
 
-        # 2g. Set MATCHA_BOFF = (callerIdx << 48) | counter.
-        let compositeOff = (ci.int64 shl 48) or counter
-        var boffPair = encodeBoff(compositeOff)
-        discard bcf_update_info(srcHdr, rec, "MATCHA_BOFF".cstring,
-                                boffPair[0].addr, 2.cint, BCF_HT_INT.cint)
+        # 2g. Write SRC_INDEX (global sequential) and CALLER_IDX (which caller).
+        var srcIdxVal = globalSrcIndex
+        inc globalSrcIndex
+        var callerIdxVal = ci.int32
+        discard bcf_update_info(srcHdr, rec, "SRC_INDEX".cstring,
+                                srcIdxVal.addr, 1.cint, BCF_HT_INT.cint)
+        discard bcf_update_info(srcHdr, rec, "CALLER_IDX".cstring,
+                                callerIdxVal.addr, 1.cint, BCF_HT_INT.cint)
 
         # 2h. REF/ALT trim to keep records small (matchcore reads neither).
         discard bcf_update_alleles_str(srcHdr, rec, "N,.".cstring)

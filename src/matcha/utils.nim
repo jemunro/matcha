@@ -2,6 +2,8 @@
 
 import std/strutils
 
+const NO_MATCH* = -1'i32  ## Sentinel for srcIndexB / fileIdxB in singleton MatchPairs.
+
 type
   SvType* = enum
     svDEL = "DEL"
@@ -19,16 +21,20 @@ type
     mOverlap = "overlap"
     mJaccard = "jaccard"
 
-  MatchResult* = object
-    chromA*:     string   ## shared by both sides — match jobs are per-chromosome
-    posA*:       int64
-    endA*:       int64    ## ignored for svBND rows; emitted as "." in output
-    idA*:        string
-    posB*:       int64
-    endB*:       int64    ## ignored for svBND rows; emitted as "." in output
-    idB*:        string
-    svtype*:     SvType
-    similarity*: float64
+  MatchPair* = object
+    ## 28-byte match record produced by matchcore.
+    ## Layout: 4+4+4+4+4+2+2+2+1+1(pad) = 28 bytes.
+    ## posA/posB enable CSI `chrom:pos-pos` queries for O(1) slim-BCF resolution;
+    ## SRC_INDEX is the tiebreaker when multiple SVs share a position.
+    srcIndexA*: int32   ## Sequential index of A record (identity + join key).
+    srcIndexB*: int32   ## Sequential index of B record; NO_MATCH for singletons.
+    posA*:      int32   ## POS of A record — for CSI resolution query.
+    posB*:      int32   ## POS of B record; 0 for singletons.
+    sim*:       float32 ## Similarity score in [0,1]; 0.0 for singletons.
+    fileIdxA*:  int16   ## Index into the run's slim-BCF file list for A.
+    fileIdxB*:  int16   ## Index into the run's slim-BCF file list for B; NO_MATCH for singletons.
+    chromIdx*:  int16   ## Index into chromOrder (chrom shared by A and B in a job).
+    svtype*:    int8    ## SvType cast to int8; read back as SvType(pair.svtype).
 
   MatchConfig* = object
     metric*:          Metric   ## Active interval metric (mOverlap | mJaccard).
@@ -41,7 +47,9 @@ type
     callsetA*:        string
     callsetB*:        string
     selfMode*:        bool   ## When true, match callsetA against itself.
-                             ## callsetB is empty; pair dedup uses MATCHA_BOFF.
+                             ## callsetB is empty; pair dedup uses srcIndexA < srcIndexB.
+    emitSingletons*:  bool   ## When true, matchcore emits a MatchPair for every A
+                             ## record with no passing B match (collapse only).
 
 const SupportedSvTypes* = {svDEL, svDUP, svINV, svBND}
 
@@ -61,12 +69,3 @@ proc parseSvType*(s: string): SvType =
   of "INS": svINS
   of "TRA": svTRA
   else: svUNKNOWN
-
-proc formatMatchResult*(r: MatchResult): string =
-  ## Format a MatchResult as a tab-separated line (no trailing newline).
-  ## BND rows emit "." for END_A / END_B (BNDs are points, not intervals).
-  let endAStr = if r.svtype == svBND: "." else: $r.endA
-  let endBStr = if r.svtype == svBND: "." else: $r.endB
-  r.chromA & "\t" & $r.posA & "\t" & endAStr & "\t" & r.idA & "\t" &
-  r.chromA & "\t" & $r.posB & "\t" & endBStr & "\t" & r.idB & "\t" & $r.svtype & "\t" &
-  formatFloat(r.similarity, ffDecimal, 6)

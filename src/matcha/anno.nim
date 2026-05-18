@@ -7,9 +7,9 @@
 ##   1. Preproc A (default keep-set) and B (default keep-set ∪ user SRCFIELDs).
 ##   2. Match A vs B via runAnnoJob — extends runMatchJob to also pull the
 ##      user-requested INFO values off each B candidate during the same pass.
-##   3. Stream the *original* A file, capture each record's bgzf_tell offset,
-##      look up its match set in an in-memory map keyed by aOffset, apply
-##      aggregation functions, and write the annotated record.
+##   3. Stream the *original* A file, look up each record's SRC_INDEX in an
+##      in-memory map (Table[int32, seq[AnnoMatch]]), apply aggregation
+##      functions, and write the annotated record.
 
 import std/[algorithm, atomics, sequtils, sets, strutils, tables]
 import hts
@@ -60,7 +60,7 @@ type
     dbFields*:      seq[string]  ## deduped DB SRCFIELDs (excluding MATCHA_*)
 
   AnnoMatch* = object
-    aOffset*:    int64
+    aIndex*:     int32   ## SRC_INDEX of the A record (for grouping in phase 3)
     posB*:       int64
     similarity*: float64
     payload*:    Table[string, seq[string]]  ## DB srcField → stringified values
@@ -222,38 +222,45 @@ proc extractDbValues(v: Variant; dbFields: seq[string];
       if v.info().get(name, sBuf) == Status.OK and sBuf.len > 0:
         result[name] = sBuf.split(',')
 
-proc collectBFields(path, chrom: string; needed: HashSet[int64];
-                    dbFields: seq[string]; dbTypes: Table[string, string]):
-    Table[int64, tuple[posB: int64; payload: DbPayload]] =
-  ## Scan a slim B BCF for `chrom`, capturing POS and the requested DB INFO
-  ## values for every record whose MATCHA_BOFF is in `needed`. The slim B
-  ## BCFs already carry the user-requested DB fields (via preproc's
-  ## extraKeepInfo), so no original-file seek is required.
+proc collectBFieldsByPos(path, chrom: string; pairs: seq[MatchPair];
+                         dbFields: seq[string]; dbTypes: Table[string, string]):
+    Table[int32, tuple[posB: int64; payload: DbPayload]] =
+  ## Retrieve DB INFO values for each unique matched B record via targeted
+  ## CSI `chrom:posB-posB` queries — O(1) per unique position rather than
+  ## a full chrom scan. SRC_INDEX is the tiebreaker for same-position SVs.
+  var vcf: VCF
+  if not open(vcf, path):
+    raise newException(IOError, "cannot reopen slim B BCF: " & path)
+  var idxData: seq[int32]
   var iBuf: seq[int32]
   var fBuf: seq[float32]
   var sBuf: string
-  scanSlimBcf(path, chrom, needed):
-    result[off] = (v.POS, extractDbValues(v, dbFields, dbTypes, iBuf, fBuf, sBuf))
+  for p in pairs:
+    if p.srcIndexB == NO_MATCH or p.srcIndexB in result: continue
+    let region = chrom & ":" & $p.posB & "-" & $p.posB
+    for v in vcf.query(region):
+      if readSrcIndex(v, idxData) != p.srcIndexB: continue
+      result[p.srcIndexB] = (v.POS, extractDbValues(v, dbFields, dbTypes, iBuf, fBuf, sBuf))
+      break
+  vcf.close()
 
 proc resolveAnnoPairs(job: MatchJob; pairs: seq[MatchPair];
                       dbFields: seq[string];
                       dbTypes: Table[string, string]): seq[AnnoMatch] =
-  ## Materialise AnnoMatches by scanning each B slim BCF once for the
-  ## offsets that participated in at least one match. extractDbValues runs
-  ## only for matched B records — a net win over the previous design which
-  ## extracted DB INFO for every B fetched into a tile, even unmatched ones.
+  ## Materialise AnnoMatches by doing one targeted CSI query per unique matched
+  ## B position. Efficient for sparse A vs dense B database.
   if pairs.len == 0: return
-  var needB: HashSet[int64]
-  for p in pairs: needB.incl(p.bOff)
-  var fieldsB: Table[int64, tuple[posB: int64; payload: DbPayload]]
-  for _, pathB in job.binsB:
-    for off, f in collectBFields(pathB, job.chrom, needB, dbFields, dbTypes):
-      fieldsB[off] = f
+  var fieldsB: Table[int32, tuple[posB: int64; payload: DbPayload]]
+  for _, entry in job.binsB:
+    for si, f in collectBFieldsByPos(entry.path, job.chrom, pairs, dbFields, dbTypes):
+      fieldsB[si] = f
   for p in pairs:
-    let f = fieldsB[p.bOff]
+    if p.srcIndexB == NO_MATCH: continue
+    if p.srcIndexB notin fieldsB: continue
+    let f = fieldsB[p.srcIndexB]
     result.add(AnnoMatch(
-      aOffset:    p.aOff, posB: f.posB,
-      similarity: p.sim, payload: f.payload,
+      aIndex:     p.srcIndexA, posB: f.posB,
+      similarity: float64(p.sim), payload: f.payload,
     ))
 
 proc runAnnoJob*(job: MatchJob; cfg: AnnoConfig;
@@ -484,7 +491,7 @@ proc runAnno*(cfg: var AnnoConfig) =
     metric: cfg.metric, threshold: cfg.threshold,
     nThreads: cfg.nThreads, tmpDir: cfg.tmpDir, selfMode: false,
   )
-  let jobs = buildWorkQueue(filesA, filesB, matchCfg)
+  let (jobs, _) = buildWorkQueue(filesA, filesB, matchCfg)
   logV("anno work queue: " & $jobs.len & " (chrom, svtype, binA) job(s)")
 
   # --- Phase 2: matching with B-INFO extraction -----------------------------
@@ -513,15 +520,15 @@ proc runAnno*(cfg: var AnnoConfig) =
         joinThread(threads[i])
       jobResults = state.results
 
-  # Group matches by aOffset.
-  var byAoff = initTable[int64, seq[AnnoMatch]]()
+  # Group matches by aIndex (SRC_INDEX of the A record).
+  var byAindex = initTable[int32, seq[AnnoMatch]]()
   var totalMatches = 0
   for jrs in jobResults:
     for m in jrs:
-      byAoff.mgetOrPut(m.aOffset, @[]).add(m)
+      byAindex.mgetOrPut(m.aIndex, @[]).add(m)
       inc totalMatches
   logV("anno: collected " & $totalMatches & " match(es) over " &
-       $byAoff.len & " annotated A record(s)")
+       $byAindex.len & " annotated A record(s)")
 
   # --- Phase 3: stream original A, write annotated output -------------------
   var vcfA: VCF
@@ -557,16 +564,17 @@ proc runAnno*(cfg: var AnnoConfig) =
     if outIdx == nil:
       raise newException(IOError, "cannot create CSI index for: " & outPath)
 
-  # bgzf_tell prime + update mirrors preproc's offset capture.
-  var nextOffset = int64(bgzf_tell(bgzfHandle(vcfA)))
+  # Stream original A, joining on SRC_INDEX (same counter preproc assigned).
+  var srcIdx: int32 = 0
   var nInput = 0
   var nAnnotated = 0
   var endBuf: seq[int32]
   for v in vcfA:
-    let recOff = nextOffset
+    let curIdx = srcIdx
+    inc srcIdx
     inc nInput
-    if recOff in byAoff:
-      let matches = byAoff[recOff]
+    if curIdx in byAindex:
+      let matches = byAindex[curIdx]
       for e in cfg.exprs:
         let vals = applyAggFunc(e, matches)
         setInfoValues(v, e, vals)
@@ -589,7 +597,6 @@ proc runAnno*(cfg: var AnnoConfig) =
         else:
           int64(v.c.pos + v.c.rlen)
       discard hts_idx_push(outIdx, v.c.rid, v.c.pos, endPos, woff, 1)
-    nextOffset = int64(bgzf_tell(bgzfHandle(vcfA)))
 
   vcfA.close()
   if outIdx != nil:

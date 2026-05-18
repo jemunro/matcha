@@ -1,94 +1,32 @@
-## match.nim — match-mode driver: per-job matching adapter over matchcore,
-## per-job slim-BCF resolution into MatchResult, thread pool, output assembly.
+## match.nim — match-mode driver: per-job pair streaming, thread pool,
+## main-thread chr:pos resolution, and TSV output.
 ##
-## matchcore.streamJobPairs / streamBndJobPairs return only (aOff, bOff, sim).
-## This adapter resolves the (chrom, posA, endA, idA, posB, endB, idB) fields
-## by re-scanning the per-job slim BCFs once each for `job.chrom`, picking
-## records up by INFO/MATCHA_BOFF. Slim BCFs are keep-set only (no FORMAT or
-## samples) so this pass is cheap. svtype and chrom come from `job` directly.
+## Workers return MatchPair triples (no resolution). The main thread opens
+## slim BCF handles from fileList, queries each representative position via
+## CSI `chrom:pos-pos`, and writes TSV rows directly — no MatchResult type.
 
-import std/[atomics, sets, tables]
+import std/[atomics, strutils]
 import hts
 import utils, preproc, log, matchcore
 
 # ---------------------------------------------------------------------------
-# Per-job resolution: slim-BCF MATCHA_BOFF → (POS, END, ID) for output rows
+# Chr:pos slim-BCF resolution (main thread only)
 # ---------------------------------------------------------------------------
 
-type SlimFields = tuple[pos, endP: int64; id: string]
-
-proc collectFields(path, chrom: string; needed: HashSet[int64];
-                   bnd: bool): Table[int64, SlimFields] =
-  ## Scan a slim BCF for `chrom`, capturing (POS, END, ID) keyed by
-  ## MATCHA_BOFF for every record whose offset is in `needed`. For BND
-  ## records endP=0 so the output renders as '.'.
-  var endData, svlenData: seq[int32]
-  scanSlimBcf(path, chrom, needed):
-    if bnd:
-      result[off] = (v.POS, 0'i64, $v.ID)
-    else:
-      var endP: int64
-      if not extractEnd(v, endData, svlenData, endP): continue
-      result[off] = (v.POS, endP, $v.ID)
-
-proc resolveIntervalPairs(job: MatchJob; pairs: seq[MatchPair]): seq[MatchResult] =
-  if pairs.len == 0: return
-  var needA, needB: HashSet[int64]
-  for p in pairs:
-    needA.incl(p.aOff); needB.incl(p.bOff)
-  let fieldsA = collectFields(job.pathA, job.chrom, needA, bnd = false)
-  var fieldsB: Table[int64, SlimFields]
-  for _, pathB in job.binsB:
-    for off, f in collectFields(pathB, job.chrom, needB, bnd = false):
-      fieldsB[off] = f
-  for p in pairs:
-    let fA = fieldsA[p.aOff]
-    let fB = fieldsB[p.bOff]
-    result.add(MatchResult(
-      chromA:     job.chrom,
-      posA:       fA.pos, endA: fA.endP, idA: fA.id,
-      posB:       fB.pos, endB: fB.endP, idB: fB.id,
-      svtype:     job.svtype,
-      similarity: p.sim,
-    ))
-
-proc resolveBndPairs(job: MatchJob; pairs: seq[MatchPair]): seq[MatchResult] =
-  if pairs.len == 0: return
-  var needA, needB: HashSet[int64]
-  for p in pairs:
-    needA.incl(p.aOff); needB.incl(p.bOff)
-  let fieldsA = collectFields(job.pathA, job.chrom, needA, bnd = true)
-  let fieldsB = collectFields(job.binsB[0], job.chrom, needB, bnd = true)
-  for p in pairs:
-    let fA = fieldsA[p.aOff]
-    let fB = fieldsB[p.bOff]
-    result.add(MatchResult(
-      chromA:     job.chrom,
-      posA:       fA.pos, endA: 0, idA: fA.id,
-      posB:       fB.pos, endB: 0, idB: fB.id,
-      svtype:     svBND,
-      similarity: p.sim,
-    ))
+proc resolveRecord(vcf: VCF; chrom: string; pos, srcIndex: int32;
+                   bnd: bool; idxScratch, endScratch: var seq[int32]
+                  ): tuple[id: string; endP: int64] =
+  ## CSI query `chrom:pos-pos`; return (ID, END) for the record whose
+  ## SRC_INDEX matches `srcIndex`. END is 0 for BND (rendered as ".").
+  for v in vcf.query(chrom & ":" & $pos & "-" & $pos):
+    if readSrcIndex(v, idxScratch) != srcIndex: continue
+    var endP: int64
+    if not bnd:
+      discard extractEnd(v, endScratch, endScratch, endP)
+    return (id: $v.ID, endP: endP)
 
 # ---------------------------------------------------------------------------
-# Per-job entrypoints (used by the thread pool and direct callers)
-# ---------------------------------------------------------------------------
-
-proc dispatchPairJob*(job: MatchJob, cfg: MatchConfig): seq[MatchPair] =
-  ## Stream (aOff, bOff, sim) triples for one job from matchcore. Used
-  ## directly by collapse, and as the first step in dispatchMatchJob.
-  ## Self-mode dedup happens inside matchcore.
-  if job.svtype == svBND: streamBndJobPairs(job, cfg)
-  else:                   streamJobPairs(job, cfg)
-
-proc dispatchMatchJob*(job: MatchJob, cfg: MatchConfig): seq[MatchResult] =
-  ## Pairs from dispatchPairJob plus slim-BCF resolution into MatchResults.
-  let pairs = dispatchPairJob(job, cfg)
-  if job.svtype == svBND: resolveBndPairs(job, pairs)
-  else:                   resolveIntervalPairs(job, pairs)
-
-# ---------------------------------------------------------------------------
-# Generic per-job thread pool — parameterized on the per-job result type
+# Generic per-job thread pool
 # ---------------------------------------------------------------------------
 
 type
@@ -100,7 +38,7 @@ type
     next:    Atomic[int]
     results: seq[seq[R]]
     runner:  JobRunner[R]
-    label:   string   # "matches" / "pairs", for log lines only
+    label:   string
 
 proc poolWorker[R](state: ptr PoolState[R]) {.thread.} =
   {.cast(gcsafe).}:
@@ -114,10 +52,6 @@ proc poolWorker[R](state: ptr PoolState[R]) {.thread.} =
 
 proc runJobsWithPool[R](jobs: seq[MatchJob]; cfg: MatchConfig;
                         runner: JobRunner[R]; label: string): seq[seq[R]] =
-  ## Dispatch `jobs` across `cfg.nThreads` workers, calling `runner` per job.
-  ## Each worker pulls indexes via an atomic counter; results land in the
-  ## per-job slot. The state lives on this proc's stack and all threads are
-  ## joined before return.
   result = newSeq[seq[R]](jobs.len)
   if jobs.len == 0: return
   if cfg.nThreads == 1:
@@ -140,14 +74,12 @@ proc runJobsWithPool[R](jobs: seq[MatchJob]; cfg: MatchConfig;
     result = state.results
     logV(label & " workers complete")
 
-proc runMatchJobsWithPool*(jobs: seq[MatchJob]; cfg: MatchConfig): seq[seq[MatchResult]] =
-  ## Full MatchResult pipeline: pair streaming + slim-BCF resolution.
-  runJobsWithPool[MatchResult](jobs, cfg, dispatchMatchJob, "matches")
+proc dispatchPairJob*(job: MatchJob, cfg: MatchConfig): seq[MatchPair] =
+  ## Stream MatchPairs for one job. Used by match, collapse, and anno.
+  if job.svtype == svBND: streamBndJobPairs(job, cfg)
+  else:                   streamJobPairs(job, cfg)
 
 proc runMatchPairJobsWithPool*(jobs: seq[MatchJob]; cfg: MatchConfig): seq[seq[MatchPair]] =
-  ## Pair-only pipeline: returns (aOff, bOff, sim) triples without the
-  ## slim-BCF resolution pass. Used by collapse, which only consumes
-  ## triples via buildSimilarityMap.
   runJobsWithPool[MatchPair](jobs, cfg, dispatchPairJob, "pairs")
 
 # ---------------------------------------------------------------------------
@@ -163,7 +95,7 @@ proc runMatch*(cfg: MatchConfig) =
     logV("self mode: preprocessing single input")
     filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A",
                            ioThreads = if cfg.nThreads >= 2: 2 else: 0)
-    filesB = filesA   # same paths, bins, chroms — dedup happens later
+    filesB = filesA
   elif cfg.nThreads >= 2:
     logV("preprocessing A and B in parallel")
     (filesA, filesB) = runParallelPreproc(
@@ -173,34 +105,54 @@ proc runMatch*(cfg: MatchConfig) =
     filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A")
     filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B")
 
-  var jobs = buildWorkQueue(filesA, filesB, cfg)
+  let (jobs, fileList) = buildWorkQueue(filesA, filesB, cfg)
   logV("work queue: " & $jobs.len & " (chrom, svtype, binA) job(s)")
   if jobs.len == 0:
     return
 
-  let jobResults = runMatchJobsWithPool(jobs, cfg)
+  let jobResults = runMatchPairJobsWithPool(jobs, cfg)
 
-  # Write the header line plus all matches in deterministic (job-sorted) order.
+  # Open slim BCF handles lazily, indexed by position in fileList.
+  var slimHandles = newSeq[VCF](fileList.len)
+  for i, path in fileList:
+    if not open(slimHandles[i], path):
+      raise newException(IOError, "cannot open slim BCF: " & path)
+
+  let chromOrder = filesA.chromOrder
   let outFile =
-    if cfg.outputPath == "": stdout
+    if isStdoutPath(cfg.outputPath): stdout
     else: open(cfg.outputPath, fmWrite)
 
   outFile.writeLine("##matcha_metric=" & $cfg.metric)
   outFile.writeLine(OutputHeader)
 
   var totalMatches = 0
+  var idxScratch, endScratch: seq[int32]
+
   for jrs in jobResults:
-    for mr in jrs:
-      outFile.writeLine(formatMatchResult(mr))
+    for p in jrs:
+      if p.srcIndexB == NO_MATCH: continue   # skip singletons
+      let bnd = SvType(p.svtype) == svBND
+      let chrom = chromOrder[p.chromIdx]
+      let fA = resolveRecord(slimHandles[p.fileIdxA], chrom, p.posA, p.srcIndexA,
+                             bnd, idxScratch, endScratch)
+      let fB = resolveRecord(slimHandles[p.fileIdxB], chrom, p.posB, p.srcIndexB,
+                             bnd, idxScratch, endScratch)
+      let endAStr = if bnd: "." else: $fA.endP
+      let endBStr = if bnd: "." else: $fB.endP
+      outFile.writeLine(
+        chrom & "\t" & $p.posA & "\t" & endAStr & "\t" & fA.id & "\t" &
+        chrom & "\t" & $p.posB & "\t" & endBStr & "\t" & fB.id & "\t" &
+        $SvType(p.svtype) & "\t" & formatFloat(float64(p.sim), ffDecimal, 6))
       inc totalMatches
 
-  if cfg.outputPath != "":
+  for h in slimHandles.mitems: h.close()
+
+  if not isStdoutPath(cfg.outputPath):
     outFile.close()
   logV("wrote " & $totalMatches & " match(es)" &
-       (if cfg.outputPath != "": " to " & cfg.outputPath else: " to stdout"))
+       (if not isStdoutPath(cfg.outputPath): " to " & cfg.outputPath else: " to stdout"))
 
-  # Clean up temp BCFs (per-(svtype, bin) files for both callsets).
-  # In self mode, filesB aliases filesA — skip the second cleanup.
   removeTempBcfs(filesA.paths)
   if not cfg.selfMode:
     removeTempBcfs(filesB.paths)

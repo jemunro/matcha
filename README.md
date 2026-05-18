@@ -8,7 +8,7 @@ Compiled, efficient structural variant (SV) matching and annotation tool written
 |---|---|
 | `matcha match` — pairwise matching between two SV callsets | complete |
 | `matcha anno` — annotate a query callset from a population database VCF | complete |
-| `matcha collapse` — cluster SVs from multiple callers within one sample, emit one representative per cluster | complete (single-sample enforcement pending) |
+| `matcha collapse` — cluster SVs from multiple callers within one sample, emit one representative per cluster | complete |
 | `matcha merge` — merge SVs across samples into a cohort pVCF | planned |
 
 DEL/DUP/INV match by coordinate + size (reciprocal overlap or Jaccard). BND records match by breakend proximity. INS is out of scope (silent skip). Genotypes are ignored.
