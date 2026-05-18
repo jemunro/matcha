@@ -609,7 +609,7 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
       discard writers[key].write_variant(v)
       if not noIndex:
         let woff = uint64(bgzf_tell(bgzfHandle(writers[key])))
-        discard hts_idx_push(indexes[key], v.c.rid, int64(v.c.pos), endPos, woff, 1)
+        discard hts_idx_push(indexes[key], v.c.rid, int64(v.c.pos), int64(v.c.pos) + int64(v.c.rlen), woff, 1)
       result.chromsBySvtype[svt].incl($v.CHROM)
       inc ws.nKept
 

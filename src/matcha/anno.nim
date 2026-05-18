@@ -560,7 +560,6 @@ proc runAnno*(cfg: var AnnoConfig) =
   var srcIdx: int32 = 0
   var nInput = 0
   var nAnnotated = 0
-  var endBuf: seq[int32]
   for v in vcfA:
     let curIdx = srcIdx
     inc srcIdx
@@ -583,12 +582,7 @@ proc runAnno*(cfg: var AnnoConfig) =
       raise newException(IOError, "failed to write variant at " &
         $v.CHROM & ":" & $v.POS)
     if outIdx != nil:
-      let endPos =
-        if v.info.get("END", endBuf) == Status.OK and endBuf.len > 0:
-          int64(endBuf[0])
-        else:
-          int64(v.c.pos + v.c.rlen)
-      discard hts_idx_push(outIdx, v.c.rid, v.c.pos, endPos, woff, 1)
+      discard hts_idx_push(outIdx, v.c.rid, v.c.pos, int64(v.c.pos + v.c.rlen), woff, 1)
 
   vcfA.close()
   if outIdx != nil:

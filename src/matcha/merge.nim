@@ -722,14 +722,36 @@ proc writeMergeOutput(cfg: MergeConfig;
   outVcf.header.hdr = outputHdr  # SHARED — clear before close to avoid double-free
   discard outVcf.write_header()
 
+  let isBgzf = not isStdoutPath(cfg.outputPath) and
+               (cfg.outputPath.endsWith(".bcf") or cfg.outputPath.endsWith(".vcf.gz"))
+  if cfg.nThreads >= 2 and isBgzf:
+    discard bgzf_mt(bgzfHandle(outVcf), 2, 128)
+  var outIdx: ptr hts_idx_t = nil
+  if isBgzf:
+    let headerOff = uint64(bgzf_tell(bgzfHandle(outVcf)))
+    outIdx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
+    if outIdx == nil:
+      raise newException(IOError, "cannot create CSI index for: " & outPath)
+
   for br in bufRows:
+    let woff = uint64(bgzf_tell(bgzfHandle(outVcf)))
     discard bcf_write(vcfHtsFile(outVcf), outputHdr, br.rec)
+    if outIdx != nil:
+      discard hts_idx_push(outIdx, br.rec.rid, int64(br.rec.pos),
+                           int64(br.rec.pos) + int64(br.rec.rlen), woff, 1)
     bcf_destroy(br.rec)
 
+  if outIdx != nil:
+    let finalOff = uint64(bgzf_tell(bgzfHandle(outVcf)))
+    hts_idx_finish(outIdx, finalOff)
   outVcf.header.hdr = nil
   outVcf.close()
   logV("merge: wrote " & $bufRows.len & " record(s) to " &
        (if isStdoutPath(cfg.outputPath): "stdout" else: cfg.outputPath))
+  if outIdx != nil:
+    hts_idx_save(outIdx, cfg.outputPath.cstring, HTS_FMT_CSI.cint)
+    hts_idx_destroy(outIdx)
+    logV("indexed " & cfg.outputPath)
 
 # ---------------------------------------------------------------------------
 # runMerge — top-level entry point
