@@ -38,6 +38,7 @@ Options:
   --min-jaccard FLOAT    minimum Jaccard index (0.0–1.0)       ←
   --bnd-slop INT         max breakend offset for BND matches (default: 100)
   --self                 match a single input against itself
+  --info FIELDS          comma-separated INFO fields to include as INFO_A/INFO_B columns
   --threads INT          worker threads (default: 1)
   --tmp-dir PATH         temp directory (default: system temp)
   --output PATH          output file (default: stdout)
@@ -63,10 +64,17 @@ Tab-separated. Skip comment lines with `grep -v ^#` or `awk '!/^#/'`.
 
 ```
 ##matcha_metric=<overlap|jaccard>
-#CHROM_A  POS_A  END_A  ID_A  CHROM_B  POS_B  END_B  ID_B  SVTYPE  SIMILARITY
+#CHROM_A  POS_A  ID_A  CHROM_B  POS_B  ID_B  SVTYPE  SIMILARITY
 ```
 
-BND rows emit `.` for `END_A` and `END_B`. `CHROM_A` and `CHROM_B` are always equal in the current matcher (each job is per-chromosome); the two columns make the schema explicit for future cross-chrom pairing.
+`CHROM_A` and `CHROM_B` are always equal (each job is per-chromosome).
+
+With `--info SVLEN,END,AF` two extra columns are inserted — `INFO_A` after `ID_A` and `INFO_B` after `ID_B` — containing the requested fields in VCF INFO format (`KEY=VALUE;KEY=VALUE`). Fields absent on a record are omitted from that cell; `.` is emitted when none are present.
+
+```
+#CHROM_A  POS_A  ID_A  INFO_A  CHROM_B  POS_B  ID_B  INFO_B  SVTYPE  SIMILARITY
+chr1      1000   DEL_A_01  SVLEN=-1000;END=2000  chr1  1000  DEL_B_01  SVLEN=-1000;END=2000  DEL  1.000000
+```
 
 ---
 

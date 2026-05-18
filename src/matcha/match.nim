@@ -5,7 +5,7 @@
 ## slim BCF handles from fileList, queries each representative position via
 ## CSI `chrom:pos-pos`, and writes TSV rows directly — no MatchResult type.
 
-import std/[atomics, strutils]
+import std/[atomics, sequtils, strutils]
 import hts
 import utils, preproc, log, matchcore
 
@@ -13,17 +13,32 @@ import utils, preproc, log, matchcore
 # Chr:pos slim-BCF resolution (main thread only)
 # ---------------------------------------------------------------------------
 
+proc formatExtraInfo(v: Variant; fields: seq[string];
+                     iBuf: var seq[int32]; fBuf: var seq[float32];
+                     sBuf: var string): string =
+  ## Emit requested INFO fields as semicolon-delimited KEY=VALUE pairs (VCF style).
+  ## Absent fields are silently omitted; returns "." when nothing is present.
+  var parts: seq[string]
+  for name in fields:
+    if v.info().get(name, iBuf) == Status.OK and iBuf.len > 0:
+      parts.add(name & "=" & iBuf.mapIt($it).join(","))
+    elif v.info().get(name, fBuf) == Status.OK and fBuf.len > 0:
+      parts.add(name & "=" & fBuf.mapIt(formatFloat(float64(it), ffDecimal, 6)).join(","))
+    elif v.info().get(name, sBuf) == Status.OK and sBuf.len > 0:
+      parts.add(name & "=" & sBuf)
+  if parts.len == 0: "." else: parts.join(";")
+
 proc resolveRecord(vcf: VCF; chrom: string; pos, srcIndex: int32;
-                   bnd: bool; idxScratch, endScratch: var seq[int32]
-                  ): tuple[id: string; endP: int64] =
-  ## CSI query `chrom:pos-pos`; return (ID, END) for the record whose
-  ## SRC_INDEX matches `srcIndex`. END is 0 for BND (rendered as ".").
+                   infoFields: seq[string]; idxScratch: var seq[int32];
+                   iBuf: var seq[int32]; fBuf: var seq[float32]; sBuf: var string
+                  ): tuple[id: string; infoStr: string] =
+  ## CSI query `chrom:pos-pos`; return (ID, INFO_str) for the record whose
+  ## SRC_INDEX matches `srcIndex`.
   for v in vcf.query(chrom & ":" & $pos & "-" & $pos):
     if readSrcIndex(v, idxScratch) != srcIndex: continue
-    var endP: int64
-    if not bnd:
-      discard extractEnd(v, endScratch, endScratch, endP)
-    return (id: $v.ID, endP: endP)
+    let infoStr = if infoFields.len > 0: formatExtraInfo(v, infoFields, iBuf, fBuf, sBuf)
+                  else: ""
+    return (id: $v.ID, infoStr: infoStr)
 
 # ---------------------------------------------------------------------------
 # Generic per-job thread pool
@@ -90,20 +105,24 @@ proc runMatch*(cfg: MatchConfig) =
   logV("matcha match: A=" & cfg.callsetA & " B=" & cfg.callsetB &
        " threads=" & $cfg.nThreads & " tmp=" & cfg.tmpDir)
 
+  let extra = cfg.infoFields   # shorthand
+
   var filesA, filesB: PreprocOutput
   if cfg.selfMode:
     logV("self mode: preprocessing single input")
-    filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A",
+    filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A", extra,
                            ioThreads = if cfg.nThreads >= 2: 2 else: 0)
     filesB = filesA
   elif cfg.nThreads >= 2:
     logV("preprocessing A and B in parallel")
     (filesA, filesB) = runParallelPreproc(
-      PreprocInput(path: cfg.callsetA, tmpDir: cfg.tmpDir, prefix: "A", ioThreads: 2),
-      PreprocInput(path: cfg.callsetB, tmpDir: cfg.tmpDir, prefix: "B", ioThreads: 2))
+      PreprocInput(path: cfg.callsetA, tmpDir: cfg.tmpDir, prefix: "A",
+                   extraKeep: extra, ioThreads: 2),
+      PreprocInput(path: cfg.callsetB, tmpDir: cfg.tmpDir, prefix: "B",
+                   extraKeep: extra, ioThreads: 2))
   else:
-    filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A")
-    filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B")
+    filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A", extra)
+    filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B", extra)
 
   let (jobs, fileList) = buildWorkQueue(filesA, filesB, cfg)
   logV("work queue: " & $jobs.len & " (chrom, svtype, binA) job(s)")
@@ -112,7 +131,6 @@ proc runMatch*(cfg: MatchConfig) =
 
   let jobResults = runMatchPairJobsWithPool(jobs, cfg)
 
-  # Open slim BCF handles lazily, indexed by position in fileList.
   var slimHandles = newSeq[VCF](fileList.len)
   for i, path in fileList:
     if not open(slimHandles[i], path):
@@ -124,26 +142,37 @@ proc runMatch*(cfg: MatchConfig) =
     else: open(cfg.outputPath, fmWrite)
 
   outFile.writeLine("##matcha_metric=" & $cfg.metric)
-  outFile.writeLine(OutputHeader)
+  if extra.len == 0:
+    outFile.writeLine(OutputHeader)
+  else:
+    outFile.writeLine(
+      "#CHROM_A\tPOS_A\tID_A\tINFO_A\tCHROM_B\tPOS_B\tID_B\tINFO_B\tSVTYPE\tSIMILARITY")
 
   var totalMatches = 0
-  var idxScratch, endScratch: seq[int32]
+  var idxScratch, iBuf: seq[int32]
+  var fBuf: seq[float32]
+  var sBuf: string
 
   for jrs in jobResults:
     for p in jrs:
-      if p.srcIndexB == NO_MATCH: continue   # skip singletons
-      let bnd = SvType(p.svtype) == svBND
-      let chrom = chromOrder[p.chromIdx]
+      if p.srcIndexB == NO_MATCH: continue
+      let chrom  = chromOrder[p.chromIdx]
+      let simStr = formatFloat(float64(p.sim), ffDecimal, 6)
+      let svStr  = $SvType(p.svtype)
       let fA = resolveRecord(slimHandles[p.fileIdxA], chrom, p.posA, p.srcIndexA,
-                             bnd, idxScratch, endScratch)
+                             extra, idxScratch, iBuf, fBuf, sBuf)
       let fB = resolveRecord(slimHandles[p.fileIdxB], chrom, p.posB, p.srcIndexB,
-                             bnd, idxScratch, endScratch)
-      let endAStr = if bnd: "." else: $fA.endP
-      let endBStr = if bnd: "." else: $fB.endP
-      outFile.writeLine(
-        chrom & "\t" & $p.posA & "\t" & endAStr & "\t" & fA.id & "\t" &
-        chrom & "\t" & $p.posB & "\t" & endBStr & "\t" & fB.id & "\t" &
-        $SvType(p.svtype) & "\t" & formatFloat(float64(p.sim), ffDecimal, 6))
+                             extra, idxScratch, iBuf, fBuf, sBuf)
+      if extra.len == 0:
+        outFile.writeLine(
+          chrom & "\t" & $p.posA & "\t" & fA.id & "\t" &
+          chrom & "\t" & $p.posB & "\t" & fB.id & "\t" &
+          svStr & "\t" & simStr)
+      else:
+        outFile.writeLine(
+          chrom & "\t" & $p.posA & "\t" & fA.id & "\t" & fA.infoStr & "\t" &
+          chrom & "\t" & $p.posB & "\t" & fB.id & "\t" & fB.infoStr & "\t" &
+          svStr & "\t" & simStr)
       inc totalMatches
 
   for h in slimHandles.mitems: h.close()

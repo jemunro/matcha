@@ -46,15 +46,17 @@ type
     outputPath*:      string
     callsetA*:        string
     callsetB*:        string
-    selfMode*:        bool   ## When true, match callsetA against itself.
-                             ## callsetB is empty; pair dedup uses srcIndexA < srcIndexB.
-    emitSingletons*:  bool   ## When true, matchcore emits a MatchPair for every A
-                             ## record with no passing B match (collapse only).
+    selfMode*:        bool         ## When true, match callsetA against itself.
+                                   ## callsetB is empty; pair dedup uses srcIndexA < srcIndexB.
+    emitSingletons*:  bool         ## When true, matchcore emits a MatchPair for every A
+                                   ## record with no passing B match (collapse only).
+    infoFields*:      seq[string]  ## Extra INFO fields to carry into both A and B slim BCFs
+                                   ## and emit as INFO_A / INFO_B columns in TSV output.
 
 const SupportedSvTypes* = {svDEL, svDUP, svINV, svBND}
 
 const OutputHeader* =
-  "#CHROM_A\tPOS_A\tEND_A\tID_A\tCHROM_B\tPOS_B\tEND_B\tID_B\tSVTYPE\tSIMILARITY"
+  "#CHROM_A\tPOS_A\tID_A\tCHROM_B\tPOS_B\tID_B\tSVTYPE\tSIMILARITY"
 
 proc isStdoutPath*(p: string): bool =
   ## True when `p` refers to standard output (empty, "-", or "/dev/stdout").

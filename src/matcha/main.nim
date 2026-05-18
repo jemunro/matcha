@@ -52,6 +52,7 @@ proc matchUsage(code: int = 1) =
   f.writeLine "  --bnd-slop INT                  max breakend offset for BND matches (default: 100)"
   f.writeLine "  --self                          match a single input against itself"
   f.writeLine "                                  (each pair emitted once; no self-self)"
+  f.writeLine "  --info FIELDS                   comma-separated INFO fields to add as INFO_A/INFO_B columns"
   f.writeLine "  --threads INT                   number of worker threads (default: 1)"
   f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
   f.writeLine "  --output PATH                   output file (default: stdout)"
@@ -119,6 +120,8 @@ proc runMatch(rawArgs: seq[string]) =
         cfg.tmpDir = nextVal(p, "tmp-dir")
       of "output":
         cfg.outputPath = nextVal(p, "output")
+      of "info":
+        cfg.infoFields = nextVal(p, "info").split(',').mapIt(it.strip)
       of "self":
         cfg.selfMode = true
       of "v", "verbose":
