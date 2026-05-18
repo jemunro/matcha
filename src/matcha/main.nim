@@ -345,7 +345,7 @@ proc collapseUsage(code: int = 1) =
   f.writeLine "  --format FIELDS               comma-separated FORMAT fields to carry"
   f.writeLine "                                default: GT"
   f.writeLine "  --info FIELDS                 comma-separated INFO fields to keep"
-  f.writeLine "                                default: all (post conflict resolution)"
+  f.writeLine "                                default: SVTYPE,SVLEN,END,CHR2,POS2 only"
   f.writeLine "  -o, --output PATH             output file (.vcf | .vcf.gz | .bcf)"
   f.writeLine "                                default: uncompressed VCF to stdout"
   f.writeLine "  --threads INT                 worker threads (default: 1)"

@@ -30,7 +30,7 @@ type
     linkage*:      LinkageMethod
     priority*:     seq[PriorityCriterion]
     formatFields*: seq[string]   ## FORMAT fields to carry; default ["GT"]
-    infoFields*:   seq[string]   ## --info filter; empty = keep all
+    infoFields*:   seq[string]   ## --info filter; empty = keep only auto-extracted fields
     outputPath*:   string
     nThreads*:     int
     tmpDir*:       string
@@ -119,7 +119,7 @@ proc buildFinalHdr(callers: seq[CallerInput]; mh: MergedHeader;
       if fieldId in fmtKeep:
         discard bcf_hdr_append(result, line.cstring)
     else:
-      if keepInfoForMerged(fieldId, cfg.infoFields):
+      if cfg.infoFields.len > 0 and keepInfoForMerged(fieldId, cfg.infoFields):
         discard bcf_hdr_append(result, line.cstring)
 
   # Ensure standard SV INFO defs (in case callers' headers omit any).
@@ -244,7 +244,8 @@ proc writeOutput(cfg: CollapseConfig;
   proc keepInfoOut(name: string): bool =
     if name in ["SRC_INDEX", "CALLER_IDX"]: return false
     if name in ["SOURCE", "SOURCELIST", "N_SOURCE", "N_MERGED"]: return true
-    if infoFilter.len == 0: return true
+    if infoFilter.len == 0:
+      return name in ["SVTYPE", "SVLEN", "END", "CHR2", "POS2"]
     for tok in infoFilter:
       if name == tok or name.startsWith(tok & "_"): return true
     false

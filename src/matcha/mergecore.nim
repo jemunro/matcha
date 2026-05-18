@@ -803,9 +803,6 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
           let wHdr = bcf_hdr_dup(finalHdr)
           wtr.header.hdr = wHdr
           writerHdrs[key] = wHdr
-          if tpool.pool != nil:
-            discard hts_set_opt(vcfHtsFile(wtr),
-                                srs_hts_opt_thread_pool(), tpool.addr)
           discard wtr.write_header()
           writers[key] = wtr
           result.paths[key] = outPath
@@ -826,6 +823,7 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
         bcf_destroy(rec)
 
   finally:
+    # Teardown order: destroy synced reader first (it owns reader file handles),
     # Teardown order: destroy synced reader first (it owns reader file handles),
     # then close writers (each holds its own dup of finalHdr), then destroy
     # the shared thread pool last (after every htsFile* that referenced it).
