@@ -10,7 +10,30 @@
 
 import std/[algorithm, deques, sequtils, tables]
 import hts
+import hts/private/hts_concat
 import intervals, preproc, bins, utils
+
+# ---------------------------------------------------------------------------
+# tearDownVcf — close a VCF and free the htslib header eagerly.
+#
+# hts-nim's `close()` only closes the file handle; the BCF header, CSI/tabix
+# indexes, and `bcf1_t` buffer are left for the GC finalizer to free. Under
+# ORC the finalizer is not guaranteed to run between jobs, so opening many
+# per-bin BCFs per match job accumulates C-heap (header is by far the largest
+# piece — ~500 KB per VCF with N samples × INFO/FORMAT lines).
+#
+# Freeing `header.hdr` here drops the per-job leak ~50×. `bidx`, `tidx`, and
+# `c` are private fields of hts-nim's VCF and still leak ~0.2 MB per opened
+# VCF until the GC eventually runs; bounded and small enough to accept rather
+# than reach into private layout.
+# ---------------------------------------------------------------------------
+
+proc tearDownVcf*(v: VCF) =
+  if v == nil: return
+  v.close()
+  if v.header != nil and v.header.hdr != nil:
+    bcf_hdr_destroy(v.header.hdr)
+    v.header.hdr = nil
 
 # ---------------------------------------------------------------------------
 # Slim-BCF INFO decode helpers
@@ -137,9 +160,9 @@ proc streamJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
     for binB, buf in buffers.mpairs:
       buf.evict(posA)
 
-  vcfA.close()
+  tearDownVcf(vcfA)
   for v in vcfsB.mvalues:
-    v.close()
+    tearDownVcf(v)
 
 # ---------------------------------------------------------------------------
 # BND matching (point events; slop-based proximity)
@@ -238,5 +261,5 @@ proc streamBndJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
     if cfg.emitSingletons and not anyMatch:
       result.add(singletonPair(job, srcIndexA, posA, passA, qualQ, callerIdxA))
 
-  vcfA.close()
-  vcfB.close()
+  tearDownVcf(vcfA)
+  tearDownVcf(vcfB)
