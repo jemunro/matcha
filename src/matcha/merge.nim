@@ -785,7 +785,9 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
     cfgMut.formatFields = @["GT"] & cfgMut.formatFields
 
   # Resolve headers.
-  let mh = resolveHeaders(cfgMut.callers)
+  let mh = resolveHeaders(cfgMut.callers,
+    infoFilter = cfgMut.infoFields,
+    fmtFilter  = cfgMut.formatFields)
   for w in mh.warnings: logWarn("merge header: " & w)
 
   # Detect whether any input declares INFO/CALLERS — drives output INFO defs.

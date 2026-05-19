@@ -321,7 +321,9 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
 
   # Phase 1: resolve output header from all N input headers.
   logVerbose("resolving headers")
-  let mh = resolveHeaders(cfg.callers)
+  let mh = resolveHeaders(cfg.callers,
+    infoFilter = cfg.infoFields,
+    fmtFilter  = cfg.formatFields)
   for w in mh.warnings: logWarn("collapse header: " & w)
 
   # First caller's chrom order anchors output ordering.

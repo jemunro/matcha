@@ -174,21 +174,31 @@ proc makeFmtLine(id, number, typ, desc: string): string =
   "##FORMAT=<ID=" & id & ",Number=" & number & ",Type=" & typ &
   ",Description=\"" & desc & "\">"
 
-proc resolveHeaders*(callers: seq[CallerInput]): MergedHeader =
+proc resolveHeaders*(callers: seq[CallerInput];
+                     infoFilter: seq[string] = @[];
+                     fmtFilter:  seq[string] = @[]): MergedHeader =
   ## Open each caller's header, collect INFO and FORMAT definitions, and
   ## produce a MergedHeader that drives the merge pass and output header.
   ##
   ## Compatible INFO/FORMAT (same Number+Type across all callers that define it):
   ##   → single merged def in output; no renames needed.
   ##
-  ## Incompatible INFO (different Number or Type):
-  ##   → rename every instance to FIELD_CALLERNAME (or FIELD_N if unnamed).
-  ##     Warn once per conflict. The original field name is dropped.
+  ## Incompatible INFO:
+  ##   Number-only conflict (same Type): emit Number=. — silent, no rename.
+  ##   Type conflict: rename every instance to FIELD_CALLERNAME; warn if fld
+  ##     is in infoFilter (or infoFilter is empty, meaning no output filter).
   ##
   ## Incompatible FORMAT:
-  ##   → emit Number=. with merged Type (best-effort) and warn.
+  ##   Number-only conflict: emit Number=. — warn if fld is in fmtFilter.
+  ##   Type conflict: rename to FIELD_CALLERNAME — warn if fld is in fmtFilter.
+  ##
+  ## headerLines and infoRes/fmtRes are built unconditionally (slim BCFs may
+  ## carry fields beyond the output filter); warnings are gated by the filters.
   ##
   ## Fields that appear in only one caller are kept unchanged.
+
+  let infoFilterSet = toHashSet(infoFilter)
+  let fmtFilterSet  = toHashSet(fmtFilter)
 
   # Collect INFO and FORMAT definitions per field, per caller.
   type FieldDef = object
@@ -226,21 +236,24 @@ proc resolveHeaders*(callers: seq[CallerInput]): MergedHeader =
   # Resolve INFO fields.
   for fld, defs in infoByField.pairs:
     let byCallers = defs  # one entry per caller that defines this field
-    # Check compatibility: same Number+Type across all callers that define it.
     let refNum = byCallers[0].number
     let refTyp = byCallers[0].typ
-    var compatible = true
+    var compatible  = true
+    var typeConflict = false
     for d in byCallers:
       if d.number != refNum or d.typ != refTyp:
         compatible = false
-        break
+      if d.typ != refTyp:
+        typeConflict = true
     if compatible or byCallers.len == 1:
-      # Single definition (possibly from one caller only) or compatible → keep as-is.
       let desc = mergeDescriptions(byCallers.mapIt(it.desc))
       result.headerLines.add(makeInfoLine(fld, refNum, refTyp, desc))
-      # No rename entry needed: resolution defaults to compatible.
+    elif not typeConflict:
+      # Number-only conflict (same Type) → widen to Number=.; no rename, no warning.
+      let desc = mergeDescriptions(byCallers.mapIt(it.desc))
+      result.headerLines.add(makeInfoLine(fld, ".", refTyp, desc))
     else:
-      # Incompatible → rename each caller's instance.
+      # Type conflict → rename each caller's instance.
       var res = FieldResolution(kind: fcIncompatibleInfo)
       var warnParts: seq[string]
       for d in byCallers:
@@ -250,8 +263,9 @@ proc resolveHeaders*(callers: seq[CallerInput]): MergedHeader =
         result.headerLines.add(makeInfoLine(newName, d.number, d.typ, d.desc))
         warnParts.add(callers[d.callerIdx].name & ":" & d.number & "/" & d.typ)
       result.infoRes[fld] = res
-      result.warnings.add("INFO conflict for " & fld & " (" & warnParts.join(", ") &
-                          ") — renamed to " & res.renames.values.toSeq.join(", "))
+      if infoFilter.len == 0 or fld in infoFilterSet:
+        result.warnings.add("INFO Type conflict for " & fld & " (" & warnParts.join(", ") &
+                            ") — renamed to " & res.renames.values.toSeq.join(", "))
 
   # Resolve FORMAT fields.
   for fld, defs in fmtByField.pairs:
@@ -278,8 +292,9 @@ proc resolveHeaders*(callers: seq[CallerInput]): MergedHeader =
         result.headerLines.add(makeFmtLine(newName, d.number, d.typ, d.desc))
         warnParts.add(callers[d.callerIdx].name & ":" & d.number & "/" & d.typ)
       result.fmtRes[fld] = res
-      result.warnings.add("FORMAT Type conflict for " & fld & " (" & warnParts.join(", ") &
-                          ") — renamed to " & res.renames.values.toSeq.join(", "))
+      if fmtFilter.len == 0 or fld in fmtFilterSet:
+        result.warnings.add("FORMAT Type conflict for " & fld & " (" & warnParts.join(", ") &
+                            ") — renamed to " & res.renames.values.toSeq.join(", "))
     else:
       # Number-only conflict (compatible Type) → emit Number=. and warn.
       var res = FieldResolution(kind: fcIncompatibleFmt)
@@ -289,8 +304,9 @@ proc resolveHeaders*(callers: seq[CallerInput]): MergedHeader =
       var warnParts: seq[string]
       for d in defs:
         warnParts.add(callers[d.callerIdx].name & ":" & d.number & "/" & d.typ)
-      result.warnings.add("FORMAT Number conflict for " & fld & " (" & warnParts.join(", ") &
-                          ") — emitting Number=.")
+      if fmtFilter.len == 0 or fld in fmtFilterSet:
+        result.warnings.add("FORMAT Number conflict for " & fld & " (" & warnParts.join(", ") &
+                            ") — emitting Number=.")
 
 # ---------------------------------------------------------------------------
 # Similarity map (from MatchPair seq)
