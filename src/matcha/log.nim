@@ -11,6 +11,7 @@
 import std/[os, strutils, times]
 
 var gVerbose = false
+var gQuiet = false
 let gStart = epochTime()
 
 proc setVerbose*(b: bool) =
@@ -20,13 +21,13 @@ proc elapsedTag(level: string): string =
   "[" & level & " " & formatFloat(epochTime() - gStart, ffDecimal, 3) & "s] "
 
 proc logInfo*(msg: string) =
+  ## Suppressed when setQuiet(true) has been called (test runs).
+  if gQuiet: return
   stderr.writeLine(elapsedTag("INFO") & msg)
 
 proc logVerbose*(msg: string) =
   if not gVerbose: return
   stderr.writeLine(elapsedTag("INFO") & msg)
-
-var gQuiet = false
 
 proc setQuiet*(b: bool) =
   ## When set, logWarn becomes a no-op. Used by tests to keep PASS/FAIL

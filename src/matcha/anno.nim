@@ -58,6 +58,7 @@ type
     callsetB*:      string     ## database
     exprs*:         seq[AnnoExpr]
     dbFields*:      seq[string]  ## deduped DB SRCFIELDs (excluding MATCHA_*)
+    keptChrs*:      seq[string]  ## --chrs filter; empty = no filter.
 
   AnnoMatch* = object
     aIndex*:     int32   ## SRC_INDEX of the A record (for grouping in phase 3)
@@ -465,18 +466,26 @@ proc runAnno*(cfg: var AnnoConfig) =
   validateOutputPath(cfg.outputPath)
   validateAnnoExprs(cfg)
 
+  let keptChrsSet = toHashSet(cfg.keptChrs)
+
   # --- Phase 1: preproc -----------------------------------------------------
   var filesA, filesB: PreprocOutput
   if cfg.nThreads >= 2:
     logInfo("preprocessing A and B in parallel" &
             (if cfg.dbFields.len > 0: " (B extra: " & cfg.dbFields.join(",") & ")" else: ""))
     (filesA, filesB) = runParallelPreproc(
-      PreprocInput(path: cfg.callsetA, tmpDir: cfg.tmpDir, prefix: "A", ioThreads: 2),
+      PreprocInput(path: cfg.callsetA, tmpDir: cfg.tmpDir, prefix: "A",
+                   ioThreads: 2, keptChrs: keptChrsSet),
       PreprocInput(path: cfg.callsetB, tmpDir: cfg.tmpDir, prefix: "B",
-                   extraKeep: cfg.dbFields, ioThreads: 2))
+                   extraKeep: cfg.dbFields, ioThreads: 2, keptChrs: keptChrsSet))
   else:
-    filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A")
-    filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B", cfg.dbFields)
+    filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A",
+                           keptChrs = keptChrsSet)
+    filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B", cfg.dbFields,
+                           keptChrs = keptChrsSet)
+  var chrsSeen = filesA.chrsSeen
+  for c in filesB.chrsSeen: chrsSeen.incl(c)
+  warnMissingChrs(cfg.keptChrs, chrsSeen)
 
   # buildWorkQueue takes a MatchConfig; build a shim with matching thresholds.
   var matchCfg = MatchConfig(
@@ -531,6 +540,20 @@ proc runAnno*(cfg: var AnnoConfig) =
   # IDs via the variant's source-header pointer; the writer then copies the
   # already-augmented header so reader and writer share the same ID space.
   registerOutputHeader(vcfA.header, cfg)
+  if keptChrsSet.len > 0:
+    # Drop excluded contigs from the header so the copied output header carries
+    # only the kept contigs. Records on excluded chroms are filtered below.
+    var n: cint = 0
+    let names = bcf_hdr_seqnames(vcfA.header.hdr, n.addr)
+    if names != nil:
+      var toRemove: seq[string]
+      for i in 0 ..< n.int:
+        let c = $names[i]
+        if c notin keptChrsSet: toRemove.add(c)
+      free(names)
+      for c in toRemove:
+        bcf_hdr_remove(vcfA.header.hdr, BCF_HEADER_TYPE.BCF_HL_CTG.cint, c.cstring)
+      discard bcf_hdr_sync(vcfA.header.hdr)
 
   var outWriter: VCF
   # hts-nim's `close()` skips hts_close() for fname=="-" — the BGZF buffer
@@ -563,6 +586,7 @@ proc runAnno*(cfg: var AnnoConfig) =
   for v in vcfA:
     let curIdx = srcIdx
     inc srcIdx
+    if keptChrsSet.len > 0 and $v.CHROM notin keptChrsSet: continue
     inc nInput
     if curIdx in byAindex:
       let matches = byAindex[curIdx]

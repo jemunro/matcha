@@ -35,6 +35,7 @@ type
     nThreads*:     int
     tmpDir*:       string
     callers*:      seq[CallerInput]
+    keptChrs*:     seq[string]    ## --chrs filter; empty = no filter.
 
 # ---------------------------------------------------------------------------
 # Sample-ID validation
@@ -111,7 +112,7 @@ proc buildSlimHdr(callers: seq[CallerInput]; mh: MergedHeader;
   ## matchcore-required INFO + user --info.
   result = bcf_hdr_init("w".cstring)
 
-  addContigsUnion(result, callers)
+  addContigsUnion(result, callers, toHashSet(cfg.keptChrs))
   addFiltersUnion(result, callers)
 
   # INFO from MergedHeader, filtered through keepInfoForMerged. FORMAT
@@ -158,7 +159,7 @@ proc buildOutputHdr(callers: seq[CallerInput]; sampleIds: seq[string];
                     cmdLine: string): ptr bcf_hdr_t =
   result = bcf_hdr_init("w".cstring)
 
-  addContigsUnion(result, callers)
+  addContigsUnion(result, callers, toHashSet(cfg.keptChrs))
   addFiltersUnion(result, callers)
 
   # INFO from MergedHeader, filtered through keepInfoForMergeOut. FORMAT
@@ -818,8 +819,17 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
                                tmpDir:           cfgMut.tmpDir,
                                stampSID:         true,
                                sampleIdByCaller: sampleIds,
-                               preserveBndAlt:   true)
+                               preserveBndAlt:   true,
+                               keptChrs:         toHashSet(cfgMut.keptChrs))
   let im = integratedMerge(cfgMut.callers, mh, slimHdr, msc, chromOrder)
+  if cfgMut.keptChrs.len > 0:
+    var seen: HashSet[string]
+    for caller in cfgMut.callers:
+      var v: VCF
+      if not open(v, caller.path): continue
+      for c in captureChromOrder(v.header): seen.incl(c)
+      v.close()
+    warnMissingChrs(cfgMut.keptChrs, seen)
 
   # Build a PreprocOutput describing the merged slim BCFs.
   let mergedPreproc = PreprocOutput(

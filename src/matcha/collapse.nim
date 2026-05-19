@@ -35,6 +35,7 @@ type
     nThreads*:     int
     tmpDir*:       string
     callers*:      seq[CallerInput]
+    keptChrs*:     seq[string]    ## --chrs filter; empty = no filter.
 
 # ---------------------------------------------------------------------------
 # buildFinalHdr — collapse-specific shared output header
@@ -48,7 +49,7 @@ proc buildFinalHdr(callers: seq[CallerInput]; mh: MergedHeader;
   ## writeOutput. Eliminates `bcf_translate` at writeOutput time.
   result = bcf_hdr_init("w".cstring)
 
-  addContigsUnion(result, callers)
+  addContigsUnion(result, callers, toHashSet(cfg.keptChrs))
   addFiltersUnion(result, callers)
 
   # INFO/FORMAT from mh.headerLines, filtered. INFO is kept only when
@@ -340,8 +341,17 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
   logInfo("integrated preproc+merge over " & $cfg.callers.len & " caller(s)")
   let msc = MergeStreamConfig(formatFields: cfg.formatFields,
                                nThreads:     cfg.nThreads,
-                               tmpDir:       cfg.tmpDir)
+                               tmpDir:       cfg.tmpDir,
+                               keptChrs:     toHashSet(cfg.keptChrs))
   let im = integratedMerge(cfg.callers, mh, finalHdr, msc, chromOrder)
+  if cfg.keptChrs.len > 0:
+    var seen: HashSet[string]
+    for caller in cfg.callers:
+      var v: VCF
+      if not open(v, caller.path): continue
+      for c in captureChromOrder(v.header): seen.incl(c)
+      v.close()
+    warnMissingChrs(cfg.keptChrs, seen)
 
   # Build a PreprocOutput describing the merged slim BCFs for buildWorkQueue.
   let mergedPreproc = PreprocOutput(

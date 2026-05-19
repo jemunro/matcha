@@ -5,7 +5,7 @@
 ## slim BCF handles from fileList, queries each representative position via
 ## CSI `chrom:pos-pos`, and writes TSV rows directly — no MatchResult type.
 
-import std/[atomics, os, sequtils, strutils]
+import std/[atomics, os, sequtils, sets, strutils]
 import hts
 import utils, preproc, log, matchcore
 
@@ -106,23 +106,30 @@ proc runMatch*(cfg: MatchConfig) =
           " threads=" & $cfg.nThreads & " tmp=" & cfg.tmpDir)
 
   let extra = cfg.infoFields   # shorthand
+  let keptChrsSet = toHashSet(cfg.keptChrs)
 
   var filesA, filesB: PreprocOutput
   if cfg.selfMode:
     logInfo("self mode: preprocessing single input")
     filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A", extra,
-                           ioThreads = if cfg.nThreads >= 2: 2 else: 0)
+                           ioThreads = if cfg.nThreads >= 2: 2 else: 0,
+                           keptChrs = keptChrsSet)
     filesB = filesA
   elif cfg.nThreads >= 2:
     logInfo("preprocessing A and B in parallel")
     (filesA, filesB) = runParallelPreproc(
       PreprocInput(path: cfg.callsetA, tmpDir: cfg.tmpDir, prefix: "A",
-                   extraKeep: extra, ioThreads: 2),
+                   extraKeep: extra, ioThreads: 2, keptChrs: keptChrsSet),
       PreprocInput(path: cfg.callsetB, tmpDir: cfg.tmpDir, prefix: "B",
-                   extraKeep: extra, ioThreads: 2))
+                   extraKeep: extra, ioThreads: 2, keptChrs: keptChrsSet))
   else:
-    filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A", extra)
-    filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B", extra)
+    filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A", extra,
+                           keptChrs = keptChrsSet)
+    filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B", extra,
+                           keptChrs = keptChrsSet)
+  var chrsSeen = filesA.chrsSeen
+  for c in filesB.chrsSeen: chrsSeen.incl(c)
+  warnMissingChrs(cfg.keptChrs, chrsSeen)
 
   let (jobs, fileList) = buildWorkQueue(filesA, filesB, cfg)
   logInfo("work queue: " & $jobs.len & " (chrom, svtype, binA) job(s)")

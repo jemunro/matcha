@@ -64,6 +64,7 @@ proc matchUsage(code: int = 1) =
   f.writeLine "  --self                          match a single input against itself"
   f.writeLine "                                  (each pair emitted once; no self-self)"
   f.writeLine "  --info FIELDS                   comma-separated INFO fields to add as INFO_A/INFO_B columns"
+  f.writeLine "  --chrs CHR[,CHR...]             restrict to listed chromosomes (filters records + headers)"
   f.writeLine "  --threads INT                   number of worker threads (default: 1)"
   f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
   f.writeLine "  --output PATH                   output file (default: stdout)"
@@ -113,6 +114,8 @@ proc runMatch(rawArgs: seq[string]) =
         cfg.outputPath = nextVal(p, "output")
       of "info":
         cfg.infoFields = nextVal(p, "info").split(',').mapIt(it.strip)
+      of "chrs":
+        cfg.keptChrs = parseChrsArg(nextVal(p, "chrs"))
       of "self":
         cfg.selfMode = true
       of "v", "verbose":
@@ -167,6 +170,7 @@ proc annoUsage(code: int = 1) =
   f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
   f.writeLine "  --bnd-slop INT                  max breakend offset for BND matches (default: 50)"
   f.writeLine "  --overwrite                     replace OUTFIELDs already in input header"
+  f.writeLine "  --chrs CHR[,CHR...]             restrict to listed chromosomes (filters records + headers)"
   f.writeLine "  --threads INT                   number of worker threads (default: 1)"
   f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
   f.writeLine "  -v, --verbose                   verbose logging to stderr"
@@ -206,6 +210,7 @@ proc annoHelp() =
   f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
   f.writeLine "  --bnd-slop INT                  max breakend offset for BND matches (default: 50)"
   f.writeLine "  --overwrite                     replace OUTFIELDs that already exist in input header"
+  f.writeLine "  --chrs CHR[,CHR...]             restrict to listed chromosomes (filters records + headers)"
   f.writeLine "  --threads INT                   number of worker threads (default: 1)"
   f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
   f.writeLine "  -v, --verbose                   verbose logging to stderr"
@@ -298,6 +303,8 @@ proc runAnnoCli(rawArgs: seq[string]) =
           logError("--threads must be >= 1"); quit(1)
       of "tmp-dir":
         cfg.tmpDir = nextVal(p, "tmp-dir")
+      of "chrs":
+        cfg.keptChrs = parseChrsArg(nextVal(p, "chrs"))
       of "v", "verbose":
         setVerbose(true)
       of "h", "help":
@@ -350,6 +357,7 @@ proc collapseUsage(code: int = 1) =
   f.writeLine "                                default: SVTYPE,SVLEN,END,CHR2,POS2 only"
   f.writeLine "  -o, --output PATH             output file (.vcf | .vcf.gz | .bcf)"
   f.writeLine "                                default: uncompressed VCF to stdout"
+  f.writeLine "  --chrs CHR[,CHR...]           restrict to listed chromosomes (filters records + headers)"
   f.writeLine "  --threads INT                 worker threads (default: 1)"
   f.writeLine "  --tmp-dir PATH                temp directory (default: system temp)"
   f.writeLine "  -v, --verbose                 verbose logging to stderr"
@@ -429,6 +437,8 @@ proc runCollapseCli(rawArgs: seq[string]) =
           logError("--threads must be >= 1"); quit(1)
       of "tmp-dir":
         cfg.tmpDir = nextVal(p, "tmp-dir")
+      of "chrs":
+        cfg.keptChrs = parseChrsArg(nextVal(p, "chrs"))
       of "v", "verbose": setVerbose(true)
       of "h", "help":    collapseUsage(0)
       else:
@@ -494,6 +504,7 @@ proc mergeUsage(code: int = 1) =
   f.writeLine "                                default: only auto-extracted + cohort + CALLERS"
   f.writeLine "  -o, --output PATH             output file (.vcf | .vcf.gz | .bcf)"
   f.writeLine "                                default: uncompressed VCF to stdout"
+  f.writeLine "  --chrs CHR[,CHR...]           restrict to listed chromosomes (filters records + headers)"
   f.writeLine "  --threads INT                 worker threads (default: 1)"
   f.writeLine "  --tmp-dir PATH                temp directory (default: system temp)"
   f.writeLine "  -v, --verbose                 verbose logging to stderr"
@@ -559,6 +570,8 @@ proc runMergeCli(rawArgs: seq[string]) =
           logError("--threads must be >= 1"); quit(1)
       of "tmp-dir":
         cfg.tmpDir = nextVal(p, "tmp-dir")
+      of "chrs":
+        cfg.keptChrs = parseChrsArg(nextVal(p, "chrs"))
       of "v", "verbose": setVerbose(true)
       of "h", "help":    mergeUsage(0)
       else:

@@ -57,6 +57,7 @@ type
                                    ## record with no passing B match (collapse only).
     infoFields*:      seq[string]  ## Extra INFO fields to carry into both A and B slim BCFs
                                    ## and emit as INFO_A / INFO_B columns in TSV output.
+    keptChrs*:        seq[string]  ## --chrs filter; empty = no filter (keep all chroms).
 
 const SupportedSvTypes* = {svDEL, svDUP, svINV, svBND}
 

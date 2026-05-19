@@ -623,6 +623,7 @@ type
     stampSID*:          bool          ## merge mode: write FORMAT/SID per record
     sampleIdByCaller*:  seq[string]   ## merge mode: SID value for caller ci
     preserveBndAlt*:    bool          ## merge mode: keep source BND ALT verbatim
+    keptChrs*:          HashSet[string] ## --chrs filter; empty = no filter
 
 # Header utility: collect ##FILTER=<...> lines from a header.
 proc collectFilterLines*(h: ptr bcf_hdr_t): seq[string] =
@@ -650,9 +651,11 @@ const AlwaysKeepInMerged* = ["SVTYPE", "SVLEN", "END", "CHR2", "POS2",
 # `##source` / `##matcha_cmdline` lines) on top.
 # ---------------------------------------------------------------------------
 
-proc addContigsUnion*(hdr: ptr bcf_hdr_t; callers: seq[CallerInput]) =
+proc addContigsUnion*(hdr: ptr bcf_hdr_t; callers: seq[CallerInput];
+                     keptChrs: HashSet[string] = initHashSet[string]()) =
   ## Append `##contig=<ID=...>` for every contig seen across callers; first
-  ## caller wins for order.
+  ## caller wins for order. When `keptChrs` is non-empty, contigs not in the
+  ## set are skipped.
   var seen: HashSet[string]
   for caller in callers:
     var vcf: VCF
@@ -664,6 +667,7 @@ proc addContigsUnion*(hdr: ptr bcf_hdr_t; callers: seq[CallerInput]) =
         let c = $names[i]
         if c notin seen:
           seen.incl(c)
+          if keptChrs.len > 0 and c notin keptChrs: continue
           discard bcf_hdr_append(hdr, ("##contig=<ID=" & c & ">").cstring)
       free(names)
     vcf.close()
@@ -906,6 +910,12 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
         let srcHdr = srs_get_header(sr, ci.cint)
         let rawRec = srs_get_line(sr, ci.cint)
 
+        if cfg.keptChrs.len > 0 and
+           getChromName(srcHdr, rawRec.rid) notin cfg.keptChrs:
+          inc wsList[ci].nRead
+          inc wsList[ci].skipped[skChromFiltered]
+          continue
+
         let rec = bcf_dup(rawRec)
         inc perCallerLineno[ci]
 
@@ -913,6 +923,13 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
                                  wsList[ci], view, svtypeBuf, endBuf, svlenBuf,
                                  callers[ci].path)
         if not nr.ok:
+          bcf_destroy(rec)
+          continue
+        if cfg.keptChrs.len > 0 and nr.svt == svBND and
+           nr.bndChr2 notin cfg.keptChrs:
+          inc wsList[ci].skipped[skChromFiltered]
+          # normalizeRecord already incremented nKept; back it out.
+          dec wsList[ci].nKept
           bcf_destroy(rec)
           continue
 

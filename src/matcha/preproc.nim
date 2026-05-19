@@ -50,6 +50,7 @@ type
     paths*:     Table[SvtypeBin, string]              ## (svtype, bin) → BCF path
     populated*: Table[SvtypeBin, HashSet[string]]     ## (svtype, bin) → chroms with ≥1 record
     chromOrder*: seq[string]                          ## chroms in input header order
+    chrsSeen*:  HashSet[string]                       ## contig IDs from input header (for --chrs validation)
 
   BinBEntry* = tuple[path: string; fileIdx: int16]
 
@@ -70,6 +71,7 @@ type
     skEndLePos
     skMalformedBnd
     skUnknownContig
+    skChromFiltered
 
   WarnState* = object
     skipped*:      array[SkipReason, int]
@@ -82,6 +84,25 @@ type
 
 proc initWarnState*(callset: string): WarnState =
   WarnState(cap: warnCap(), callset: callset)
+
+proc parseChrsArg*(raw: string): seq[string] =
+  ## Parse --chrs CHR[,CHR...]. Errors on empty list, empty tokens, duplicates.
+  ## Returns the chromosome names in user-supplied order (preserved for
+  ## diagnostics). Callers convert to HashSet for membership lookups.
+  var seen: HashSet[string]
+  for tok in raw.split(','):
+    let s = tok.strip
+    if s.len == 0:
+      logError("--chrs: empty chromosome name in list: '" & raw & "'")
+      quit(1)
+    if s in seen:
+      logError("--chrs: duplicate chromosome name '" & s & "' in list")
+      quit(1)
+    seen.incl(s)
+    result.add(s)
+  if result.len == 0:
+    logError("--chrs: at least one chromosome name is required")
+    quit(1)
 
 # INFO fields kept in each class of temp BCF. SVTYPE is encoded in the filename;
 # SVLEN is derivable from END-POS and matchcore never reads it.
@@ -117,6 +138,7 @@ proc reasonStr(r: SkipReason): string =
   of skEndLePos:            "end_le_pos"
   of skMalformedBnd:        "malformed_bnd"
   of skUnknownContig:       "unknown_contig"
+  of skChromFiltered:       "chrom_filtered"
 
 proc warnSkip*(reason: SkipReason, ws: var WarnState,
               chrom: string, pos: int64, id: string, detail: string) =
@@ -413,7 +435,8 @@ proc captureChromOrder*(h: vcf.Header): seq[string] =
 proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
                     extraKeepInfo: openArray[string] = [],
                     ioThreads:    int  = 0;
-                    noIndex:      bool = false): PreprocOutput =
+                    noIndex:      bool = false;
+                    keptChrs:     HashSet[string] = initHashSet[string]()): PreprocOutput =
   ## Stream vcfPath, normalize each record, and write per-SVTYPE BCFs.
   ## When noIndex=false (default), all temp BCFs are CSI-indexed on return.
   ## Inputs may be VCF.gz or BCF.
@@ -452,6 +475,7 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   var toDelete: seq[string]
 
   result.chromOrder = captureChromOrder(vcf.header)
+  for c in result.chromOrder: result.chrsSeen.incl(c)
 
   for v in vcf:
     var curSrcIndex = srcIndex
@@ -474,9 +498,15 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
       let chrom = $v.CHROM
       let pos1  = v.POS
       let curId = $v.ID
+      if keptChrs.len > 0 and chrom notin keptChrs:
+        inc ws.skipped[skChromFiltered]
+        break recordBody
       let r = resolveRecord(v, ws, chrom, pos1, curId,
                             svtypeStr, endData, svlenData)
       if not r.ok: break recordBody
+      if keptChrs.len > 0 and r.svt == svBND and r.bndChr2 notin keptChrs:
+        inc ws.skipped[skChromFiltered]
+        break recordBody
       let svt    = r.svt
       let endPos = r.endPos
       let svlen  = r.svlen
@@ -657,6 +687,16 @@ proc buildWorkQueue*(a, b: PreprocOutput,
   jobs.sort(cmpJobs)
   result = (jobs: jobs, fileList: fileList)
 
+proc warnMissingChrs*(keptChrs: seq[string]; seen: HashSet[string]) =
+  ## Emit a single logWarn listing any --chrs entries absent from `seen`
+  ## (union of contig IDs across all inputs processed so far).
+  if keptChrs.len == 0: return
+  var missing: seq[string]
+  for c in keptChrs:
+    if c notin seen: missing.add(c)
+  if missing.len > 0:
+    logWarn("--chrs: not found in any input header: " & missing.join(","))
+
 proc removeTempBcfs*(paths: Table[SvtypeBin, string]) =
   ## Delete per-(svtype, bin) BCF temp files and their CSI indexes.
   for path in paths.values:
@@ -673,6 +713,7 @@ type PreprocInput* = object
   prefix*:    string
   extraKeep*: seq[string]
   ioThreads*: int
+  keptChrs*:  HashSet[string]
 
 var gPpIn:  array[2, PreprocInput]
 var gPpOut: array[2, PreprocOutput]
@@ -680,7 +721,8 @@ var gPpOut: array[2, PreprocOutput]
 proc ppWorker(idx: int) {.thread.} =
   {.cast(gcsafe).}:
     let s = gPpIn[idx]
-    gPpOut[idx] = preprocessVcf(s.path, s.tmpDir, s.prefix, s.extraKeep, s.ioThreads)
+    gPpOut[idx] = preprocessVcf(s.path, s.tmpDir, s.prefix, s.extraKeep,
+                                s.ioThreads, keptChrs = s.keptChrs)
 
 proc runParallelPreproc*(a, b: PreprocInput): tuple[a, b: PreprocOutput] =
   gPpIn[0] = a; gPpIn[1] = b
