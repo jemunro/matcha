@@ -39,6 +39,7 @@ Options:
   --bnd-slop INT         max breakend offset for BND matches (default: 100)
   --self                 match a single input against itself
   --info FIELDS          comma-separated INFO fields to include as INFO_A/INFO_B columns
+  --chrs CHR[,CHR...]    restrict to listed chromosomes (filters records; no header change for TSV output)
   --threads INT          worker threads (default: 1)
   --tmp-dir PATH         temp directory (default: system temp)
   --output PATH          output file (default: stdout)
@@ -91,6 +92,7 @@ matcha anno [options] input database
   --min-jaccard FLOAT
   --bnd-slop INT                default 100
   --overwrite                   allow replacing existing INFO fields
+  --chrs CHR[,CHR...]           restrict to listed chromosomes (filters records + header contigs)
   --threads INT                 default 1
   --tmp-dir PATH
   -v, --verbose
@@ -136,6 +138,7 @@ matcha collapse [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
   --info FIELDS                comma-separated INFO fields to keep
                                (default: all, post conflict resolution)
   -o, --output PATH            output (.vcf | .vcf.gz | .bcf); default stdout VCF
+  --chrs CHR[,CHR...]          restrict to listed chromosomes (filters records + header contigs)
   --threads INT                default 1
   --tmp-dir PATH
   -v, --verbose
@@ -167,7 +170,11 @@ Per-cluster INFO fields added to the output:
 - `N_CALLERS` — distinct input callsets in the cluster.
 - `N_MERGED` — total records merged into the cluster (≥ `N_CALLERS`).
 
-Conflict-resolved INFO fields (e.g. differing `SVLEN` across callers) and FORMAT fields configured via `--info` / `--format` are carried through from the representative record.
+Conflict-resolved INFO fields (e.g. differing `SVLEN` across callers) and FORMAT fields configured via `--info` / `--format` are carried through from the representative record. Conflict rules:
+
+- **Compatible** (same Number + Type across all callers that declare the field): single merged def, no rename.
+- **Number-only conflict** (same Type, different Number — e.g. `Number=1` vs `Number=.`): silently widened to `Number=.` in the output. No rename, no warning.
+- **Type conflict** (e.g. one caller declares `Integer`, another `String`): each caller's instance is renamed to `FIELD_<callerName>` in the output. A warning is logged only when the field is in the `--info` / `--format` filter; warnings for fields the user didn't request are suppressed.
 
 ---
 
@@ -191,6 +198,7 @@ matcha merge [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
   --info FIELDS                 comma-separated INFO fields to keep from representative
                                 default: only auto-extracted + cohort + CALLERS
   -o, --output PATH             output (.vcf | .vcf.gz | .bcf); default stdout VCF
+  --chrs CHR[,CHR...]           restrict to listed chromosomes (filters records + header contigs)
   --threads INT                 default 1
   --tmp-dir PATH
   -v, --verbose

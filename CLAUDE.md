@@ -22,7 +22,7 @@ python3 tests/generate_fixtures.py   # regenerate fixtures (needs bcftools + bgz
 | `utils.nim` | Shared types: `SvType`, `Metric`, `MatchPair`, `MatchConfig`, `OutputHeader`, `NO_MATCH` |
 | `intervals.nim` | `reciprocalOverlap`, `jaccard` |
 | `bins.nim` | `binIndexFor`, `adjacentBins`, `TiledBuffer`, `BufferedRec` |
-| `preproc.nim` | Normalize → per-(svtype,bin) temp BCF + work queue; `extraKeepInfo` (anno); `SRC_INDEX` assignment; `buildWorkQueue` returns `(jobs, fileList)` |
+| `preproc.nim` | Normalize → per-(svtype,bin) temp BCF + work queue; `extraKeepInfo` (anno); `SRC_INDEX` assignment; `buildWorkQueue` returns `(jobs, fileList)`; `parseChrsArg`/`warnMissingChrs` for `--chrs` filter |
 | `matchcore.nim` | `streamJobPairs` (interval) and `streamBndJobPairs` (BND) — both return `seq[MatchPair]` (28-byte: srcIndex, pos, sim, fileIdx, chromIdx, svtype). Slim-BCF decode helpers (`readSrcIndex`, `readPos2`, `readChr2`, `extractEnd`). |
 | `match.nim` | match-mode: pair-only pool (`runMatchPairJobsWithPool`), main-thread chr:pos CSI resolution, TSV output |
 | `anno.nim` | anno-mode: expression parser, `applyAggFunc`, per-match chr:pos CSI B retrieval, SRC_INDEX counter join for phase 3, output VCF assembly |
