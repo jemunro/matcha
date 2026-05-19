@@ -44,7 +44,7 @@ timed("M02", "no threshold flag: exits non-zero, mentions flag names"):
     "default metric should be jaccard, got preamble: " & outp
 
 # M02b — passing BOTH --min-overlap and --min-jaccard is an error (xor).
-timed("M02b", "both thresholds: mutually exclusive error"):
+timed("M03", "both thresholds: mutually exclusive — exits non-zero"):
   let (outp, code) = runMerged(
     "match --min-overlap 0.5 --min-jaccard 0.5 " & FixtureA & " " & FixtureB)
   doAssert code != 0, "passing both should fail"
@@ -53,7 +53,7 @@ timed("M02b", "both thresholds: mutually exclusive error"):
     "error should mention mutual exclusion, got: " & outp
 
 # M03 — TC01 exact match: SIMILARITY=1.0
-timed("M03", "exact match DEL_A_01/DEL_B_01: similarity = 1.0"):
+timed("M04", "exact match DEL_A_01/DEL_B_01: similarity = 1.0"):
   let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
   doAssert code == 0, "exit " & $code & ": " & outp
   let rows = parseTsv(outp)
@@ -65,7 +65,7 @@ timed("M03", "exact match DEL_A_01/DEL_B_01: similarity = 1.0"):
   doAssert found, "DEL_A_01/DEL_B_01 pair not found in output"
 
 # M04 — TC02 partial overlap above threshold is emitted
-timed("M04", "partial overlap above threshold: DEL_A_02 emitted"):
+timed("M05", "partial overlap above threshold: DEL_A_02 emitted"):
   let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
   doAssert code == 0
   let rows = parseTsv(outp)
@@ -76,7 +76,7 @@ timed("M04", "partial overlap above threshold: DEL_A_02 emitted"):
   doAssert found, "DEL_A_02 partial overlap should be emitted at threshold 0.5"
 
 # M05 — TC03 below threshold NOT emitted
-timed("M05", "below-threshold overlap: DEL_A_03/DEL_B_03 not emitted"):
+timed("M06", "below-threshold overlap: DEL_A_03/DEL_B_03 not emitted"):
   let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
   doAssert code == 0
   let rows = parseTsv(outp)
@@ -86,7 +86,7 @@ timed("M05", "below-threshold overlap: DEL_A_03/DEL_B_03 not emitted"):
         "DEL_A_03/DEL_B_03 overlap=0.4 should be filtered at threshold 0.5"
 
 # M06 — TC05 SVTYPE mismatch produces no output
-timed("M06", "SVTYPE mismatch DEL_A_05/DUP_B_05: no match emitted"):
+timed("M07", "SVTYPE mismatch DEL_A_05/DUP_B_05: no match emitted"):
   let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
   doAssert code == 0
   let rows = parseTsv(outp)
@@ -96,7 +96,7 @@ timed("M06", "SVTYPE mismatch DEL_A_05/DUP_B_05: no match emitted"):
         "DEL/DUP SVTYPE mismatch should not match"
 
 # M07 — TC06 multiple matches: both B records emitted for DEL_A_06
-timed("M07", "multiple matches: 2 B records match DEL_A_06"):
+timed("M08", "multiple matches: 2 B records match DEL_A_06"):
   let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
   doAssert code == 0
   let rows = parseTsv(outp)
@@ -107,7 +107,7 @@ timed("M07", "multiple matches: 2 B records match DEL_A_06"):
   doAssert matchCount == 2, "expected 2 matches for DEL_A_06, got " & $matchCount
 
 # M08 — TC07 unmatched A record: DEL_A_07 absent from output
-timed("M08", "unmatched A record: DEL_A_07 not in output"):
+timed("M09", "unmatched A record: DEL_A_07 not in output"):
   let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
   doAssert code == 0
   let rows = parseTsv(outp)
@@ -116,7 +116,7 @@ timed("M08", "unmatched A record: DEL_A_07 not in output"):
       doAssert row[2] != "DEL_A_07", "DEL_A_07 should have no match in B"
 
 # M09 — TC09 multi-chromosome: chr2 and chrX rows present
-timed("M09", "multi-chromosome: chr2 and chrX results present"):
+timed("M10", "multi-chromosome: chr2 and chrX results present"):
   let (outp, code) = run("match --min-overlap 0.9 " & FixtureA & " " & FixtureB)
   doAssert code == 0
   let rows = parseTsv(outp)
@@ -130,7 +130,7 @@ timed("M09", "multi-chromosome: chr2 and chrX results present"):
   doAssert hasChrX, "chrX results missing"
 
 # M10 — --min-jaccard alone: TC08 DEL_A_08 excluded (jaccard=0.2 < 0.5)
-timed("M10", "--min-jaccard 0.5 alone: DEL_A_08 excluded (jaccard=0.2)"):
+timed("M11", "--min-jaccard 0.5 alone: DEL_A_08 excluded (jaccard=0.2)"):
   let (outp, code) = run("match --min-jaccard 0.5 " & FixtureA & " " & FixtureB)
   doAssert code == 0
   let rows = parseTsv(outp)
@@ -140,7 +140,7 @@ timed("M10", "--min-jaccard 0.5 alone: DEL_A_08 excluded (jaccard=0.2)"):
         "DEL_A_08 has jaccard=0.2 and should be excluded at --min-jaccard 0.5"
 
 # M11 — output has 8 tab-separated columns, similarity in [0,1].
-timed("M11", "output: 8 columns, similarity in [0,1]"):
+timed("M12", "output: 8 columns, similarity in [0,1]"):
   let (outp, code) = run("match --min-overlap 0.9 " & FixtureA & " " & FixtureB)
   doAssert code == 0
   let rows = parseTsv(outp)
@@ -153,7 +153,7 @@ timed("M11", "output: 8 columns, similarity in [0,1]"):
     doAssert sim >= 0.0 and sim <= 1.0, "SIMILARITY out of [0,1]: " & $sim
 
 # M12 — --output writes to file
-timed("M12", "--output: results written to file"):
+timed("M13", "--output: results written to file"):
   let tmpOut = getTempDir() / "matcha_test_out.tsv"
   defer: (if fileExists(tmpOut): removeFile(tmpOut))
   let (outp, code) = run(
@@ -164,7 +164,7 @@ timed("M12", "--output: results written to file"):
   doAssert readFile(tmpOut).len > 0, "output file is empty"
 
 # M13 — --threads 2 output (sorted) equals --threads 1 output (sorted)
-timed("M13", "--threads 2 produces same output as --threads 1"):
+timed("M14", "--threads 2 produces same output as --threads 1"):
   let (outp1, c1) = run("match --min-overlap 0.5 --threads 1 " & FixtureA & " " & FixtureB)
   let (outp2, c2) = run("match --min-overlap 0.5 --threads 2 " & FixtureA & " " & FixtureB)
   doAssert c1 == 0 and c2 == 0,
@@ -175,7 +175,7 @@ timed("M13", "--threads 2 produces same output as --threads 1"):
 
 # M14 — output begins with ##matcha_metric= line, then a #-prefixed header
 # with the SIMILARITY column.
-timed("M14", "output: ##matcha_metric preamble + SIMILARITY header"):
+timed("M15", "output: ##matcha_metric preamble + SIMILARITY header"):
   let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
   doAssert code == 0, "exit " & $code & ": " & outp
   let lines = outp.strip.splitLines
@@ -189,7 +189,7 @@ timed("M14", "output: ##matcha_metric preamble + SIMILARITY header"):
   doAssert "JACCARD" notin header, "JACCARD column should be gone"
 
 # M14b — --min-jaccard switches the metric line accordingly.
-timed("M14b", "##matcha_metric=jaccard when --min-jaccard is active"):
+timed("M16", "##matcha_metric=jaccard when --min-jaccard is active"):
   let (outp, code) = run("match --min-jaccard 0.5 " & FixtureA & " " & FixtureB)
   doAssert code == 0, "exit " & $code & ": " & outp
   let lines = outp.strip.splitLines
@@ -197,7 +197,7 @@ timed("M14b", "##matcha_metric=jaccard when --min-jaccard is active"):
     "got: " & lines[0]
 
 # M15 — .bcf inputs produce identical output to .vcf.gz inputs
-timed("M15", ".bcf inputs: same output as .vcf.gz inputs"):
+timed("M17", ".bcf inputs: same output as .vcf.gz inputs"):
   const FixtureA_bcf = "tests/fixtures/fixtureA.bcf"
   const FixtureB_bcf = "tests/fixtures/fixtureB.bcf"
   doAssert fileExists(FixtureA_bcf), "fixture missing: " & FixtureA_bcf
@@ -254,7 +254,7 @@ timed("S04", "--self: 1 positional arg is accepted"):
   doAssert code == 0, "expected exit 0, got " & $code & ": " & outp
 
 # S05 — --self with 0 or 2 positionals is an error mentioning --self
-timed("S05", "--self: 0 or 2 positionals errors out, mentions --self"):
+timed("S05", "--self: 0 or 2 positionals exits non-zero, mentions --self"):
   block:
     let (outp, code) = runMerged("match --self --min-overlap 0.5")
     doAssert code != 0, "expected non-zero exit with 0 positionals"

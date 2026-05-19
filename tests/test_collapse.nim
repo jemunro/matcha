@@ -209,7 +209,7 @@ timed("C12", "--info SVTYPE filter keeps SVTYPE, drops END and SVLEN"):
   doAssert not sawSvlen, "--info SVTYPE: SVLEN should be absent, but found"
 
 # CT03 — --format "" → output has zero sample columns
-timed("CT03", "--format '' produces zero-sample output"):
+timed("CT01", "--format '' produces zero-sample output"):
   let outBcf = tmpBcf()
   let (_, code) = run("collapse --min-jaccard 0.5 --format \"\" Caller1:" & FixCaller1 &
                       " Caller2:" & FixCaller2 & " -o " & outBcf)
@@ -227,7 +227,7 @@ timed("CT03", "--format '' produces zero-sample output"):
 
 # CT05 — 1-sample collapse: output has one sample column (caller 0's sample
 # name) and GT carries through per record from its source caller.
-timed("CT05", "1-sample collapse: SAMPLE1 column carries GT round-trip"):
+timed("CT02", "1-sample collapse: SAMPLE1 column carries GT round-trip"):
   let outBcf = tmpBcf()
   let (_, code) = run("collapse --min-jaccard 0.5 Caller1:" & FixCaller1_1S &
                       " Caller2:" & FixCaller2_1S & " -o " & outBcf)
@@ -263,7 +263,7 @@ timed("CT05", "1-sample collapse: SAMPLE1 column carries GT round-trip"):
            "DUP_D_01 GT=" & gts.getOrDefault("DUP_D_01")
 
 # CT06 — 2-sample input rejected with a clear error.
-timed("CT06", "multi-sample input causes non-zero exit with informative message"):
+timed("CT03", "multi-sample input causes non-zero exit with informative message"):
   let outBcf = tmpBcf()
   let (outp, code) = runMerged("collapse --min-jaccard 0.5 D:" & FixCaller1_2S &
                                " M:" & FixCaller2_1S & " -o " & outBcf)
@@ -275,7 +275,7 @@ timed("CT06", "multi-sample input causes non-zero exit with informative message"
            "expected informative reject message, got: " & outp
 
 # CT07 — inconsistent sample counts across inputs rejected.
-timed("CT07", "inconsistent sample counts cause non-zero exit"):
+timed("CT04", "inconsistent sample counts cause non-zero exit"):
   let outBcf = tmpBcf()
   let (outp, code) = runMerged("collapse --min-jaccard 0.5 D:" & FixCaller1_1S &
                                " M:" & FixCaller2 & " -o " & outBcf)
@@ -286,7 +286,7 @@ timed("CT07", "inconsistent sample counts cause non-zero exit"):
 
 # CT04 — 3-caller run (aliasing one fixture twice) — streaming loop ticks
 # across 3 readers; record counts/sources are correct.
-timed("CT04", "3-caller run: streaming across 3 readers produces sensible counts"):
+timed("CT05", "3-caller run: streaming across 3 readers produces sensible counts"):
   let outBcf = tmpBcf()
   let (_, code) = run("collapse --min-jaccard 0.5 " &
                       " Caller1:" & FixCaller1 &

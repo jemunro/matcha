@@ -75,7 +75,6 @@ type
   WarnState* = object
     skipped*:      array[SkipReason, int]
     emitted*:      array[SkipReason, int]
-    inconsistent*: int
     syntheticId*:  int
     nRead*:        int
     nKept*:        int
@@ -128,13 +127,6 @@ proc warnSkip*(reason: SkipReason, ws: var WarnState,
     logWarn(chrom & ":" & $pos & " ID=" & id &
             " reason=\"" & reasonStr(reason) & ": " & detail & "\"")
 
-proc warnInconsistency(ws: var WarnState,
-                       chrom: string, pos: int64, id: string, detail: string) =
-  inc ws.inconsistent
-  if ws.inconsistent <= ws.cap:
-    logWarn(chrom & ":" & $pos & " ID=" & id &
-            " reason=\"end_svlen_inconsistent: " & detail & "\"")
-
 proc symbolicAltSvtype(alt: string): SvType =
   ## Parse `<DEL>`, `<DUP>`, `<INV>`, `<INS>`, `<TRA>` → corresponding SvType.
   ## Returns svUNKNOWN for non-symbolic ALTs (e.g. BND breakend strings).
@@ -179,10 +171,6 @@ proc parseBndAlt*(alt: string): tuple[ok: bool; chr2: string; pos2: int64] =
     return
   if pos <= 0: return
   (ok: true, chr2: chrom, pos2: pos)
-
-proc inconsistencyExceedsTenPct(svlen, endDerived: int64): bool =
-  if svlen <= 0: return false
-  abs(svlen - endDerived).float / svlen.float > 0.10
 
 proc synthesizeId(chrom: string, pos: int64, svt: SvType, lineno: int): string =
   chrom & "_" & $pos & "_" & $svt & "_" & $lineno
@@ -241,6 +229,60 @@ proc resolveSvlen(v: Variant, endPos: int64, infoSvlen: var seq[int32]):
     return (true, derived, false)
   return (false, 0'i64, false)
 
+proc resolveRecord(view: Variant; ws: var WarnState;
+                   chrom: string; pos1: int64; curId: string;
+                   svtypeBuf: var string;
+                   endBuf, svlenBuf: var seq[int32]):
+    tuple[ok: bool; svt: SvType; endPos: int64; svlen: int64; binIdx: int;
+          bndChr2: string; bndPos2: int64] =
+  ## Resolve SVTYPE/END/SVLEN and skip-classify a record. Emits warnSkip for
+  ## skip reasons but does not touch ws.nRead/ws.nKept and does not mutate the
+  ## record. Callers handle counters, ID synthesis, multiallelic/contig-error
+  ## checks (which differ between the hts-nim and C-API paths), and writes.
+  result.ok = false
+
+  let svt = resolveSvtype(view, svtypeBuf)
+  if svt == svUNKNOWN:
+    warnSkip(skUnresolvableSvtype, ws, chrom, pos1, curId,
+             "no INFO/SVTYPE and no recognizable ALT")
+    return
+  if svt == svTRA:
+    warnSkip(skUnsupportedTra, ws, chrom, pos1, curId,
+             "TRA records are not supported (use BND notation)")
+    return
+  if svt notin SupportedSvTypes:
+    inc ws.skipped[skUnsupportedSvtype]   # INS lands here silently
+    return
+
+  if svt == svBND:
+    let alts = view.ALT
+    let altStr = if alts.len > 0: alts[0] else: ""
+    let bnd = parseBndAlt(altStr)
+    if not bnd.ok:
+      warnSkip(skMalformedBnd, ws, chrom, pos1, curId,
+               "could not parse breakend ALT: '" & altStr & "'")
+      return
+    return (ok: true, svt: svt, endPos: pos1 + 1, svlen: 0'i64, binIdx: 0,
+            bndChr2: bnd.chr2, bndPos2: bnd.pos2)
+
+  let endR = resolveEnd(view, endBuf, svlenBuf)
+  if not endR.ok:
+    warnSkip(skUnresolvableEnd, ws, chrom, pos1, curId,
+             "missing both INFO/END and INFO/SVLEN")
+    return
+  if endR.endPos <= pos1:
+    warnSkip(skEndLePos, ws, chrom, pos1, curId,
+             "END=" & $endR.endPos & " <= POS=" & $pos1)
+    return
+  let svR = resolveSvlen(view, endR.endPos, svlenBuf)
+  if not svR.ok:
+    warnSkip(skUnresolvableEnd, ws, chrom, pos1, curId,
+             "could not resolve SVLEN")
+    return
+
+  (ok: true, svt: svt, endPos: endR.endPos, svlen: svR.svlen,
+   binIdx: binIndexFor(svR.svlen), bndChr2: "", bndPos2: 0'i64)
+
 proc ensureSvInfoDefs(h: vcf.Header) =
   for def in SvInfoDefs:
     let (id, num, typ, desc) = def
@@ -257,7 +299,7 @@ proc normalizeRecord*(hdr: ptr bcf_hdr_t; rec: ptr bcf1_t; lineno: int;
           bndChr2: string; bndPos2: int64] =
   ## Resolve SVTYPE/END/SVLEN/binIdx for a single record. May synthesize an
   ## ID on the record (via bcf_update_id) and may quit() on multiallelic input.
-  ## Increments `ws` counters for skipped/synthesized/inconsistent records.
+  ## Increments `ws` counters for skipped/synthesized records.
   ## Returns ok=false for any skip reason; caller should not write the record.
   ##
   ## `view` is a reusable non-owning Variant wrapper (from synced_bcf_reader's
@@ -287,73 +329,19 @@ proc normalizeRecord*(hdr: ptr bcf_hdr_t; rec: ptr bcf1_t; lineno: int;
   let pos1  = rec.pos + 1
   let curId = getRecId(rec)
 
-  let svt = resolveSvtype(view, svtypeBuf)
-  if svt == svUNKNOWN:
-    warnSkip(skUnresolvableSvtype, ws, chrom, pos1, curId,
-             "no INFO/SVTYPE and no recognizable ALT")
-    return
-  if svt == svTRA:
-    warnSkip(skUnsupportedTra, ws, chrom, pos1, curId,
-             "TRA records are not supported (use BND notation)")
-    return
-  if svt notin SupportedSvTypes:
-    inc ws.skipped[skUnsupportedSvtype]  # INS lands here silently
-    return
-
-  var endPos, svlen: int64
-  var binIdx: int
-  var bndChr2: string
-  var bndPos2: int64
-
-  if svt == svBND:
-    var altStr = ""
-    if rec.n_allele.int > 1 and rec.d.allele != nil:
-      let alts = cast[cstringArray](rec.d.allele)
-      altStr = $alts[1]
-    let bnd = parseBndAlt(altStr)
-    if not bnd.ok:
-      warnSkip(skMalformedBnd, ws, chrom, pos1, curId,
-               "could not parse breakend ALT: '" & altStr & "'")
-      return
-    bndChr2 = bnd.chr2
-    bndPos2 = bnd.pos2
-    endPos  = pos1 + 1
-    svlen   = 0
-    binIdx  = 0
-  else:
-    let endR = resolveEnd(view, endBuf, svlenBuf)
-    if not endR.ok:
-      warnSkip(skUnresolvableEnd, ws, chrom, pos1, curId,
-               "missing both INFO/END and INFO/SVLEN")
-      return
-    if endR.endPos <= pos1:
-      warnSkip(skEndLePos, ws, chrom, pos1, curId,
-               "END=" & $endR.endPos & " <= POS=" & $pos1)
-      return
-    let svR = resolveSvlen(view, endR.endPos, svlenBuf)
-    if not svR.ok:
-      warnSkip(skUnresolvableEnd, ws, chrom, pos1, curId,
-               "could not resolve SVLEN")
-      return
-    let endDerived = endR.endPos - pos1
-    var sv = svR.svlen
-    if endR.fromInfo and svR.fromInfo and inconsistencyExceedsTenPct(sv, endDerived):
-      warnInconsistency(ws, chrom, pos1, curId,
-                        "INFO/SVLEN=" & $sv & " vs END-POS=" & $endDerived)
-      sv = endDerived
-    endPos = endR.endPos
-    svlen  = sv
-    binIdx = binIndexFor(svlen)
+  let r = resolveRecord(view, ws, chrom, pos1, curId,
+                        svtypeBuf, endBuf, svlenBuf)
+  if not r.ok: return
 
   # Synthesize ID if missing
   if curId.len == 0:
-    let newId = synthesizeId(chrom, pos1, svt, lineno)
+    let newId = synthesizeId(chrom, pos1, r.svt, lineno)
     discard bcf_update_id(hdr, rec, newId.cstring)
     inc ws.syntheticId
 
   inc ws.nKept
-  (ok: true, svt: svt, endPos: endPos, svlen: svlen, binIdx: binIdx,
-   bndChr2: bndChr2, bndPos2: bndPos2)
+  (ok: true, svt: r.svt, endPos: r.endPos, svlen: r.svlen, binIdx: r.binIdx,
+   bndChr2: r.bndChr2, bndPos2: r.bndPos2)
 
 proc emitSummary*(ws: WarnState) =
   let nSkipped = ws.nRead - ws.nKept
@@ -363,9 +351,8 @@ proc emitSummary*(ws: WarnState) =
   for r in SkipReason:
     parts.add(reasonStr(r) & "=" & $ws.skipped[r])
   logWarn("  by reason: " & parts.join(", "))
-  logWarn("  inconsistencies: " & $ws.inconsistent &
-          " END/SVLEN >10% (END used as authoritative)")
-  logWarn("  ids synthesized: " & $ws.syntheticId)
+  if ws.syntheticId > 0:
+    logWarn("  ids synthesized: " & $ws.syntheticId)
 
 proc tempBcfPath(tmpDir, prefix, svtype: string, binIdx: int): string =
   tmpDir / "matcha_" & $getCurrentProcessId() & "_" & prefix & "_" &
@@ -477,75 +464,22 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
                          " — split multiallelics before running matcha"
         quit(1)
 
-      let svt = resolveSvtype(v, svtypeStr)
-      if svt == svUNKNOWN:
-        warnSkip(skUnresolvableSvtype, ws, $v.CHROM, v.POS, $v.ID,
-                 "no INFO/SVTYPE and no recognizable ALT")
-        break recordBody
-      if svt == svTRA:
-        warnSkip(skUnsupportedTra, ws, $v.CHROM, v.POS, $v.ID,
-                 "TRA records are not supported (use BND notation)")
-        break recordBody
-      if svt notin SupportedSvTypes:
-        inc ws.skipped[skUnsupportedSvtype]   # INS lands here
-        break recordBody
-
-      # Resolve END/SVLEN and assign a size bin. BND records take a
-      # dedicated branch: they are point events, so size has no meaning —
-      # END is set to POS+1 (CSI requires endPos > pos), SVLEN to 0, and
-      # they all land in a single (svBND, bin 0) temp BCF. CHR2/POS2 are
-      # parsed from the breakend ALT and authoritatively rewritten below.
-      var endPos: int64
-      var svlen: int64
-      var binIdx: int
-      var bndChr2: string
-      var bndPos2: int64
-      if svt == svBND:
-        let alts = v.ALT
-        let altStr = if alts.len > 0: alts[0] else: ""
-        let bnd = parseBndAlt(altStr)
-        if not bnd.ok:
-          warnSkip(skMalformedBnd, ws, $v.CHROM, v.POS, $v.ID,
-                   "could not parse breakend ALT: '" & altStr & "'")
-          break recordBody
-        bndChr2 = bnd.chr2
-        bndPos2 = bnd.pos2
-        endPos = v.POS + 1
-        svlen = 0
-        binIdx = 0
-      else:
-        let (eOk, ep, endFromInfo) = resolveEnd(v, endData, svlenData)
-        if not eOk:
-          warnSkip(skUnresolvableEnd, ws, $v.CHROM, v.POS, $v.ID,
-                   "missing both INFO/END and INFO/SVLEN")
-          break recordBody
-
-        if ep <= v.POS:
-          warnSkip(skEndLePos, ws, $v.CHROM, v.POS, $v.ID,
-                   "END=" & $ep & " <= POS=" & $v.POS)
-          break recordBody
-
-        let (sOk, svlenInit, svlenFromInfo) = resolveSvlen(v, ep, svlenData)
-        if not sOk:
-          warnSkip(skUnresolvableEnd, ws, $v.CHROM, v.POS, $v.ID,
-                   "could not resolve SVLEN")
-          break recordBody
-
-        let endDerived = ep - v.POS
-        var sv = svlenInit
-        if endFromInfo and svlenFromInfo and
-           inconsistencyExceedsTenPct(sv, endDerived):
-          warnInconsistency(ws, $v.CHROM, v.POS, $v.ID,
-                            "INFO/SVLEN=" & $sv & " vs END-POS=" & $endDerived)
-          sv = endDerived
-        endPos = ep
-        svlen = sv
-        binIdx = binIndexFor(svlen)
+      let chrom = $v.CHROM
+      let pos1  = v.POS
+      let curId = $v.ID
+      let r = resolveRecord(v, ws, chrom, pos1, curId,
+                            svtypeStr, endData, svlenData)
+      if not r.ok: break recordBody
+      let svt    = r.svt
+      let endPos = r.endPos
+      let svlen  = r.svlen
+      let binIdx = r.binIdx
+      let bndChr2 = r.bndChr2
+      let bndPos2 = r.bndPos2
 
       # Synthesize ID if missing
-      let curId = $v.ID
       if curId.len == 0 or curId == ".":
-        v.ID = synthesizeId($v.CHROM, v.POS, svt, lineno)
+        v.ID = synthesizeId(chrom, pos1, svt, lineno)
         inc ws.syntheticId
 
       # Slim INFO: drop everything outside the per-SVTYPE keep-set (two-phase

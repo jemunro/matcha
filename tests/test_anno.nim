@@ -79,7 +79,7 @@ proc mkMatch(posB: int64; sim: float64;
   AnnoMatch(aIndex: 0, posB: posB,
             similarity: sim, payload: payload)
 
-timed("A10", "applyAggFunc: max/min/mean over numeric DB field"):
+timed("A05", "applyAggFunc: max/min/mean over numeric DB field"):
   var e = parseAnnoExpr("X=max(AF)"); e.dbType = "Float"; e.dbNumber = "1"
   let m1 = mkMatch(100, 1.0, {"AF": @["0.1"]}.toTable)
   let m2 = mkMatch(200, 1.0, {"AF": @["0.5"]}.toTable)
@@ -94,7 +94,7 @@ timed("A10", "applyAggFunc: max/min/mean over numeric DB field"):
   let mean = parseFloat(applyAggFunc(e, matches)[0])
   doAssert abs(mean - 0.3) < 1e-5, "mean should be 0.3, got " & $mean
 
-timed("A11", "applyAggFunc: first/last respect posB ordering"):
+timed("A06", "applyAggFunc: first/last respect posB ordering"):
   var e = parseAnnoExpr("X=first(CALLER)"); e.dbType = "String"; e.dbNumber = "1"
   let matches = @[
     mkMatch(300, 1.0, {"CALLER": @["c"]}.toTable),
@@ -105,7 +105,7 @@ timed("A11", "applyAggFunc: first/last respect posB ordering"):
   e.fn = afLast
   doAssert applyAggFunc(e, matches) == @["c"]
 
-timed("A12", "applyAggFunc: best ranks by similarity"):
+timed("A07", "applyAggFunc: best ranks by similarity"):
   var e = parseAnnoExpr("X=best(CALLER)"); e.dbType = "String"; e.dbNumber = "1"
   let matches = @[
     mkMatch(100, 0.5, {"CALLER": @["lo"]}.toTable),
@@ -114,7 +114,7 @@ timed("A12", "applyAggFunc: best ranks by similarity"):
   ]
   doAssert applyAggFunc(e, matches) == @["top"]
 
-timed("A13", "applyAggFunc: best tie-break by earliest posB"):
+timed("A08", "applyAggFunc: best tie-break by earliest posB"):
   var e = parseAnnoExpr("X=best(CALLER)"); e.dbType = "String"; e.dbNumber = "1"
   let matches = @[
     mkMatch(300, 0.9, {"CALLER": @["late"]}.toTable),
@@ -123,7 +123,7 @@ timed("A13", "applyAggFunc: best tie-break by earliest posB"):
   ]
   doAssert applyAggFunc(e, matches) == @["early"]
 
-timed("A14", "applyAggFunc: all flattens list-valued source across matches"):
+timed("A09", "applyAggFunc: all flattens list-valued source across matches"):
   var e = parseAnnoExpr("X=all(CALLERS)"); e.dbType = "String"; e.dbNumber = "."
   let matches = @[
     mkMatch(100, 1.0, {"CALLERS": @["a", "b"]}.toTable),
@@ -131,7 +131,7 @@ timed("A14", "applyAggFunc: all flattens list-valued source across matches"):
   ]
   doAssert applyAggFunc(e, matches) == @["a", "b", "c"]
 
-timed("A15", "applyAggFunc: unique deduplicates flattened list"):
+timed("A10", "applyAggFunc: unique deduplicates flattened list"):
   var e = parseAnnoExpr("X=unique(CALLERS)"); e.dbType = "String"; e.dbNumber = "."
   let matches = @[
     mkMatch(100, 1.0, {"CALLERS": @["a", "b"]}.toTable),
@@ -139,7 +139,7 @@ timed("A15", "applyAggFunc: unique deduplicates flattened list"):
   ]
   doAssert applyAggFunc(e, matches) == @["a", "b", "c"]
 
-timed("A16", "applyAggFunc: empty match set returns absent except MATCHA_COUNT=0"):
+timed("A11", "applyAggFunc: empty match set returns absent except MATCHA_COUNT=0"):
   var e1 = parseAnnoExpr("X=max(AF)"); e1.dbType = "Float"; e1.dbNumber = "1"
   doAssert applyAggFunc(e1, @[]).len == 0
 
@@ -149,7 +149,7 @@ timed("A16", "applyAggFunc: empty match set returns absent except MATCHA_COUNT=0
   let e3 = parseAnnoExpr("S=max(MATCHA_SIMILARITY)")
   doAssert applyAggFunc(e3, @[]).len == 0
 
-timed("A17", "applyAggFunc: MATCHA_SIMILARITY vector vs scalar MATCHA_COUNT"):
+timed("A12", "applyAggFunc: MATCHA_SIMILARITY vector vs scalar MATCHA_COUNT"):
   let matches = @[
     mkMatch(100, 0.9, initTable[string, seq[string]]()),
     mkMatch(200, 0.4, initTable[string, seq[string]]()),
@@ -164,7 +164,7 @@ timed("A17", "applyAggFunc: MATCHA_SIMILARITY vector vs scalar MATCHA_COUNT"):
 # End-to-end integration tests against the matcha binary
 # ---------------------------------------------------------------------------
 
-timed("A30", "binary available with anno subcommand"):
+timed("A13", "binary available with anno subcommand"):
   if not fileExists(BinPath):
     let (outp, code) = execCmdEx("nimble build 2>&1")
     if code != 0:
@@ -173,23 +173,23 @@ timed("A30", "binary available with anno subcommand"):
   doAssert code == 0, "anno --help exit " & $code
   doAssert "OUTFIELD=FUNC(SRCFIELD)" in outp
 
-timed("A31", "no -a expression: hard error"):
+timed("A14", "no -a expression: exits non-zero"):
   let (outp, code) = runMerged("anno --min-overlap 0.5 " & FixtureA & " " & FixtureDB)
   doAssert code != 0
   doAssert "-a" in outp or "expression" in outp,
     "error should mention missing -a: " & outp
 
-timed("A32", "no threshold: uses default --min-jaccard 0.75"):
+timed("A15", "no threshold: uses default --min-jaccard 0.75"):
   let (outp, code) = run("anno -a X=max\\(AF\\) " & FixtureA & " " & FixtureDB)
   doAssert code == 0, "should exit 0 with default threshold, got: " & outp
 
-timed("A33", "unknown DB SRCFIELD: hard error"):
+timed("A16", "unknown DB SRCFIELD: exits non-zero"):
   let (outp, code) = runMerged("anno -a X=max\\(NOPE\\) --min-overlap 0.5 " &
                                 FixtureA & " " & FixtureDB)
   doAssert code != 0
   doAssert "NOPE" in outp
 
-timed("A34", "end-to-end: max/min/mean/unique annotations"):
+timed("A17", "end-to-end: max/min/mean/unique annotations"):
   let (outp, code) = run("anno --min-overlap 0.5 " &
     "-a AF_MAX=max\\(AF\\) -a AF_MIN=min\\(AF\\) -a AF_MEAN=mean\\(AF\\) " &
     "-a CALLERS_U=unique\\(CALLERS\\) -a N=first\\(MATCHA_COUNT\\) " &
@@ -207,7 +207,7 @@ timed("A34", "end-to-end: max/min/mean/unique annotations"):
   doAssert a06["CALLERS_U"] == "delly,gatk,manta", "got " & a06["CALLERS_U"]
   doAssert a06["N"] == "2", "N=" & a06["N"]
 
-timed("A35", "end-to-end: MATCHA_COUNT=0 on unmatched, absent fields"):
+timed("A18", "end-to-end: MATCHA_COUNT=0 on unmatched, absent fields"):
   let (outp, code) = run("anno --min-overlap 0.5 " &
     "-a AF_MAX=max\\(AF\\) -a N=first\\(MATCHA_COUNT\\) " &
     FixtureA & " " & FixtureDB)
@@ -219,7 +219,7 @@ timed("A35", "end-to-end: MATCHA_COUNT=0 on unmatched, absent fields"):
   doAssert a07["N"] == "0", "N should be 0 on unmatched, got " & a07["N"]
   doAssert "AF_MAX" notin a07, "AF_MAX should be absent on unmatched"
 
-timed("A36", "end-to-end: INS pass-through; BND annotated via BND_DB"):
+timed("A19", "end-to-end: INS pass-through; BND annotated via BND_DB"):
   let (outp, code) = run("anno --min-overlap 0.5 -a X=max\\(AF\\) " &
     FixtureA & " " & FixtureDB)
   doAssert code == 0
@@ -234,7 +234,7 @@ timed("A36", "end-to-end: INS pass-through; BND annotated via BND_DB"):
   doAssert info["BND_A_11"]["X"].startsWith("0.4"),
     "BND_A_11 X should be 0.40, got " & info["BND_A_11"]["X"]
 
-timed("A37", "end-to-end: -o file output matches stdout output"):
+timed("A20", "end-to-end: -o file output matches stdout output"):
   let (stdoutText, code1) = run("anno --min-overlap 0.5 -a X=max\\(AF\\) " &
     FixtureA & " " & FixtureDB)
   doAssert code1 == 0
@@ -247,7 +247,7 @@ timed("A37", "end-to-end: -o file output matches stdout output"):
   doAssert fileExists(tmpVcf)
   doAssert readFile(tmpVcf) == stdoutText
 
-timed("A38", "end-to-end: .bcf output written and indexed"):
+timed("A21", "end-to-end: .bcf output written and indexed"):
   let tmpBcf = getTempDir() / "matcha_anno_test.bcf"
   defer:
     if fileExists(tmpBcf): removeFile(tmpBcf)
@@ -263,7 +263,7 @@ when false:
   # here due to a process/fork limit in the Codespace runtime. It works
   # fine on a normal terminal. Re-enable once we move the suite off this
   # environment, or migrate the test to a forkless runner.
-  timed("A39", "end-to-end: --threads 2 matches --threads 1"):
+  timed("A22", "end-to-end: --threads 2 matches --threads 1"):
     let (t1, c1) = run("anno --min-overlap 0.5 -a X=max\\(AF\\) -a N=first\\(MATCHA_COUNT\\) " &
       FixtureA & " " & FixtureDB)
     let (t2, c2) = run("anno --threads 2 --min-overlap 0.5 -a X=max\\(AF\\) -a N=first\\(MATCHA_COUNT\\) " &
@@ -271,7 +271,7 @@ when false:
     doAssert c1 == 0 and c2 == 0
     doAssert t1 == t2, "threaded output differs from single-threaded"
 
-timed("A40", "end-to-end: best() ranks by similarity, tie-breaks by posB"):
+timed("A23", "end-to-end: best() ranks by similarity, tie-breaks by posB"):
   # On DEL_A_06 both matches have the same overlap (0.95) → tied; the
   # tiebreak by earliest posB chooses DEL_DB_06b (posB=12950, CALLER=delly).
   let (outp, code) = run("anno --min-overlap 0.5 -a CB=best\\(CALLER\\) " &
@@ -282,7 +282,7 @@ timed("A40", "end-to-end: best() ranks by similarity, tie-breaks by posB"):
     "best(CALLER) on DEL_A_06 should be delly (earliest posB), got " &
     info["DEL_A_06"]["CB"]
 
-timed("A40b", "end-to-end: --best-metric is rejected (removed flag)"):
+timed("A24", "end-to-end: --best-metric is rejected (removed flag)"):
   let (outp, code) = runMerged(
     "anno --min-overlap 0.5 --best-metric overlap -a X=max\\(AF\\) " &
     FixtureA & " " & FixtureDB)
@@ -290,7 +290,7 @@ timed("A40b", "end-to-end: --best-metric is rejected (removed flag)"):
   doAssert "best-metric" in outp or "unknown option" in outp,
     "error should mention unknown option, got: " & outp
 
-timed("A43", "end-to-end: BND-DB annotation picks up similarity vector"):
+timed("A25", "end-to-end: BND-DB annotation picks up similarity vector"):
   # BND_A_11 matches BND_DB_11 with sim=1.0.
   let (outp, code) = run("anno --min-overlap 0.5 " &
     "-a S=max\\(MATCHA_SIMILARITY\\) -a N=first\\(MATCHA_COUNT\\) " &
@@ -304,7 +304,7 @@ timed("A43", "end-to-end: BND-DB annotation picks up similarity vector"):
   doAssert abs(parseFloat(simStr) - 1.0) < 1e-5,
     "BND_A_11 sim should be ~1.0, got " & simStr
 
-timed("A44", "end-to-end: ##matcha_metric header line is emitted"):
+timed("A26", "end-to-end: ##matcha_metric header line is emitted"):
   let (outp, code) = run(
     "anno --min-overlap 0.5 -a X=max\\(AF\\) " & FixtureA & " " & FixtureDB)
   doAssert code == 0
@@ -316,7 +316,7 @@ timed("A44", "end-to-end: ##matcha_metric header line is emitted"):
   doAssert "##matcha_metric=jaccard" in outp2,
     "expected ##matcha_metric=jaccard in header"
 
-timed("A45", "end-to-end: MATCHA_OVERLAP/MATCHA_JACCARD now fail as unknown DB"):
+timed("A27", "end-to-end: MATCHA_OVERLAP/MATCHA_JACCARD rejected as unknown DB fields"):
   # The old names are gone — they fall through to the standard "unknown
   # DB SRCFIELD" path.
   let (outp, code) = runMerged(
@@ -326,7 +326,7 @@ timed("A45", "end-to-end: MATCHA_OVERLAP/MATCHA_JACCARD now fail as unknown DB")
   doAssert "MATCHA_JACCARD" in outp,
     "error should mention the unknown SRCFIELD, got: " & outp
 
-timed("A41", "end-to-end: OUTFIELD collision with input header errors without --overwrite"):
+timed("A28", "end-to-end: OUTFIELD collision with input header rejected without --overwrite"):
   # SVTYPE is already in fixtureA's header. Trying to write to it without
   # --overwrite must error.
   let (outp, code) = runMerged("anno --min-overlap 0.5 -a SVTYPE=first\\(CALLER\\) " &
@@ -335,7 +335,7 @@ timed("A41", "end-to-end: OUTFIELD collision with input header errors without --
   doAssert "overwrite" in outp.toLowerAscii or "already" in outp.toLowerAscii,
     "expected overwrite-required error, got: " & outp
 
-timed("A42", "end-to-end: --overwrite allows replacing existing INFO field"):
+timed("A29", "end-to-end: --overwrite allows replacing existing INFO field"):
   let (_, code) = run("anno --overwrite --min-overlap 0.5 -a SVTYPE=first\\(CALLER\\) " &
     FixtureA & " " & FixtureDB)
   doAssert code == 0, "should succeed with --overwrite, exit " & $code

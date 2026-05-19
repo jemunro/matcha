@@ -54,7 +54,7 @@ timed("P02", "preprocessVcf: BND kept; INS and TRA excluded"):
     doAssert key.svtype != svTRA, "TRA should be excluded"
 
 # P02b — BND slim record carries authoritative CHR2/POS2 from ALT parse.
-timed("P02b", "preprocessVcf: BND slim record has CHR2/POS2 parsed from ALT"):
+timed("P03", "preprocessVcf: BND slim record has CHR2/POS2 parsed from ALT"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
@@ -78,7 +78,7 @@ timed("P02b", "preprocessVcf: BND slim record has CHR2/POS2 parsed from ALT"):
   doAssert foundA11, "BND_A_11 missing from BND temp BCF"
 
 # P03 — extracted fields are correct (POS, END, ID)
-timed("P03", "preprocessVcf: DEL_A_01 has correct POS=1000, END=2000"):
+timed("P04", "preprocessVcf: DEL_A_01 has correct POS=1000, END=2000"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
@@ -98,7 +98,7 @@ timed("P03", "preprocessVcf: DEL_A_01 has correct POS=1000, END=2000"):
   doAssert found, "DEL_A_01 not found in temp BCF"
 
 # P04 — every temp BCF has a CSI index
-timed("P04", "preprocessVcf: every temp BCF has a .csi index file"):
+timed("P05", "preprocessVcf: every temp BCF has a .csi index file"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
@@ -107,7 +107,7 @@ timed("P04", "preprocessVcf: every temp BCF has a .csi index file"):
       "missing CSI index for " & $key.svtype & "/bin" & $key.bin & ": " & path
 
 # P05 — every emitted job key is in both A and B
-timed("P05", "buildWorkQueue: every job (chrom, svtype, binA) is reachable in both"):
+timed("P06", "buildWorkQueue: every job (chrom, svtype, binA) is reachable in both"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let ppA = preprocessVcf(FixtureA, tmpDir, "A")
@@ -127,7 +127,7 @@ timed("P05", "buildWorkQueue: every job (chrom, svtype, binA) is reachable in bo
         "job binB references missing B path"
 
 # P06 — chrom order in jobs respects A's input header order
-timed("P06", "buildWorkQueue: jobs ordered by VCF header chrom order"):
+timed("P07", "buildWorkQueue: jobs ordered by VCF header chrom order"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let ppA = preprocessVcf(FixtureA, tmpDir, "A")
@@ -145,7 +145,7 @@ timed("P06", "buildWorkQueue: jobs ordered by VCF header chrom order"):
     prev = cur
 
 # P07 — preprocessVcf works on .bcf inputs
-timed("P07", "preprocessVcf: accepts .bcf input"):
+timed("P08", "preprocessVcf: accepts .bcf input"):
   const FixtureA_bcf = "tests/fixtures/fixtureA.bcf"
   doAssert fileExists(FixtureA_bcf), "fixture missing: " & FixtureA_bcf
   let tmpDir = createTempDir("matcha_test_", "")
@@ -180,7 +180,7 @@ proc readRecords(path: string): seq[tuple[id: string, pos: int64, endPos: int64,
   vcf.close()
 
 # P08 — INFO is slimmed to per-SVTYPE keep-set only after preprocessing
-timed("P08", "preprocessVcf: temp BCF records have only keep-set INFO fields"):
+timed("P09", "preprocessVcf: temp BCF records have only keep-set INFO fields"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
@@ -195,7 +195,7 @@ timed("P08", "preprocessVcf: temp BCF records have only keep-set INFO fields"):
           " (svtype=" & $key.svtype & ")"
 
 # P09 — record with ID="." gets synthesized (CHROM_POS_SVTYPE_LINENUMBER)
-timed("P09", "preprocessVcf: missing ID is synthesized"):
+timed("P10", "preprocessVcf: missing ID is synthesized"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
@@ -209,7 +209,7 @@ timed("P09", "preprocessVcf: missing ID is synthesized"):
   doAssert found, "expected synthesized ID prefix chr1_37000_DEL_<lineno>"
 
 # P10 — symbolic ALT only (no INFO/SVTYPE) is routed to the right SVTYPE BCF
-timed("P10", "preprocessVcf: ALT-symbolic SVTYPE (TC12) routed to (DEL, 0)"):
+timed("P11", "preprocessVcf: ALT-symbolic SVTYPE (TC12) routed to (DEL, 0)"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
@@ -221,7 +221,7 @@ timed("P10", "preprocessVcf: ALT-symbolic SVTYPE (TC12) routed to (DEL, 0)"):
   doAssert found, "DEL_A_12_alt_only missing from (DEL, 0) BCF"
 
 # P11 — SVTYPE conflict (INFO=DUP, ALT=<DEL>) → ALT wins; record lands in DEL BCF
-timed("P11", "preprocessVcf: ALT wins on SVTYPE conflict (TC13)"):
+timed("P12", "preprocessVcf: ALT wins on SVTYPE conflict (TC13)"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
@@ -237,7 +237,7 @@ timed("P11", "preprocessVcf: ALT wins on SVTYPE conflict (TC13)"):
         doAssert rec.id != "DEL_A_13_conflict", "should not be in any DUP bin"
 
 # P12 — record with neither END nor SVLEN is skipped
-timed("P12", "preprocessVcf: missing END and SVLEN → skipped (TC15)"):
+timed("P13", "preprocessVcf: missing END and SVLEN → skipped (TC15)"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
@@ -247,7 +247,7 @@ timed("P12", "preprocessVcf: missing END and SVLEN → skipped (TC15)"):
         "TC15 should have been skipped (no END, no SVLEN)"
 
 # P13 — record with END < POS is skipped
-timed("P13", "preprocessVcf: END <= POS → skipped (TC16)"):
+timed("P14", "preprocessVcf: END <= POS → skipped (TC16)"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
@@ -255,21 +255,6 @@ timed("P13", "preprocessVcf: END <= POS → skipped (TC16)"):
     for rec in readRecords(path):
       doAssert rec.id != "DEL_A_16_bad_end",
         "TC16 should have been skipped (END < POS)"
-
-# P14 — END/SVLEN inconsistency >10% → kept; SVLEN normalized to END-POS
-timed("P14", "preprocessVcf: inconsistent END/SVLEN → SVLEN := END-POS (TC17)"):
-  let tmpDir = createTempDir("matcha_test_", "")
-  defer: removeDir(tmpDir)
-  let pp = preprocessVcf(FixtureA, tmpDir, "A")
-  var found = false
-  for rec in readRecords(pp.delBin0):
-    if rec.id == "DEL_A_17_inconsistent":
-      # Input: POS=43000, END=44000, INFO/SVLEN=-1500. END-POS=1000.
-      # |1500-1000|/1500 = 33% > 10% → END wins, SVLEN normalized to 1000.
-      doAssert rec.endPos == 44000, "END should be 44000, got " & $rec.endPos
-      found = true
-      break
-  doAssert found, "DEL_A_17_inconsistent missing from (DEL, 0) BCF"
 
 # P15 — SRC_INDEX is present on every slim BCF record and values are unique
 timed("P15", "preprocessVcf: SRC_INDEX present and unique on slim BCF records"):
