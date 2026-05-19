@@ -345,10 +345,9 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
 
   # Build a PreprocOutput describing the merged slim BCFs for buildWorkQueue.
   let mergedPreproc = PreprocOutput(
-    paths:          im.paths,
-    populatedBins:  im.populatedBins,
-    chromsBySvtype: im.chromsBySvtype,
-    chromOrder:     chromOrder,
+    paths:      im.paths,
+    populated:  im.populated,
+    chromOrder: chromOrder,
   )
 
   # Phase 3: self-match + cluster + representative selection (shared pipeline).

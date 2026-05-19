@@ -47,10 +47,9 @@ type
   SvtypeBin* = tuple[svtype: SvType, bin: int]
 
   PreprocOutput* = object
-    paths*:          Table[SvtypeBin, string]         ## (svtype, bin) → BCF path
-    populatedBins*:  Table[SvType, set[uint8]]        ## svtype → set of bin indexes
-    chromsBySvtype*: Table[SvType, HashSet[string]]   ## svtype → chroms seen
-    chromOrder*:     seq[string]                      ## chroms in input header order
+    paths*:     Table[SvtypeBin, string]              ## (svtype, bin) → BCF path
+    populated*: Table[SvtypeBin, HashSet[string]]     ## (svtype, bin) → chroms with ≥1 record
+    chromOrder*: seq[string]                          ## chroms in input header order
 
   BinBEntry* = tuple[path: string; fileIdx: int16]
 
@@ -533,11 +532,7 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
           if idx == nil:
             raise newException(IOError, "cannot create CSI index for: " & path)
           indexes[key] = idx
-      if svt notin result.chromsBySvtype:
-        result.chromsBySvtype[svt] = initHashSet[string]()
-      if svt notin result.populatedBins:
-        result.populatedBins[svt] = {}
-      result.populatedBins[svt].incl(uint8(binIdx))
+      result.populated.mgetOrPut(key, initHashSet[string]()).incl($v.CHROM)
 
       # REF/ALT and QUAL are unused by matchcore — blank them to shrink the
       # record.
@@ -552,7 +547,6 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
       if not noIndex:
         let woff = uint64(bgzf_tell(bgzfHandle(writers[key])))
         discard hts_idx_push(indexes[key], v.c.rid, int64(v.c.pos), int64(v.c.pos) + int64(v.c.rlen), woff, 1)
-      result.chromsBySvtype[svt].incl($v.CHROM)
       inc ws.nKept
 
   vcf.close()
@@ -612,12 +606,17 @@ proc buildWorkQueue*(a, b: PreprocOutput,
   for i, c in a.chromOrder:
     chromIdx[c] = i
 
+  # Derive per-svtype bin sets from b.populated for adjacentBins.
+  var bPopBins: Table[SvType, set[uint8]]
+  for k in b.populated.keys:
+    bPopBins.mgetOrPut(k.svtype, {}).incl(uint8(k.bin))
+
   var jobs: seq[MatchJob]
   for key, pathA in a.paths:
     let (svt, binA) = key
-    if svt notin b.populatedBins: continue
+    if svt notin bPopBins: continue
 
-    let adj = adjacentBins(binA, threshold, b.populatedBins[svt])
+    let adj = adjacentBins(binA, threshold, bPopBins[svt])
     if adj.len == 0: continue
 
     # In self mode, restrict binsB to binB >= binA so each cross-bin pair is
@@ -631,8 +630,13 @@ proc buildWorkQueue*(a, b: PreprocOutput,
         binsB[binB] = (path: bPath, fileIdx: pathToIdx[bPath])
     if binsB.len == 0: continue
 
-    let chromsA = a.chromsBySvtype[svt]
-    let chromsB = b.chromsBySvtype[svt]
+    # Only iterate chroms where (svt, binA) actually has A records.
+    let chromsA = a.populated.getOrDefault(key)
+    # Union B chroms across adjacent bins to build the intersection set.
+    var chromsB: HashSet[string]
+    for binB in adj:
+      for c in b.populated.getOrDefault((svt, binB)):
+        chromsB.incl(c)
     for chrom in chromsA:
       if chrom notin chromsB: continue
       jobs.add(MatchJob(

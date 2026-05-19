@@ -806,9 +806,8 @@ proc augmentSrcHdrForRenames*(srcHdr: ptr bcf_hdr_t; ci: int;
   discard bcf_hdr_sync(srcHdr)
 
 type IntegratedMergeResult* = object
-  paths*:          Table[SvtypeBin, string]
-  populatedBins*:  Table[SvType, set[uint8]]
-  chromsBySvtype*: Table[SvType, HashSet[string]]
+  paths*:     Table[SvtypeBin, string]
+  populated*: Table[SvtypeBin, HashSet[string]]
 
 proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
                       finalHdr: ptr bcf_hdr_t;
@@ -1006,12 +1005,9 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
           discard bcf_update_alleles_str(srcHdr, rec, "N,.".cstring)
 
         # 2i. Track metadata + lazy-open writer.
-        if nr.svt notin result.populatedBins:
-          result.populatedBins[nr.svt] = {}
-        result.populatedBins[nr.svt].incl(uint8(nr.binIdx))
-        if nr.svt notin result.chromsBySvtype:
-          result.chromsBySvtype[nr.svt] = initHashSet[string]()
-        result.chromsBySvtype[nr.svt].incl(getChromName(srcHdr, rec.rid))
+        let mKey: SvtypeBin = (nr.svt, nr.binIdx)
+        result.populated.mgetOrPut(mKey, initHashSet[string]()).incl(
+          getChromName(srcHdr, rec.rid))
 
         let key: SvtypeBin = (nr.svt, nr.binIdx)
         if key notin writers:

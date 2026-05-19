@@ -27,7 +27,7 @@ proc baseCfg(): MatchConfig =
   MatchConfig(metric: mOverlap, threshold: 0.5, nThreads: 1)
 
 # P01 — preprocessVcf produces the expected (svtype, bin) keys + chroms
-timed("P01", "preprocessVcf: (svtype, bin) keys + chromsBySvtype + populatedBins"):
+timed("P01", "preprocessVcf: (svtype, bin) keys + populated"):
   doAssert fileExists(FixtureA), "fixture missing: " & FixtureA
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
@@ -35,12 +35,9 @@ timed("P01", "preprocessVcf: (svtype, bin) keys + chromsBySvtype + populatedBins
   doAssert (svDEL, 0) in pp.paths, "missing (DEL, bin 0)"
   doAssert (svDUP, 1) in pp.paths, "missing (DUP, bin 1)"
   doAssert (svINV, 1) in pp.paths, "missing (INV, bin 1)"
-  doAssert 0'u8 in pp.populatedBins[svDEL], "DEL bin 0 not in populatedBins"
-  doAssert 1'u8 in pp.populatedBins[svDUP], "DUP bin 1 not in populatedBins"
-  doAssert 1'u8 in pp.populatedBins[svINV], "INV bin 1 not in populatedBins"
-  doAssert "chr1" in pp.chromsBySvtype[svDEL], "DEL should include chr1"
-  doAssert "chr2" in pp.chromsBySvtype[svDUP], "DUP should include chr2"
-  doAssert "chrX" in pp.chromsBySvtype[svINV], "INV should include chrX"
+  doAssert "chr1" in pp.populated.getOrDefault((svDEL, 0)), "DEL/bin0 missing chr1"
+  doAssert "chr2" in pp.populated.getOrDefault((svDUP, 1)), "DUP/bin1 missing chr2"
+  doAssert "chrX" in pp.populated.getOrDefault((svINV, 1)), "INV/bin1 missing chrX"
 
 # P02 — BND records are kept; INS and TRA are skipped.
 timed("P02", "preprocessVcf: BND kept; INS and TRA excluded"):
@@ -117,10 +114,13 @@ timed("P06", "buildWorkQueue: every job (chrom, svtype, binA) is reachable in bo
   for job in jobs:
     doAssert (job.svtype, job.binA) in ppA.paths,
       "job's (svtype, binA) not in A: " & $job.svtype & "/bin" & $job.binA
-    doAssert job.chrom in ppA.chromsBySvtype[job.svtype],
-      "chrom not in A's set: " & job.chrom & "/" & $job.svtype
-    doAssert job.chrom in ppB.chromsBySvtype[job.svtype],
-      "chrom not in B's set: " & job.chrom & "/" & $job.svtype
+    doAssert job.chrom in ppA.populated.getOrDefault((job.svtype, job.binA)),
+      "chrom not in A's populated set: " & job.chrom & "/" & $job.svtype & "/bin" & $job.binA
+    block chromInB:
+      for binB in job.binsB.keys:
+        if job.chrom in ppB.populated.getOrDefault((job.svtype, binB)):
+          break chromInB
+      doAssert false, "chrom not in any adjacent B bin: " & job.chrom & "/" & $job.svtype
     doAssert job.binsB.len > 0, "job has no adjacent B bins"
     for binB in job.binsB.keys:
       doAssert (job.svtype, binB) in ppB.paths,
@@ -152,7 +152,7 @@ timed("P08", "preprocessVcf: accepts .bcf input"):
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA_bcf, tmpDir, "A_bcf")
   doAssert (svDEL, 0) in pp.paths, "missing (DEL, bin 0) from .bcf input"
-  doAssert "chr1" in pp.chromsBySvtype[svDEL], "DEL/chr1 should be present"
+  doAssert "chr1" in pp.populated.getOrDefault((svDEL, 0)), "DEL/bin0/chr1 should be present"
 
 # Helper: collect every record in a per-(svtype, bin) BCF.
 proc readRecords(path: string): seq[tuple[id: string, pos: int64, endPos: int64,
@@ -286,8 +286,8 @@ timed("P16", "preprocessVcf: 5000bp DEL_A_08 lands in (DEL, bin 3)"):
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
   doAssert (svDEL, 3) in pp.paths,
     "expected (DEL, bin 3) populated for DEL_A_08"
-  doAssert 3'u8 in pp.populatedBins[svDEL],
-    "bin 3 should be in populatedBins[DEL]"
+  doAssert (svDEL, 3) in pp.populated,
+    "bin 3 should be in populated for DEL"
   var foundLarge = false
   for rec in readRecords(pp.paths[(svDEL, 3)]):
     if rec.id == "DEL_A_08":

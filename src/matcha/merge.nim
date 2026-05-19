@@ -823,10 +823,9 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
 
   # Build a PreprocOutput describing the merged slim BCFs.
   let mergedPreproc = PreprocOutput(
-    paths:          im.paths,
-    populatedBins:  im.populatedBins,
-    chromsBySvtype: im.chromsBySvtype,
-    chromOrder:     chromOrder,
+    paths:      im.paths,
+    populated:  im.populated,
+    chromOrder: chromOrder,
   )
 
   # Self-match + cluster + representative selection (shared pipeline).
