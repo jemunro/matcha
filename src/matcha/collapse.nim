@@ -236,8 +236,10 @@ proc writeOutput(cfg: CollapseConfig;
 
   let isBgzf = not isStdoutPath(cfg.outputPath) and
                (cfg.outputPath.endsWith(".bcf") or cfg.outputPath.endsWith(".vcf.gz"))
-  if cfg.nThreads >= 2 and isBgzf:
-    discard bgzf_mt(bgzfHandle(outVcf), 2, 128)
+  # bgzf_mt is intentionally skipped when building an inline CSI index: in MT
+  # mode bgzf_tell returns a stale block_address (not updated until the worker
+  # thread flushes the block), corrupting all virtual offsets beyond the first
+  # BGZF block.  Revisit using bcf_idx_init/bcf_idx_save for MT-safe indexing.
   var outIdx: ptr hts_idx_t = nil
   if isBgzf:
     let headerOff = uint64(bgzf_tell(bgzfHandle(outVcf)))
@@ -246,9 +248,9 @@ proc writeOutput(cfg: CollapseConfig;
       raise newException(IOError, "cannot create CSI index for: " & outPath)
 
   for br in buf:
-    let woff = uint64(bgzf_tell(bgzfHandle(outVcf)))
     discard bcf_write(vcfHtsFile(outVcf), finalHdr, br.rec)
     if outIdx != nil:
+      let woff = uint64(bgzf_tell(bgzfHandle(outVcf)))
       discard hts_idx_push(outIdx, br.rec.rid, int64(br.rec.pos),
                            int64(br.rec.pos) + int64(br.rec.rlen), woff, 1)
     bcf_destroy(br.rec)

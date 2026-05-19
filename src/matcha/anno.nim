@@ -543,12 +543,12 @@ proc runAnno*(cfg: var AnnoConfig) =
   if not outWriter.write_header():
     raise newException(IOError, "failed to write output header")
 
-  # Enable bgzf compression threads and real-time CSI indexing for compressed
-  # outputs. Plain VCF (stdout or .vcf) is neither compressed nor indexed.
+  # bgzf_mt is intentionally skipped when building an inline CSI index: in MT
+  # mode bgzf_tell returns a stale block_address (not updated until the worker
+  # thread flushes the block), corrupting all virtual offsets beyond the first
+  # BGZF block.  Revisit using bcf_idx_init/bcf_idx_save for MT-safe indexing.
   let isBgzf = not isStdoutPath(cfg.outputPath) and
                (outPath.endsWith(".bcf") or outPath.endsWith(".vcf.gz"))
-  if cfg.nThreads >= 2 and isBgzf:
-    discard bgzf_mt(bgzfHandle(outWriter), 2, 128)
   var outIdx: ptr hts_idx_t = nil
   if isBgzf:
     let headerOff = uint64(bgzf_tell(bgzfHandle(outWriter)))
@@ -577,11 +577,11 @@ proc runAnno*(cfg: var AnnoConfig) =
         if e.matchaVar == mvCount:
           var zero: int32 = 0
           discard v.info.set(e.outField, zero)
-    let woff = uint64(bgzf_tell(bgzfHandle(outWriter)))
     if not outWriter.write_variant(v):
       raise newException(IOError, "failed to write variant at " &
         $v.CHROM & ":" & $v.POS)
     if outIdx != nil:
+      let woff = uint64(bgzf_tell(bgzfHandle(outWriter)))
       discard hts_idx_push(outIdx, v.c.rid, v.c.pos, int64(v.c.pos + v.c.rlen), woff, 1)
 
   vcfA.close()
