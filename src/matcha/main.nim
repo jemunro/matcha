@@ -2,7 +2,7 @@
 ## Entry point is src/matcha.nim which includes this file.
 
 import std/[os, parseopt, sequtils, strutils]
-import utils, match, anno, collapse, merge, mergecore, log
+import utils, match, anno, collapse, merge, mergecore, preproc, log
 
 const NimblePkgVersion {.strdefine.} = "dev"
 const VERSION = NimblePkgVersion
@@ -16,18 +16,18 @@ proc nextVal(p: var OptParser; flag: string): string =
   p.next()
   if p.kind == cmdArgument:
     return p.key
-  stderr.writeLine "error: --" & flag & " requires a value"
+  logError("--" & flag & " requires a value")
   quit(1)
 
 proc parseFloatOpt(v, flag: string): float64 =
   try: parseFloat(v)
   except ValueError:
-    stderr.writeLine "error: --" & flag & " must be a float, got: " & v; quit(1)
+    logError("--" & flag & " must be a float, got: " & v); quit(1)
 
 proc parseIntOpt(v, flag: string): int =
   try: parseInt(v)
   except ValueError:
-    stderr.writeLine "error: --" & flag & " must be an integer, got: " & v; quit(1)
+    logError("--" & flag & " must be an integer, got: " & v); quit(1)
 
 proc usage(code: int = 1) =
   let f = if code == 0: stdout else: stderr
@@ -102,11 +102,11 @@ proc runMatch(rawArgs: seq[string]) =
       of "bnd-slop":
         cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
         if cfg.bndSlop <= 0:
-          stderr.writeLine "error: --bnd-slop must be > 0"; quit(1)
+          logError("--bnd-slop must be > 0"); quit(1)
       of "threads":
         cfg.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
         if cfg.nThreads < 1:
-          stderr.writeLine "error: --threads must be >= 1"; quit(1)
+          logError("--threads must be >= 1"); quit(1)
       of "tmp-dir":
         cfg.tmpDir = nextVal(p, "tmp-dir")
       of "output":
@@ -120,18 +120,18 @@ proc runMatch(rawArgs: seq[string]) =
       of "h", "help":
         matchUsage(0)
       else:
-        stderr.writeLine "error: unknown option: --" & p.key
+        logError("unknown option: --" & p.key)
         matchUsage()
     of cmdArgument:
       positionals.add(p.key)
 
   if overlapSet and jaccardSet:
-    stderr.writeLine "error: --min-overlap and --min-jaccard are mutually exclusive"
+    logError("--min-overlap and --min-jaccard are mutually exclusive")
     matchUsage()
   let expected = if cfg.selfMode: 1 else: 2
   if positionals.len != expected:
     let what = if cfg.selfMode: "1 input file (--self mode)" else: "2 input files"
-    stderr.writeLine "error: expected " & what & ", got " & $positionals.len
+    logError("expected " & what & ", got " & $positionals.len)
     matchUsage()
 
   cfg.callsetA = positionals[0]
@@ -139,14 +139,15 @@ proc runMatch(rawArgs: seq[string]) =
     cfg.callsetB = positionals[1]
 
   if not fileExists(cfg.callsetA):
-    stderr.writeLine "error: input file not found: " & cfg.callsetA
+    logError("input file not found: " & cfg.callsetA)
     quit(1)
   if not cfg.selfMode and not fileExists(cfg.callsetB):
-    stderr.writeLine "error: input file not found: " & cfg.callsetB
+    logError("input file not found: " & cfg.callsetB)
     quit(1)
 
   if cfg.tmpDir == "":
     cfg.tmpDir = getTempDir()
+  cfg.tmpDir = makeRunTmpDir(cfg.tmpDir)
 
   runMatch(cfg)
 
@@ -275,7 +276,7 @@ proc runAnnoCli(rawArgs: seq[string]) =
         try:
           cfg.exprs.add(parseAnnoExpr(raw))
         except ValueError as e:
-          stderr.writeLine "error: " & e.msg
+          logError(e.msg)
           quit(1)
       of "o", "output":
         cfg.outputPath = nextVal(p, "o")
@@ -288,13 +289,13 @@ proc runAnnoCli(rawArgs: seq[string]) =
       of "bnd-slop":
         cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
         if cfg.bndSlop <= 0:
-          stderr.writeLine "error: --bnd-slop must be > 0"; quit(1)
+          logError("--bnd-slop must be > 0"); quit(1)
       of "overwrite":
         cfg.overwrite = true
       of "threads":
         cfg.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
         if cfg.nThreads < 1:
-          stderr.writeLine "error: --threads must be >= 1"; quit(1)
+          logError("--threads must be >= 1"); quit(1)
       of "tmp-dir":
         cfg.tmpDir = nextVal(p, "tmp-dir")
       of "v", "verbose":
@@ -302,28 +303,28 @@ proc runAnnoCli(rawArgs: seq[string]) =
       of "h", "help":
         annoHelp()
       else:
-        stderr.writeLine "error: unknown option: --" & p.key
+        logError("unknown option: --" & p.key)
         annoUsage()
     of cmdArgument:
       positionals.add(p.key)
 
   if overlapSet and jaccardSet:
-    stderr.writeLine "error: --min-overlap and --min-jaccard are mutually exclusive"
+    logError("--min-overlap and --min-jaccard are mutually exclusive")
     annoUsage()
   if positionals.len != 2:
-    stderr.writeLine "error: expected 2 input files (input database), got " &
-      $positionals.len
+    logError("expected 2 input files (input database), got " & $positionals.len)
     annoUsage()
   cfg.callsetA = positionals[0]
   cfg.callsetB = positionals[1]
   if not fileExists(cfg.callsetA):
-    stderr.writeLine "error: input file not found: " & cfg.callsetA
+    logError("input file not found: " & cfg.callsetA)
     quit(1)
   if not fileExists(cfg.callsetB):
-    stderr.writeLine "error: database file not found: " & cfg.callsetB
+    logError("database file not found: " & cfg.callsetB)
     quit(1)
   if cfg.tmpDir == "":
     cfg.tmpDir = getTempDir()
+  cfg.tmpDir = makeRunTmpDir(cfg.tmpDir)
 
   runAnno(cfg)
 
@@ -370,8 +371,7 @@ proc parsePriority(s: string): seq[PriorityCriterion] =
     of "CENTRE", "CENTER": result.add(pcCentre)
     of "ORDER":  result.add(pcOrder)
     else:
-      stderr.writeLine "error: unknown priority criterion '" & tok & "'"
-      stderr.writeLine "       valid values: PASS, QUAL, CENTRE, ORDER"
+      logError("unknown priority criterion '" & tok & "' — valid values: PASS, QUAL, CENTRE, ORDER")
       quit(1)
   # ORDER is always the final tiebreaker; append if not already last.
   if result.len == 0 or result[^1] != pcOrder:
@@ -405,7 +405,7 @@ proc runCollapseCli(rawArgs: seq[string]) =
       of "bnd-slop":
         cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
         if cfg.bndSlop <= 0:
-          stderr.writeLine "error: --bnd-slop must be > 0"; quit(1)
+          logError("--bnd-slop must be > 0"); quit(1)
       of "linkage":
         let v = nextVal(p, "linkage").toLowerAscii
         case v
@@ -413,7 +413,7 @@ proc runCollapseCli(rawArgs: seq[string]) =
         of "single":   cfg.linkage = lmSingle
         of "complete": cfg.linkage = lmComplete
         else:
-          stderr.writeLine "error: --linkage must be average, single, or complete"
+          logError("--linkage must be average, single, or complete")
           quit(1)
       of "priority":
         cfg.priority = parsePriority(nextVal(p, "priority"))
@@ -426,23 +426,23 @@ proc runCollapseCli(rawArgs: seq[string]) =
       of "threads":
         cfg.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
         if cfg.nThreads < 1:
-          stderr.writeLine "error: --threads must be >= 1"; quit(1)
+          logError("--threads must be >= 1"); quit(1)
       of "tmp-dir":
         cfg.tmpDir = nextVal(p, "tmp-dir")
       of "v", "verbose": setVerbose(true)
       of "h", "help":    collapseUsage(0)
       else:
-        stderr.writeLine "error: unknown option: --" & p.key
+        logError("unknown option: --" & p.key)
         collapseUsage()
     of cmdArgument:
       positionals.add(p.key)
 
   if overlapSet and jaccardSet:
-    stderr.writeLine "error: --min-overlap and --min-jaccard are mutually exclusive"
+    logError("--min-overlap and --min-jaccard are mutually exclusive")
     collapseUsage()
 
   if positionals.len < 1:
-    stderr.writeLine "error: at least one input file is required"
+    logError("at least one input file is required")
     collapseUsage()
 
   # Parse [Name:]path positional arguments.
@@ -460,11 +460,12 @@ proc runCollapseCli(rawArgs: seq[string]) =
 
   for caller in cfg.callers:
     if not fileExists(caller.path):
-      stderr.writeLine "error: input file not found: " & caller.path
+      logError("input file not found: " & caller.path)
       quit(1)
 
   if cfg.tmpDir == "":
     cfg.tmpDir = getTempDir()
+  cfg.tmpDir = makeRunTmpDir(cfg.tmpDir)
 
   # Build command line string for provenance header.
   let cmdLine = "matcha collapse " & rawArgs.join(" ")
@@ -534,7 +535,7 @@ proc runMergeCli(rawArgs: seq[string]) =
       of "bnd-slop":
         cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
         if cfg.bndSlop <= 0:
-          stderr.writeLine "error: --bnd-slop must be > 0"; quit(1)
+          logError("--bnd-slop must be > 0"); quit(1)
       of "linkage":
         let v = nextVal(p, "linkage").toLowerAscii
         case v
@@ -542,7 +543,7 @@ proc runMergeCli(rawArgs: seq[string]) =
         of "single":   cfg.linkage = lmSingle
         of "complete": cfg.linkage = lmComplete
         else:
-          stderr.writeLine "error: --linkage must be average, single, or complete"
+          logError("--linkage must be average, single, or complete")
           quit(1)
       of "priority":
         cfg.priority = parsePriority(nextVal(p, "priority"))
@@ -555,23 +556,22 @@ proc runMergeCli(rawArgs: seq[string]) =
       of "threads":
         cfg.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
         if cfg.nThreads < 1:
-          stderr.writeLine "error: --threads must be >= 1"; quit(1)
+          logError("--threads must be >= 1"); quit(1)
       of "tmp-dir":
         cfg.tmpDir = nextVal(p, "tmp-dir")
       of "v", "verbose": setVerbose(true)
       of "h", "help":    mergeUsage(0)
       else:
-        stderr.writeLine "error: unknown option: --" & p.key
+        logError("unknown option: --" & p.key)
         mergeUsage()
     of cmdArgument:
       positionals.add(p.key)
 
   if overlapSet and jaccardSet:
-    stderr.writeLine "error: --min-overlap and --min-jaccard are mutually exclusive"
+    logError("--min-overlap and --min-jaccard are mutually exclusive")
     mergeUsage()
   if positionals.len < 2:
-    stderr.writeLine "error: merge requires at least 2 input files (got " &
-      $positionals.len & ")"
+    logError("merge requires at least 2 input files (got " & $positionals.len & ")")
     mergeUsage()
 
   for arg in positionals:
@@ -588,11 +588,12 @@ proc runMergeCli(rawArgs: seq[string]) =
 
   for caller in cfg.callers:
     if not fileExists(caller.path):
-      stderr.writeLine "error: input file not found: " & caller.path
+      logError("input file not found: " & caller.path)
       quit(1)
 
   if cfg.tmpDir == "":
     cfg.tmpDir = getTempDir()
+  cfg.tmpDir = makeRunTmpDir(cfg.tmpDir)
 
   let cmdLine = "matcha merge " & rawArgs.join(" ")
   runMerge(cfg, cmdLine)
@@ -618,7 +619,7 @@ proc mainEntry*() =
   of "--help", "-h":
     usage(0)
   else:
-    stderr.writeLine "error: unknown subcommand '" & args[0] & "'"
+    logError("unknown subcommand '" & args[0] & "'")
     usage()
 
 when isMainModule:

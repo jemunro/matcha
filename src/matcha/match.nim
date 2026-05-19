@@ -5,7 +5,7 @@
 ## slim BCF handles from fileList, queries each representative position via
 ## CSI `chrom:pos-pos`, and writes TSV rows directly — no MatchResult type.
 
-import std/[atomics, sequtils, strutils]
+import std/[atomics, os, sequtils, strutils]
 import hts
 import utils, preproc, log, matchcore
 
@@ -62,8 +62,8 @@ proc poolWorker[R](state: ptr PoolState[R]) {.thread.} =
       if idx >= state.jobs.len: break
       state.results[idx] = state.runner(state.jobs[idx], state.cfg)
       let j = state.jobs[idx]
-      logV("job " & j.chrom & "/" & $j.svtype & "/bin" & $j.binA &
-           ": " & $state.results[idx].len & " " & state.label)
+      logVerbose("job " & j.chrom & "/" & $j.svtype & "/bin" & $j.binA &
+               ": " & $state.results[idx].len & " " & state.label)
 
 proc runJobsWithPool[R](jobs: seq[MatchJob]; cfg: MatchConfig;
                         runner: JobRunner[R]; label: string): seq[seq[R]] =
@@ -72,11 +72,11 @@ proc runJobsWithPool[R](jobs: seq[MatchJob]; cfg: MatchConfig;
   if cfg.nThreads == 1:
     for i, job in jobs.pairs:
       result[i] = runner(job, cfg)
-      logV("job " & job.chrom & "/" & $job.svtype & "/bin" & $job.binA &
-           ": " & $result[i].len & " " & label)
+      logVerbose("job " & job.chrom & "/" & $job.svtype & "/bin" & $job.binA &
+               ": " & $result[i].len & " " & label)
   else:
-    logV("starting " & $cfg.nThreads & " worker thread(s) for " &
-         $jobs.len & " job(s)")
+    logInfo("starting " & $cfg.nThreads & " worker thread(s) for " &
+            $jobs.len & " job(s)")
     var state = PoolState[R](jobs: jobs, cfg: cfg,
                              results: newSeq[seq[R]](jobs.len),
                              runner: runner, label: label)
@@ -87,7 +87,7 @@ proc runJobsWithPool[R](jobs: seq[MatchJob]; cfg: MatchConfig;
     for i in 0 ..< cfg.nThreads:
       joinThread(threads[i])
     result = state.results
-    logV(label & " workers complete")
+    logVerbose(label & " workers complete")
 
 proc dispatchPairJob*(job: MatchJob, cfg: MatchConfig): seq[MatchPair] =
   ## Stream MatchPairs for one job. Used by match, collapse, and anno.
@@ -102,19 +102,19 @@ proc runMatchPairJobsWithPool*(jobs: seq[MatchJob]; cfg: MatchConfig): seq[seq[M
 # ---------------------------------------------------------------------------
 
 proc runMatch*(cfg: MatchConfig) =
-  logV("matcha match: A=" & cfg.callsetA & " B=" & cfg.callsetB &
-       " threads=" & $cfg.nThreads & " tmp=" & cfg.tmpDir)
+  logInfo("matcha match: A=" & cfg.callsetA & " B=" & cfg.callsetB &
+          " threads=" & $cfg.nThreads & " tmp=" & cfg.tmpDir)
 
   let extra = cfg.infoFields   # shorthand
 
   var filesA, filesB: PreprocOutput
   if cfg.selfMode:
-    logV("self mode: preprocessing single input")
+    logInfo("self mode: preprocessing single input")
     filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A", extra,
                            ioThreads = if cfg.nThreads >= 2: 2 else: 0)
     filesB = filesA
   elif cfg.nThreads >= 2:
-    logV("preprocessing A and B in parallel")
+    logInfo("preprocessing A and B in parallel")
     (filesA, filesB) = runParallelPreproc(
       PreprocInput(path: cfg.callsetA, tmpDir: cfg.tmpDir, prefix: "A",
                    extraKeep: extra, ioThreads: 2),
@@ -125,7 +125,7 @@ proc runMatch*(cfg: MatchConfig) =
     filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B", extra)
 
   let (jobs, fileList) = buildWorkQueue(filesA, filesB, cfg)
-  logV("work queue: " & $jobs.len & " (chrom, svtype, binA) job(s)")
+  logInfo("work queue: " & $jobs.len & " (chrom, svtype, binA) job(s)")
   if jobs.len == 0:
     return
 
@@ -179,9 +179,7 @@ proc runMatch*(cfg: MatchConfig) =
 
   if not isStdoutPath(cfg.outputPath):
     outFile.close()
-  logV("wrote " & $totalMatches & " match(es)" &
-       (if not isStdoutPath(cfg.outputPath): " to " & cfg.outputPath else: " to stdout"))
+  logInfo("wrote " & $totalMatches & " match(es)" &
+          (if not isStdoutPath(cfg.outputPath): " to " & cfg.outputPath else: " to stdout"))
 
-  removeTempBcfs(filesA.paths)
-  if not cfg.selfMode:
-    removeTempBcfs(filesB.paths)
+  removeDir(cfg.tmpDir)

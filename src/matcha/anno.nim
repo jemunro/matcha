@@ -11,7 +11,7 @@
 ##      in-memory map (Table[int32, seq[AnnoMatch]]), apply aggregation
 ##      functions, and write the annotated record.
 
-import std/[algorithm, atomics, sequtils, sets, strutils, tables]
+import std/[algorithm, atomics, os, sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
 import utils, preproc, log, matchcore
@@ -141,20 +141,20 @@ proc validateAnnoExprs*(cfg: var AnnoConfig) =
   ## input header (when --overwrite not set). Populates dbType/dbNumber on
   ## each non-MATCHA expression and the dbFields list on the config.
   if cfg.exprs.len == 0:
-    stderr.writeLine "error: anno requires at least one -a expression"
+    logError("anno requires at least one -a expression")
     quit(1)
 
   var seenOut = initHashSet[string]()
   for e in cfg.exprs:
     if e.outField in seenOut:
-      stderr.writeLine "error: duplicate OUTFIELD '" & e.outField & "' in -a expressions"
+      logError("duplicate OUTFIELD '" & e.outField & "' in -a expressions")
       quit(1)
     seenOut.incl(e.outField)
 
   # DB header lookup for non-MATCHA SRCFIELDs.
   var vcfDB: VCF
   if not open(vcfDB, cfg.callsetB):
-    stderr.writeLine "error: cannot open database: " & cfg.callsetB
+    logError("cannot open database: " & cfg.callsetB)
     quit(1)
   var dbFieldsSet = initHashSet[string]()
   for i in 0 ..< cfg.exprs.len:
@@ -165,7 +165,7 @@ proc validateAnnoExprs*(cfg: var AnnoConfig) =
       cfg.exprs[i].dbType = hr["Type"]
       cfg.exprs[i].dbNumber = hr["Number"]
     except KeyError:
-      stderr.writeLine "error: SRCFIELD '" & src & "' not found in database header: " & cfg.callsetB
+      logError("SRCFIELD '" & src & "' not found in database header: " & cfg.callsetB)
       quit(1)
     dbFieldsSet.incl(src)
   vcfDB.close()
@@ -175,15 +175,15 @@ proc validateAnnoExprs*(cfg: var AnnoConfig) =
   # Input-header OUTFIELD collision check.
   var vcfA: VCF
   if not open(vcfA, cfg.callsetA):
-    stderr.writeLine "error: cannot open input: " & cfg.callsetA
+    logError("cannot open input: " & cfg.callsetA)
     quit(1)
   for e in cfg.exprs:
     try:
       discard vcfA.header.get(e.outField, BCF_HEADER_TYPE.BCF_HL_INFO)
       # already present
       if not cfg.overwrite:
-        stderr.writeLine "error: OUTFIELD '" & e.outField &
-          "' already in input header; pass --overwrite to replace"
+        logError("OUTFIELD '" & e.outField &
+          "' already in input header; pass --overwrite to replace")
         quit(1)
       else:
         logWarn("OUTFIELD '" & e.outField & "' present in input header — replacing (--overwrite)")
@@ -390,8 +390,8 @@ proc annoPoolWorker(state: ptr AnnoPoolState) {.thread.} =
       if idx >= state.jobs.len: break
       state.results[idx] = dispatchAnnoJob(state.jobs[idx], state.cfg, state.dbTypes)
       let j = state.jobs[idx]
-      logV("anno job " & j.chrom & "/" & $j.svtype & "/bin" & $j.binA &
-           ": " & $state.results[idx].len & " match(es)")
+      logVerbose("anno job " & j.chrom & "/" & $j.svtype & "/bin" & $j.binA &
+               ": " & $state.results[idx].len & " match(es)")
 
 # ---------------------------------------------------------------------------
 # Output assembly (phase 3)
@@ -400,7 +400,7 @@ proc annoPoolWorker(state: ptr AnnoPoolState) {.thread.} =
 proc validateOutputPath(p: string) =
   if isStdoutPath(p): return
   if not (p.endsWith(".vcf") or p.endsWith(".vcf.gz") or p.endsWith(".bcf")):
-    stderr.writeLine "error: -o must end in .vcf, .vcf.gz, or .bcf: " & p
+    logError("-o must end in .vcf, .vcf.gz, or .bcf: " & p)
     quit(1)
 
 proc registerOutputHeader(h: vcf.Header; cfg: AnnoConfig) =
@@ -460,16 +460,16 @@ proc setInfoValues(v: Variant; e: AnnoExpr; values: seq[string]) =
 # ---------------------------------------------------------------------------
 
 proc runAnno*(cfg: var AnnoConfig) =
-  logV("matcha anno: A=" & cfg.callsetA & " B=" & cfg.callsetB &
-       " threads=" & $cfg.nThreads & " tmp=" & cfg.tmpDir)
+  logInfo("matcha anno: A=" & cfg.callsetA & " B=" & cfg.callsetB &
+          " threads=" & $cfg.nThreads & " tmp=" & cfg.tmpDir)
   validateOutputPath(cfg.outputPath)
   validateAnnoExprs(cfg)
 
   # --- Phase 1: preproc -----------------------------------------------------
   var filesA, filesB: PreprocOutput
   if cfg.nThreads >= 2:
-    logV("preprocessing A and B in parallel" &
-         (if cfg.dbFields.len > 0: " (B extra: " & cfg.dbFields.join(",") & ")" else: ""))
+    logInfo("preprocessing A and B in parallel" &
+            (if cfg.dbFields.len > 0: " (B extra: " & cfg.dbFields.join(",") & ")" else: ""))
     (filesA, filesB) = runParallelPreproc(
       PreprocInput(path: cfg.callsetA, tmpDir: cfg.tmpDir, prefix: "A", ioThreads: 2),
       PreprocInput(path: cfg.callsetB, tmpDir: cfg.tmpDir, prefix: "B",
@@ -484,7 +484,7 @@ proc runAnno*(cfg: var AnnoConfig) =
     nThreads: cfg.nThreads, tmpDir: cfg.tmpDir, selfMode: false,
   )
   let (jobs, _) = buildWorkQueue(filesA, filesB, matchCfg)
-  logV("anno work queue: " & $jobs.len & " (chrom, svtype, binA) job(s)")
+  logInfo("anno work queue: " & $jobs.len & " (chrom, svtype, binA) job(s)")
 
   # --- Phase 2: matching with B-INFO extraction -----------------------------
   var dbTypes = initTable[string, string]()
@@ -497,11 +497,11 @@ proc runAnno*(cfg: var AnnoConfig) =
     if cfg.nThreads == 1:
       for i, j in jobs.pairs:
         jobResults[i] = dispatchAnnoJob(j, cfg, dbTypes)
-        logV("anno job " & j.chrom & "/" & $j.svtype & "/bin" & $j.binA &
-             ": " & $jobResults[i].len & " match(es)")
+        logVerbose("anno job " & j.chrom & "/" & $j.svtype & "/bin" & $j.binA &
+                 ": " & $jobResults[i].len & " match(es)")
     else:
-      logV("starting " & $cfg.nThreads & " anno worker thread(s) for " &
-           $jobs.len & " job(s)")
+      logInfo("starting " & $cfg.nThreads & " anno worker thread(s) for " &
+              $jobs.len & " job(s)")
       var state = AnnoPoolState(jobs: jobs, cfg: cfg, dbTypes: dbTypes,
                                 results: newSeq[seq[AnnoMatch]](jobs.len))
       state.next.store(0, moRelaxed)
@@ -519,8 +519,8 @@ proc runAnno*(cfg: var AnnoConfig) =
     for m in jrs:
       byAindex.mgetOrPut(m.aIndex, @[]).add(m)
       inc totalMatches
-  logV("anno: collected " & $totalMatches & " match(es) over " &
-       $byAindex.len & " annotated A record(s)")
+  logInfo("anno: collected " & $totalMatches & " match(es) over " &
+          $byAindex.len & " annotated A record(s)")
 
   # --- Phase 3: stream original A, write annotated output -------------------
   var vcfA: VCF
@@ -589,14 +589,13 @@ proc runAnno*(cfg: var AnnoConfig) =
     let finalOff = uint64(bgzf_tell(bgzfHandle(outWriter)))
     hts_idx_finish(outIdx, finalOff)
   outWriter.close()
-  logV("anno: wrote " & $nInput & " record(s) (" &
-       $nAnnotated & " annotated) to " &
-       (if isStdoutPath(cfg.outputPath): "stdout" else: cfg.outputPath))
+  logInfo("anno: wrote " & $nInput & " record(s) (" &
+          $nAnnotated & " annotated) to " &
+          (if isStdoutPath(cfg.outputPath): "stdout" else: cfg.outputPath))
   if outIdx != nil:
     hts_idx_save(outIdx, cfg.outputPath.cstring, HTS_FMT_CSI.cint)
     hts_idx_destroy(outIdx)
-    logV("indexed " & cfg.outputPath)
+    logInfo("indexed " & cfg.outputPath)
 
-  # Clean up temp BCFs (A and B preproc artifacts).
-  removeTempBcfs(filesA.paths)
-  removeTempBcfs(filesB.paths)
+  # Clean up: per-invocation temp dir (holds A and B preproc artifacts).
+  removeDir(cfg.tmpDir)

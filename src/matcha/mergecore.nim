@@ -551,11 +551,11 @@ proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
                           priority: seq[PriorityCriterion];
                           modeTag = "self-match"): ClusterPipelineResult =
   let (jobs, fileList) = buildWorkQueue(mergedPreproc, mergedPreproc, matchCfg)
-  logV(modeTag & ": " & $jobs.len & " job(s)")
+  logVerbose(modeTag & ": " & $jobs.len & " job(s)")
   var allPairs: seq[MatchPair]
   for jrs in runMatchPairJobsWithPool(jobs, matchCfg):
     for mp in jrs: allPairs.add(mp)
-  logV(modeTag & ": " & $allPairs.len & " pair(s)")
+  logVerbose(modeTag & ": " & $allPairs.len & " pair(s)")
 
   let simMap = buildSimilarityMap(allPairs)
   var seenOffsets: HashSet[int32]
@@ -571,7 +571,7 @@ proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
       seenOffsets.incl(p.srcIndexB)
       allOffsets.add(p.srcIndexB)
       result.locByIdx[p.srcIndexB] = (p.chromIdx, p.posB, p.fileIdxB)
-  logV(modeTag & ": " & $allOffsets.len & " unique record(s)")
+  logVerbose(modeTag & ": " & $allOffsets.len & " unique record(s)")
 
   let clusters = clusterAll(allOffsets, simMap, linkage, threshold)
 
@@ -590,7 +590,7 @@ proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
     for idx in cl:
       if idx != rep: ordered.add(idx)
     result.finalClusters.add(ordered)
-  logV(modeTag & ": " & $result.finalClusters.len & " cluster(s)")
+  logInfo(modeTag & ": " & $result.finalClusters.len & " cluster(s)")
   result.fileList = fileList
 
 # ---------------------------------------------------------------------------

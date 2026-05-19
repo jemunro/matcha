@@ -22,7 +22,7 @@
 ##
 ## Per-record warnings are throttled at MATCHA_WARN_CAP (default 5) per reason.
 
-import std/[algorithm, os, sequtils, sets, strutils, tables]
+import std/[algorithm, os, sequtils, sets, strutils, tables, tempfiles]
 import hts
 import hts/private/hts_concat  # BCF_ERR_CTG_UNDEF, BGZF, htsFile, bgzf_tell
 import utils, log, bins, synced_bcf_reader
@@ -316,9 +316,9 @@ proc normalizeRecord*(hdr: ptr bcf_hdr_t; rec: ptr bcf1_t; lineno: int;
 
   if rec.n_allele.int > 2:
     let chrom = getChromName(hdr, rec.rid)
-    stderr.writeLine "error: multiallelic record at " & chrom & ":" &
-                     $(rec.pos + 1) & " in " & vcfPath &
-                     " — split multiallelics before running matcha"
+    logError("multiallelic record at " & chrom & ":" &
+             $(rec.pos + 1) & " in " & vcfPath &
+             " — split multiallelics before running matcha")
     quit(1)
 
   discard bcf_unpack(rec, BCF_UN_SHR.cint)
@@ -357,6 +357,14 @@ proc emitSummary*(ws: WarnState) =
 proc tempBcfPath(tmpDir, prefix, svtype: string, binIdx: int): string =
   tmpDir / "matcha_" & $getCurrentProcessId() & "_" & prefix & "_" &
            svtype & "_b" & $binIdx & ".bcf"
+
+proc makeRunTmpDir*(parent: string): string =
+  ## Create a unique per-invocation subdirectory under `parent`. Uses mkdtemp
+  ## semantics so it is safe against PID reuse across nodes sharing scratch.
+  if not dirExists(parent):
+    createDir(parent)
+  result = createTempDir("matcha_", "", parent)
+  logInfo("tmp dir: " & result)
 
 proc hrecToLine(h: ptr bcf_hrec_t): string =
   let keys = cast[ptr UncheckedArray[cstring]](h.keys)
@@ -414,7 +422,7 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   ## extraKeepInfo: additional INFO field names that survive the slim step.
   ## Used by `matcha anno` to carry user-requested DB fields into the
   ## per-(svtype, bin) BCFs alongside the default keep-set.
-  logV("[" & prefix & "] reading " & vcfPath)
+  logVerbose("[" & prefix & "] reading " & vcfPath)
   var vcf: VCF
   if not open(vcf, vcfPath, threads = ioThreads):
     raise newException(IOError, "cannot open VCF/BCF: " & vcfPath)
@@ -459,9 +467,9 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
         break recordBody
 
       if v.ALT.len > 1:
-        stderr.writeLine "error: multiallelic record at " & $v.CHROM & ":" &
-                         $v.POS & " in " & vcfPath &
-                         " — split multiallelics before running matcha"
+        logError("multiallelic record at " & $v.CHROM & ":" &
+                 $v.POS & " in " & vcfPath &
+                 " — split multiallelics before running matcha")
         quit(1)
 
       let chrom = $v.CHROM
@@ -562,7 +570,7 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   bcf_hdr_destroy(slimHdrInterval)
   bcf_hdr_destroy(slimHdrBnd)
 
-  logV("[" & prefix & "] wrote " & $result.paths.len &
+  logInfo("[" & prefix & "] wrote " & $result.paths.len &
        " temp BCFs ((svtype, bin) groups)" &
        (if noIndex: " (no index)" else: " (CSI indexed)"))
   emitSummary(ws)

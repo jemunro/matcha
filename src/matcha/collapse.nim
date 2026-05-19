@@ -260,12 +260,12 @@ proc writeOutput(cfg: CollapseConfig;
     hts_idx_finish(outIdx, finalOff)
   outVcf.header.hdr = nil
   outVcf.close()
-  logV("collapse: wrote " & $buf.len & " record(s) to " &
-       (if isStdoutPath(cfg.outputPath): "stdout" else: cfg.outputPath))
+  logInfo("collapse: wrote " & $buf.len & " record(s) to " &
+          (if isStdoutPath(cfg.outputPath): "stdout" else: cfg.outputPath))
   if outIdx != nil:
     hts_idx_save(outIdx, cfg.outputPath.cstring, HTS_FMT_CSI.cint)
     hts_idx_destroy(outIdx)
-    logV("indexed " & cfg.outputPath)
+    logInfo("indexed " & cfg.outputPath)
 
 # ---------------------------------------------------------------------------
 # Top-level entry point
@@ -274,8 +274,8 @@ proc writeOutput(cfg: CollapseConfig;
 const CollapseVersion {.strdefine.} = "dev"
 
 proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
-  logV("matcha collapse: " & $cfg.callers.len & " caller(s)" &
-       " linkage=" & $cfg.linkage & " threads=" & $cfg.nThreads)
+  logInfo("matcha collapse: " & $cfg.callers.len & " caller(s)" &
+          " linkage=" & $cfg.linkage & " threads=" & $cfg.nThreads)
 
   for caller in cfg.callers:
     if not fileExists(caller.path):
@@ -320,7 +320,7 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
         quit(1)
 
   # Phase 1: resolve output header from all N input headers.
-  logV("resolving headers")
+  logVerbose("resolving headers")
   let mh = resolveHeaders(cfg.callers)
   for w in mh.warnings: logWarn("collapse header: " & w)
 
@@ -335,7 +335,7 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
   var outSampleName: string
   let finalHdr = buildFinalHdr(cfg.callers, mh, cfg, CollapseVersion, cmdLine,
                                outSampleName)
-  logV("integrated preproc+merge over " & $cfg.callers.len & " caller(s)")
+  logInfo("integrated preproc+merge over " & $cfg.callers.len & " caller(s)")
   let msc = MergeStreamConfig(formatFields: cfg.formatFields,
                                nThreads:     cfg.nThreads,
                                tmpDir:       cfg.tmpDir)
@@ -350,7 +350,7 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
   )
 
   # Phase 3: self-match + cluster + representative selection (shared pipeline).
-  logV("self-matching merged slim BCFs")
+  logInfo("self-matching merged slim BCFs")
   let matchCfg = MatchConfig(
     metric:         cfg.metric,
     threshold:      cfg.threshold,
@@ -368,6 +368,6 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
   writeOutput(cfg, finalHdr, chromOrder, im.paths, cpr.finalClusters,
               cpr.passQualMap)
 
-  # Clean up: merged slim BCFs + CSI indexes, and finalHdr.
-  removeTempBcfs(im.paths)
+  # Clean up: per-invocation temp dir (merged slim BCFs + CSI indexes), and finalHdr.
+  removeDir(cfg.tmpDir)
   bcf_hdr_destroy(finalHdr)

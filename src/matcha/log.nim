@@ -1,8 +1,12 @@
-## log.nim — verbose logging to stderr, gated by a global flag.
+## log.nim — structured logging to stderr.
 ##
-## All matcha components import this and call logV(). The flag is set once
-## at startup by CLI parsing and only read thereafter, so it is safe to read
-## from worker threads without synchronisation.
+## logInfo    — always emitted; meaningful progress/result lines a user always wants.
+## logVerbose — gated by -v/--verbose; per-file and per-job detail.
+## logWarn    — always emitted (suppressible in tests via setQuiet).
+## logError   — always emitted; fatal condition messages.
+##
+## The verbose flag is set once at startup and only read thereafter, so it is
+## safe to read from worker threads without synchronisation.
 
 import std/[os, strutils, times]
 
@@ -15,7 +19,10 @@ proc setVerbose*(b: bool) =
 proc elapsedTag(level: string): string =
   "[" & level & " " & formatFloat(epochTime() - gStart, ffDecimal, 3) & "s] "
 
-proc logV*(msg: string) =
+proc logInfo*(msg: string) =
+  stderr.writeLine(elapsedTag("INFO") & msg)
+
+proc logVerbose*(msg: string) =
   if not gVerbose: return
   stderr.writeLine(elapsedTag("INFO") & msg)
 

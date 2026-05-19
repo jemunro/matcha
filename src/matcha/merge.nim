@@ -748,12 +748,12 @@ proc writeMergeOutput(cfg: MergeConfig;
     hts_idx_finish(outIdx, finalOff)
   outVcf.header.hdr = nil
   outVcf.close()
-  logV("merge: wrote " & $bufRows.len & " record(s) to " &
+  logInfo("merge: wrote " & $bufRows.len & " record(s) to " &
        (if isStdoutPath(cfg.outputPath): "stdout" else: cfg.outputPath))
   if outIdx != nil:
     hts_idx_save(outIdx, cfg.outputPath.cstring, HTS_FMT_CSI.cint)
     hts_idx_destroy(outIdx)
-    logV("indexed " & cfg.outputPath)
+    logInfo("indexed " & cfg.outputPath)
 
 # ---------------------------------------------------------------------------
 # runMerge — top-level entry point
@@ -764,7 +764,7 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
     logError("merge: need at least 2 input files (got " & $cfg.callers.len & ")")
     quit(1)
 
-  logV("matcha merge: " & $cfg.callers.len & " sample(s)" &
+  logInfo("matcha merge: " & $cfg.callers.len & " sample(s)" &
        " linkage=" & $cfg.linkage & " threads=" & $cfg.nThreads)
 
   for caller in cfg.callers:
@@ -781,7 +781,7 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
   let sampleIds = validateMergeInputs(cfg.callers)
   var cfgMut = cfg
   if "GT" notin cfgMut.formatFields:
-    logV("merge: auto-adding GT to --format for cohort AC/AN/AF")
+    logInfo("merge: auto-adding GT to --format for cohort AC/AN/AF")
     cfgMut.formatFields = @["GT"] & cfgMut.formatFields
 
   # Resolve headers.
@@ -810,7 +810,7 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
                                   inputsHadCallers, cmdLine)
 
   # Integrated preproc + merge using slimHdr as writer.
-  logV("integrated preproc+merge over " & $cfgMut.callers.len & " sample(s)")
+  logInfo("integrated preproc+merge over " & $cfgMut.callers.len & " sample(s)")
   let msc = MergeStreamConfig(formatFields:     cfgMut.formatFields,
                                nThreads:         cfgMut.nThreads,
                                tmpDir:           cfgMut.tmpDir,
@@ -828,7 +828,7 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
   )
 
   # Self-match + cluster + representative selection (shared pipeline).
-  logV("self-matching merged slim BCFs")
+  logInfo("self-matching merged slim BCFs")
   let matchCfg = MatchConfig(
     metric:         cfgMut.metric,
     threshold:      cfgMut.threshold,
@@ -854,6 +854,6 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
                   inputsHadCallers)
 
   # Teardown.
-  removeTempBcfs(im.paths)
+  removeDir(cfgMut.tmpDir)
   bcf_hdr_destroy(slimHdr)
   bcf_hdr_destroy(outputHdr)
