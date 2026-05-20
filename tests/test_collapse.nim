@@ -30,10 +30,10 @@ proc viewBcf(path: string): string =
   outp
 
 type ColRecord = object
-  chrom, id, filter: string
-  pos:               int
-  source, sourceList: string
-  nSource, nMerged:  int
+  chrom, id, filter, alt: string
+  pos:                    int
+  source, sourceList:     string
+  nSource, nMerged:       int
 
 proc parseCollapsed(vcfText: string): seq[ColRecord] =
   ## Collapse emits CALLERS (Number=. comma-list, representative-first) +
@@ -48,6 +48,7 @@ proc parseCollapsed(vcfText: string): seq[ColRecord] =
       pos:    parseInt(cols[1]),
       id:     cols[2],
       filter: cols[6],
+      alt:    cols[4],
     )
     for field in cols[7].split(';'):
       let kv = field.split('=', 1)
@@ -90,11 +91,11 @@ timed("C02", "2-caller collapse: exits 0, BCF readable"):
   doAssert "SVTYPE" in view, "BCF appears empty or malformed"
   discard tryRemoveFile(outBcf)
 
-# C03 — correct record count: 5 output records for 2-caller fixture
-timed("C03", "correct output record count (5 for the 2-caller fixture)"):
+# C03 — correct record count: 6 output records for 2-caller fixture (5 interval + 1 BND cluster)
+timed("C03", "correct output record count (6 for the 2-caller fixture)"):
   let (recs, code) = collapseRun()
   doAssert code == 0, "collapse failed"
-  doAssert recs.len == 5, "expected 5 records, got " & $recs.len &
+  doAssert recs.len == 6, "expected 6 records, got " & $recs.len &
     ": " & recs.mapIt(it.id).join(", ")
 
 # C04 — PASS filter beats LowQual: DEL_M_02 chosen over DEL_D_02
@@ -188,7 +189,7 @@ timed("C11", "--min-overlap 0.5 produces the same cluster topology"):
   doAssert code == 0, "collapse --min-overlap failed"
   let recs = parseCollapsed(viewBcf(outBcf))
   discard tryRemoveFile(outBcf)
-  doAssert recs.len == 5, "expected 5 records with --min-overlap 0.5, got " & $recs.len
+  doAssert recs.len == 6, "expected 6 records with --min-overlap 0.5, got " & $recs.len
 
 # C12 — --info filter: requesting only SVTYPE in output drops END/SVLEN
 timed("C12", "--info SVTYPE filter keeps SVTYPE, drops END and SVLEN"):
@@ -207,6 +208,19 @@ timed("C12", "--info SVTYPE filter keeps SVTYPE, drops END and SVLEN"):
   doAssert sawSvtype, "--info SVTYPE: SVTYPE not in output"
   doAssert not sawEnd,   "--info SVTYPE: END should be absent, but found"
   doAssert not sawSvlen, "--info SVTYPE: SVLEN should be absent, but found"
+
+# C13 — BND cluster: bracket-form ALT preserved in collapse output
+timed("C13", "BND cluster: bracket-form ALT (N[chr1:32000[) preserved through collapse"):
+  let (recs, code) = collapseRun()
+  doAssert code == 0
+  var found = false
+  for r in recs:
+    if r.pos == 31000:
+      doAssert "[chr1:32000[" in r.alt or "]chr1:32000]" in r.alt or
+               "[chr1:32000" in r.alt,
+               "BND ALT not preserved, got: " & r.alt
+      found = true
+  doAssert found, "no BND row at pos 31000"
 
 # CT03 — --format "" → output has zero sample columns
 timed("CT01", "--format '' produces zero-sample output"):

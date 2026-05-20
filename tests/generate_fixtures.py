@@ -466,20 +466,31 @@ def col(chrom, pos, rid, svtype, svlen, end, qual=".", filt="PASS"):
             "svtype": svtype, "svlen": svlen, "end": end}
 
 
-# Caller1: some PASS, one LowQual, one singleton, one DUP
+def bnd_col(chrom, pos, rid, chr2, pos2, qual=".", filt="PASS"):
+    """BND collapse fixture record — bracket-form ALT, no END/SVLEN in INFO."""
+    alt = f"N[{chr2}:{pos2}["
+    return {"chrom": chrom, "pos": pos, "id": rid, "ref": "N", "alt": alt,
+            "info": "SVTYPE=BND", "qual": str(qual), "filter": filt,
+            "svtype": "BND", "svlen": 0, "end": pos + 1,
+            "chr2": chr2, "pos2": pos2}
+
+
+# Caller1: some PASS, one LowQual, one singleton, one DUP, one BND
 RECORDS_COLLAPSE_CALLER1 = [
-    col("chr1", 1000,  "DEL_D_01", "DEL", 1000, 2000,  qual=50,  filt="PASS"),
-    col("chr1", 3000,  "DEL_D_02", "DEL", 1000, 4000,  qual=30,  filt="LowQual"),
-    col("chr1", 5000,  "DEL_D_03", "DEL", 1000, 6000,  qual=40,  filt="PASS"),
-    col("chr1", 9000,  "DUP_D_01", "DUP", 1000, 10000, qual=50,  filt="PASS"),
+    col("chr1",    1000,  "DEL_D_01", "DEL", 1000, 2000,  qual=50,  filt="PASS"),
+    col("chr1",    3000,  "DEL_D_02", "DEL", 1000, 4000,  qual=30,  filt="LowQual"),
+    col("chr1",    5000,  "DEL_D_03", "DEL", 1000, 6000,  qual=40,  filt="PASS"),
+    col("chr1",    9000,  "DUP_D_01", "DUP", 1000, 10000, qual=50,  filt="PASS"),
+    bnd_col("chr1", 31000, "BND_D_01", chr2="chr1", pos2=32000, qual=50, filt="PASS"),
 ]
 
-# Caller2: all PASS, one singleton, same positions as Caller1 (some exact, some shifted)
+# Caller2: all PASS, one singleton, same positions as Caller1 (some exact, some shifted), one BND
 RECORDS_COLLAPSE_CALLER2 = [
-    col("chr1", 1000,  "DEL_M_01", "DEL", 1000, 2000,  qual=80,  filt="PASS"),
-    col("chr1", 3100,  "DEL_M_02", "DEL", 1000, 4100,  qual=80,  filt="PASS"),
-    col("chr1", 7000,  "DEL_M_03", "DEL", 1000, 8000,  qual=80,  filt="PASS"),
-    col("chr1", 9000,  "DUP_M_01", "DUP", 1000, 10000, qual=80,  filt="PASS"),
+    col("chr1",    1000,  "DEL_M_01", "DEL", 1000, 2000,  qual=80,  filt="PASS"),
+    col("chr1",    3100,  "DEL_M_02", "DEL", 1000, 4100,  qual=80,  filt="PASS"),
+    col("chr1",    7000,  "DEL_M_03", "DEL", 1000, 8000,  qual=80,  filt="PASS"),
+    col("chr1",    9000,  "DUP_M_01", "DUP", 1000, 10000, qual=80,  filt="PASS"),
+    bnd_col("chr1", 31000, "BND_M_01", chr2="chr1", pos2=32000, qual=80, filt="PASS"),
 ]
 
 # 1-sample collapse fixtures: same records as the 0-sample fixtures plus a
@@ -724,8 +735,8 @@ def main():
     # plus one sample column "SAMPLE1" carrying distinct GT values per record
     # (so a CT test can spot if GT round-trips correctly through the merged
     # BCF → final output path).
-    caller1_1s_gt = ["0/1", "0/0", "1/1", "0/1"]  # one per Caller1 record
-    caller2_1s_gt = ["1/1", "0/1", "0/0", "1/1"]  # one per Caller2 record
+    caller1_1s_gt = ["0/1", "0/0", "1/1", "0/1", "0/1"]  # one per Caller1 record (incl. BND_D_01)
+    caller2_1s_gt = ["1/1", "0/1", "0/0", "1/1", "0/1"]  # one per Caller2 record (incl. BND_M_01)
     print("Writing collapse_caller1_1sample.vcf.gz ...")
     write_collapse_vcf_with_samples(
         RECORDS_COLLAPSE_CALLER1,

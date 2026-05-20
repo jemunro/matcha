@@ -339,10 +339,11 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
   let finalHdr = buildFinalHdr(cfg.callers, mh, cfg, CollapseVersion, cmdLine,
                                outSampleName)
   logInfo("integrated preproc+merge over " & $cfg.callers.len & " caller(s)")
-  let msc = MergeStreamConfig(formatFields: cfg.formatFields,
-                               nThreads:     cfg.nThreads,
-                               tmpDir:       cfg.tmpDir,
-                               keptChrs:     toHashSet(cfg.keptChrs))
+  let msc = MergeStreamConfig(formatFields:   cfg.formatFields,
+                               nThreads:       cfg.nThreads,
+                               tmpDir:         cfg.tmpDir,
+                               preserveBndAlt: true,
+                               keptChrs:       toHashSet(cfg.keptChrs))
   let im = integratedMerge(cfg.callers, mh, finalHdr, msc, chromOrder)
   if cfg.keptChrs.len > 0:
     var seen: HashSet[string]
