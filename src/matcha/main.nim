@@ -81,6 +81,7 @@ proc matchUsage(code: int = 1) =
   quit(code)
 
 proc runMatch(rawArgs: seq[string]) =
+  if rawArgs.len == 0: matchUsage(0)
   var cfg = MatchConfig(nThreads: 1, bndSlop: 50, metric: mJaccard, threshold: 0.75)
   var positionals: seq[string]
   # Track which metric flag(s) were supplied so we can enforce the xor rule
@@ -266,6 +267,7 @@ proc annoHelp() =
   quit(0)
 
 proc runAnnoCli(rawArgs: seq[string]) =
+  if rawArgs.len == 0: annoUsage(0)
   var cfg = AnnoConfig(nThreads: 1, bndSlop: 50, metric: mJaccard, threshold: 0.75)
   var positionals: seq[string]
   var overlapSet, jaccardSet: bool
@@ -386,6 +388,7 @@ proc parsePriority(s: string): seq[PriorityCriterion] =
     result.add(pcOrder)
 
 proc runCollapseCli(rawArgs: seq[string]) =
+  if rawArgs.len == 0: collapseUsage(0)
   var cfg = CollapseConfig(
     nThreads:     1,
     bndSlop:      50,
@@ -519,6 +522,7 @@ proc mergeUsage(code: int = 1) =
   quit(code)
 
 proc runMergeCli(rawArgs: seq[string]) =
+  if rawArgs.len == 0: mergeUsage(0)
   var cfg = MergeConfig(
     nThreads:     1,
     bndSlop:      50,
