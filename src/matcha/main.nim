@@ -61,6 +61,8 @@ proc matchUsage(code: int = 1) =
   f.writeLine "  --min-overlap FLOAT             minimum reciprocal overlap (0.0-1.0)"
   f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
   f.writeLine "  --bnd-slop INT                  max breakend offset for BND matches (default: 50)"
+  f.writeLine "  --min-ins-sim FLOAT             minimum INS combined sim = sqrt(pos*len) (default: 0.75)"
+  f.writeLine "  --ins-slop INT                  max position offset for INS matches (default: 50)"
   f.writeLine "  --self                          match a single input against itself"
   f.writeLine "                                  (each pair emitted once; no self-self)"
   f.writeLine "  --info FIELDS                   comma-separated INFO fields to add as INFO_A/INFO_B columns"
@@ -73,6 +75,7 @@ proc matchUsage(code: int = 1) =
   f.writeLine ""
   f.writeLine "Default metric: --min-jaccard 0.75. Specify --min-overlap or --min-jaccard to override."
   f.writeLine "BND rows use --bnd-slop independently."
+  f.writeLine "INS rows use --min-ins-sim with --ins-slop (combined position+size similarity)."
   f.writeLine ""
   f.writeLine "Output is tab-separated. A ##matcha_metric=<overlap|jaccard> preamble"
   f.writeLine "precedes the #-prefixed header line. Columns:"
@@ -82,7 +85,8 @@ proc matchUsage(code: int = 1) =
 
 proc runMatch(rawArgs: seq[string]) =
   if rawArgs.len == 0: matchUsage(0)
-  var cfg = MatchConfig(nThreads: 1, bndSlop: 50, metric: mJaccard, threshold: 0.75)
+  var cfg = MatchConfig(nThreads: 1, bndSlop: 50, insSlop: 50,
+                        insMinSim: 0.75, metric: mJaccard, threshold: 0.75)
   var positionals: seq[string]
   # Track which metric flag(s) were supplied so we can enforce the xor rule
   # after parsing. The cfg.metric / cfg.threshold fields don't carry "unset"
@@ -105,6 +109,14 @@ proc runMatch(rawArgs: seq[string]) =
         cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
         if cfg.bndSlop <= 0:
           logError("--bnd-slop must be > 0"); quit(1)
+      of "ins-slop":
+        cfg.insSlop = parseIntOpt(nextVal(p, "ins-slop"), "ins-slop")
+        if cfg.insSlop <= 0:
+          logError("--ins-slop must be > 0"); quit(1)
+      of "min-ins-sim":
+        cfg.insMinSim = parseFloatOpt(nextVal(p, "min-ins-sim"), "min-ins-sim")
+        if cfg.insMinSim <= 0 or cfg.insMinSim > 1:
+          logError("--min-ins-sim must be in (0, 1]"); quit(1)
       of "threads":
         cfg.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
         if cfg.nThreads < 1:
@@ -170,6 +182,8 @@ proc annoUsage(code: int = 1) =
   f.writeLine "  --min-overlap FLOAT             minimum reciprocal overlap (0.0-1.0)"
   f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
   f.writeLine "  --bnd-slop INT                  max breakend offset for BND matches (default: 50)"
+  f.writeLine "  --min-ins-sim FLOAT             minimum INS combined sim = sqrt(pos*len) (default: 0.75)"
+  f.writeLine "  --ins-slop INT                  max position offset for INS matches (default: 50)"
   f.writeLine "  --overwrite                     replace OUTFIELDs already in input header"
   f.writeLine "  --chrs CHR[,CHR...]             restrict to listed chromosomes (filters records + headers)"
   f.writeLine "  --threads INT                   number of worker threads (default: 1)"
@@ -210,6 +224,8 @@ proc annoHelp() =
   f.writeLine "  --min-overlap FLOAT             minimum reciprocal overlap (0.0-1.0)"
   f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
   f.writeLine "  --bnd-slop INT                  max breakend offset for BND matches (default: 50)"
+  f.writeLine "  --min-ins-sim FLOAT             minimum INS combined sim = sqrt(pos*len) (default: 0.75)"
+  f.writeLine "  --ins-slop INT                  max position offset for INS matches (default: 50)"
   f.writeLine "  --overwrite                     replace OUTFIELDs that already exist in input header"
   f.writeLine "  --chrs CHR[,CHR...]             restrict to listed chromosomes (filters records + headers)"
   f.writeLine "  --threads INT                   number of worker threads (default: 1)"
@@ -268,7 +284,8 @@ proc annoHelp() =
 
 proc runAnnoCli(rawArgs: seq[string]) =
   if rawArgs.len == 0: annoUsage(0)
-  var cfg = AnnoConfig(nThreads: 1, bndSlop: 50, metric: mJaccard, threshold: 0.75)
+  var cfg = AnnoConfig(nThreads: 1, bndSlop: 50, insSlop: 50,
+                       insMinSim: 0.75, metric: mJaccard, threshold: 0.75)
   var positionals: seq[string]
   var overlapSet, jaccardSet: bool
   var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
@@ -297,6 +314,14 @@ proc runAnnoCli(rawArgs: seq[string]) =
         cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
         if cfg.bndSlop <= 0:
           logError("--bnd-slop must be > 0"); quit(1)
+      of "ins-slop":
+        cfg.insSlop = parseIntOpt(nextVal(p, "ins-slop"), "ins-slop")
+        if cfg.insSlop <= 0:
+          logError("--ins-slop must be > 0"); quit(1)
+      of "min-ins-sim":
+        cfg.insMinSim = parseFloatOpt(nextVal(p, "min-ins-sim"), "min-ins-sim")
+        if cfg.insMinSim <= 0 or cfg.insMinSim > 1:
+          logError("--min-ins-sim must be in (0, 1]"); quit(1)
       of "overwrite":
         cfg.overwrite = true
       of "threads":
@@ -349,6 +374,8 @@ proc collapseUsage(code: int = 1) =
   f.writeLine "  --min-overlap FLOAT           minimum reciprocal overlap (0.0-1.0)"
   f.writeLine "  --min-jaccard FLOAT           minimum Jaccard index (0.0-1.0)"
   f.writeLine "  --bnd-slop INT                max breakend offset for BND (default: 50)"
+  f.writeLine "  --min-ins-sim FLOAT           minimum INS combined sim = sqrt(pos*len) (default: 0.75)"
+  f.writeLine "  --ins-slop INT                max position offset for INS matches (default: 50)"
   f.writeLine "  --linkage average|single|complete  agglomerative linkage (default: average)"
   f.writeLine "  --priority CRITERIA           comma-separated: PASS,QUAL,CENTRE,ORDER"
   f.writeLine "                                default: PASS,CENTRE,ORDER"
@@ -392,6 +419,8 @@ proc runCollapseCli(rawArgs: seq[string]) =
   var cfg = CollapseConfig(
     nThreads:     1,
     bndSlop:      50,
+    insSlop:      50,
+    insMinSim:    0.75,
     metric:       mJaccard,
     threshold:    0.75,
     linkage:      lmAverage,
@@ -417,6 +446,14 @@ proc runCollapseCli(rawArgs: seq[string]) =
         cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
         if cfg.bndSlop <= 0:
           logError("--bnd-slop must be > 0"); quit(1)
+      of "ins-slop":
+        cfg.insSlop = parseIntOpt(nextVal(p, "ins-slop"), "ins-slop")
+        if cfg.insSlop <= 0:
+          logError("--ins-slop must be > 0"); quit(1)
+      of "min-ins-sim":
+        cfg.insMinSim = parseFloatOpt(nextVal(p, "min-ins-sim"), "min-ins-sim")
+        if cfg.insMinSim <= 0 or cfg.insMinSim > 1:
+          logError("--min-ins-sim must be in (0, 1]"); quit(1)
       of "linkage":
         let v = nextVal(p, "linkage").toLowerAscii
         case v
@@ -498,6 +535,8 @@ proc mergeUsage(code: int = 1) =
   f.writeLine "  --min-overlap FLOAT           minimum reciprocal overlap (0.0-1.0)"
   f.writeLine "  --min-jaccard FLOAT           minimum Jaccard index (0.0-1.0)"
   f.writeLine "  --bnd-slop INT                max breakend offset for BND (default: 50)"
+  f.writeLine "  --min-ins-sim FLOAT           minimum INS combined sim = sqrt(pos*len) (default: 0.75)"
+  f.writeLine "  --ins-slop INT                max position offset for INS matches (default: 50)"
   f.writeLine "  --linkage average|single|complete  agglomerative linkage (default: average)"
   f.writeLine "  --priority CRITERIA           comma-separated: PASS,QUAL,CENTRE,ORDER"
   f.writeLine "                                default: PASS,CENTRE,ORDER (drives representative)"
@@ -526,6 +565,8 @@ proc runMergeCli(rawArgs: seq[string]) =
   var cfg = MergeConfig(
     nThreads:     1,
     bndSlop:      50,
+    insSlop:      50,
+    insMinSim:    0.75,
     metric:       mJaccard,
     threshold:    0.75,
     linkage:      lmAverage,
@@ -551,6 +592,14 @@ proc runMergeCli(rawArgs: seq[string]) =
         cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
         if cfg.bndSlop <= 0:
           logError("--bnd-slop must be > 0"); quit(1)
+      of "ins-slop":
+        cfg.insSlop = parseIntOpt(nextVal(p, "ins-slop"), "ins-slop")
+        if cfg.insSlop <= 0:
+          logError("--ins-slop must be > 0"); quit(1)
+      of "min-ins-sim":
+        cfg.insMinSim = parseFloatOpt(nextVal(p, "min-ins-sim"), "min-ins-sim")
+        if cfg.insMinSim <= 0 or cfg.insMinSim > 1:
+          logError("--min-ins-sim must be in (0, 1]"); quit(1)
       of "linkage":
         let v = nextVal(p, "linkage").toLowerAscii
         case v

@@ -27,6 +27,8 @@ type
     metric*:       Metric
     threshold*:    float64
     bndSlop*:      int
+    insSlop*:      int
+    insMinSim*:    float64
     linkage*:      LinkageMethod
     priority*:     seq[PriorityCriterion]
     formatFields*: seq[string]   ## FORMAT fields to carry; default ["GT"]
@@ -343,6 +345,7 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
                                nThreads:       cfg.nThreads,
                                tmpDir:         cfg.tmpDir,
                                preserveBndAlt: true,
+                               preserveInsAlt: true,
                                keptChrs:       toHashSet(cfg.keptChrs))
   let im = integratedMerge(cfg.callers, mh, finalHdr, msc, chromOrder)
   if cfg.keptChrs.len > 0:
@@ -367,6 +370,8 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
     metric:         cfg.metric,
     threshold:      cfg.threshold,
     bndSlop:        cfg.bndSlop,
+    insSlop:        cfg.insSlop,
+    insMinSim:      cfg.insMinSim,
     nThreads:       cfg.nThreads,
     tmpDir:         cfg.tmpDir,
     selfMode:       true,

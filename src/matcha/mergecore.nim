@@ -623,6 +623,7 @@ type
     stampSID*:          bool          ## merge mode: write FORMAT/SID per record
     sampleIdByCaller*:  seq[string]   ## merge mode: SID value for caller ci
     preserveBndAlt*:    bool          ## merge mode: keep source BND ALT verbatim
+    preserveInsAlt*:    bool          ## keep source INS REF/ALT verbatim (sequence-resolved)
     keptChrs*:          HashSet[string] ## --chrs filter; empty = no filter
 
 # Header utility: collect ##FILTER=<...> lines from a header.
@@ -893,7 +894,8 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
   # Reusable Variant view over the synced reader's records.
   let view = newVariantView()
   var svtypeBuf: string
-  var endBuf, svlenBuf: seq[int32]
+  var endBuf, svlenBuf, inslenBuf: seq[int32]
+  var leftSeqBuf, rightSeqBuf: string
   var renameBuf: pointer = nil
   var renameN:   cint    = 0
 
@@ -920,7 +922,9 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
         inc perCallerLineno[ci]
 
         let nr = normalizeRecord(srcHdr, rec, perCallerLineno[ci],
-                                 wsList[ci], view, svtypeBuf, endBuf, svlenBuf,
+                                 wsList[ci], view, svtypeBuf,
+                                 endBuf, svlenBuf, inslenBuf,
+                                 leftSeqBuf, rightSeqBuf,
                                  callers[ci].path)
         if not nr.ok:
           bcf_destroy(rec)
@@ -1016,7 +1020,8 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
         # 2h. REF/ALT trim to keep records small. For BND in merge mode we
         # preserve the source ALT verbatim (strand orientation lives in the
         # bracket form and is not derivable from CHR2/POS2 at output time).
-        if cfg.preserveBndAlt and nr.svt == svBND:
+        if (cfg.preserveBndAlt and nr.svt == svBND) or
+           (cfg.preserveInsAlt and nr.svt == svINS):
           discard  # leave REF/ALT as the source had them
         else:
           discard bcf_update_alleles_str(srcHdr, rec, "N,.".cstring)

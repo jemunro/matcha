@@ -11,7 +11,7 @@ Compiled, efficient structural variant (SV) matching and annotation tool written
 | `matcha collapse` — cluster SVs from multiple callers within one sample, emit one representative per cluster | complete |
 | `matcha merge` — merge SVs across samples into a cohort pVCF | complete |
 
-DEL/DUP/INV match by coordinate + size (reciprocal overlap or Jaccard). BND records match by breakend proximity. INS is out of scope (silent skip). Genotypes are ignored.
+DEL/DUP/INV match by coordinate + size (reciprocal overlap or Jaccard). BND records match by breakend proximity. INS records match by position proximity plus size ratio. Genotypes are ignored.
 
 ## Build
 
@@ -36,7 +36,9 @@ matcha match --self [options] INPUT         # self-match (each pair once, no sel
 Options:
   --min-overlap FLOAT    minimum reciprocal overlap (0.0–1.0)  ← exactly one required
   --min-jaccard FLOAT    minimum Jaccard index (0.0–1.0)       ←
-  --bnd-slop INT         max breakend offset for BND matches (default: 100)
+  --bnd-slop INT         max breakend offset for BND matches (default: 50)
+  --min-ins-sim FLOAT    minimum INS combined sim = sqrt(pos_sim·len_sim) (default: 0.75)
+  --ins-slop INT         max position offset for INS matches (default: 50)
   --self                 match a single input against itself
   --info FIELDS          comma-separated INFO fields to include as INFO_A/INFO_B columns
   --chrs CHR[,CHR...]    restrict to listed chromosomes (filters records; no header change for TSV output)
@@ -58,6 +60,13 @@ Inputs may be `.vcf.gz` or `.bcf`; format is auto-detected. `-v` is accepted bef
 **BND** — candidates share CHROM and CHR2 with both breakends within `--bnd-slop`:  
 `|POS_A − POS_B| < slop` and `|POS2_A − POS2_B| < slop`.  
 Similarity: `(2·slop − |dPOS| − |dPOS2|) / (2·slop)`. Strand is ignored.
+
+**INS** — candidates share CHROM with `|POS_A − POS_B| < --ins-slop`. Similarity combines position and size:
+- `pos_sim = (slop − |dPOS|) / slop`
+- `len_sim = min(SVLEN_A, SVLEN_B) / max(SVLEN_A, SVLEN_B)`
+- `sim = sqrt(pos_sim · len_sim)` — must be ≥ `--min-ins-sim`.
+
+SVLEN is resolved from the first available of: `INFO/INSLEN`, `INFO/SVLEN`, `len(ALT) − len(REF)` (sequence-resolved ALTs only), `len(LEFT_SVINSSEQ) + len(RIGHT_SVINSSEQ)`. Records with no resolvable length are skipped with reason `unresolvable_ins_len`.
 
 ### Output
 
@@ -90,7 +99,9 @@ matcha anno [options] input database
   -o PATH                       output (.vcf | .vcf.gz | .bcf); default stdout VCF
   --min-overlap FLOAT           (exactly one of these two is required)
   --min-jaccard FLOAT
-  --bnd-slop INT                default 100
+  --bnd-slop INT                default 50
+  --min-ins-sim FLOAT           default 0.75
+  --ins-slop INT                default 50
   --overwrite                   allow replacing existing INFO fields
   --chrs CHR[,CHR...]           restrict to listed chromosomes (filters records + header contigs)
   --threads INT                 default 1
@@ -128,7 +139,9 @@ matcha collapse [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
 
   --min-overlap FLOAT          (exactly one of these two is required)
   --min-jaccard FLOAT
-  --bnd-slop INT               default 100
+  --bnd-slop INT               default 50
+  --min-ins-sim FLOAT          default 0.75
+  --ins-slop INT               default 50
   --linkage average|single|complete   agglomerative linkage (default: average)
   --priority CRITERIA          comma-separated tiebreak cascade for representative
                                selection: PASS, QUAL, CENTRE, ORDER
@@ -190,6 +203,8 @@ matcha merge [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
   --min-overlap FLOAT           (exactly one of these two is required)
   --min-jaccard FLOAT
   --bnd-slop INT                default 50
+  --min-ins-sim FLOAT           default 0.75
+  --ins-slop INT                default 50
   --linkage average|single|complete   agglomerative linkage (default: average)
   --priority CRITERIA           tiebreak cascade for representative selection
                                 default: PASS,CENTRE,ORDER
@@ -223,6 +238,7 @@ matcha merge [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
   - `N_CALLERS` — distinct count.
 - Missing samples are written as `GT=./.` with missing values for other carried FORMAT fields.
 - For BND records, the original bracket-form ALT (`N[chr:pos[` etc.) is preserved.
+- For INS records, the original sequence-resolved ALT (e.g. from Delly or sequence-resolved Manta calls) is preserved on the representative record when present; symbolic `<INS>` is used otherwise.
 
 ### Notes
 

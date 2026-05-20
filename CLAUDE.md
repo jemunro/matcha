@@ -4,7 +4,7 @@ Compiled SV matching and annotation tool (Nim + hts-nim). See [README.md](README
 
 ## Status
 
-Milestones 1–4 (`matcha match`, `matcha anno`, `matcha collapse`, `matcha merge`) complete. SVTYPE=INS support is out of scope (silent skip).
+Milestones 1–4 (`matcha match`, `matcha anno`, `matcha collapse`, `matcha merge`) complete. SVTYPE=INS is supported across all four subcommands (position + size similarity; `--min-ins-sim`, `--ins-slop`). SVTYPE=TRA is not supported (warned and skipped).
 
 ## Build & test
 
@@ -22,8 +22,8 @@ python3 tests/generate_fixtures.py   # regenerate fixtures (needs bcftools + bgz
 | `utils.nim` | Shared types: `SvType`, `Metric`, `MatchPair`, `MatchConfig`, `OutputHeader`, `NO_MATCH` |
 | `intervals.nim` | `reciprocalOverlap`, `jaccard` |
 | `bins.nim` | `binIndexFor`, `adjacentBins`, `TiledBuffer`, `BufferedRec` |
-| `preproc.nim` | Normalize → per-(svtype,bin) temp BCF + work queue; `extraKeepInfo` (anno); `SRC_INDEX` assignment; `buildWorkQueue` returns `(jobs, fileList)`; `parseChrsArg`/`warnMissingChrs` for `--chrs` filter |
-| `matchcore.nim` | `streamJobPairs` (interval) and `streamBndJobPairs` (BND) — both return `seq[MatchPair]` (28-byte: srcIndex, pos, sim, fileIdx, chromIdx, svtype). Slim-BCF decode helpers (`readSrcIndex`, `readPos2`, `readChr2`, `extractEnd`). |
+| `preproc.nim` | Normalize → per-(svtype,bin) temp BCF + work queue; INS length resolution (`readInsLen`; INSLEN → SVLEN → ALT seq → SVINSSEQ chain); `extraKeepInfo` (anno); `SRC_INDEX` assignment; `buildWorkQueue` returns `(jobs, fileList)`; `parseChrsArg`/`warnMissingChrs` for `--chrs` filter |
+| `matchcore.nim` | `streamJobPairs` (interval), `streamBndJobPairs` (BND), `streamInsJobPairs` (INS) — all return `seq[MatchPair]`. Shared `advanceSlidingCache[T]` helper used by BND and INS. Slim-BCF decode helpers (`readSrcIndex`, `readPos2`, `readChr2`, `extractEnd`, `readSvlen`). |
 | `match.nim` | match-mode: pair-only pool (`runMatchPairJobsWithPool`), main-thread chr:pos CSI resolution, TSV output |
 | `anno.nim` | anno-mode: expression parser, `applyAggFunc`, per-match chr:pos CSI B retrieval, SRC_INDEX counter join for phase 3, output VCF assembly |
 | `mergecore.nim` | header merge (`resolveHeaders`), `buildSimilarityMap`, union-find, agglomerative clustering, `selectRepresentative` |

@@ -15,6 +15,9 @@ HEADER = """\
 ##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">
 ##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="Difference in length between REF and ALT alleles">
 ##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant">
+##INFO=<ID=INSLEN,Number=1,Type=Integer,Description="Inserted sequence length">
+##INFO=<ID=LEFT_SVINSSEQ,Number=1,Type=String,Description="Manta left side of large insertion">
+##INFO=<ID=RIGHT_SVINSSEQ,Number=1,Type=String,Description="Manta right side of large insertion">
 ##contig=<ID=chr1,length=248956422>
 ##contig=<ID=chr2,length=242193529>
 ##contig=<ID=chrX,length=156040895>
@@ -153,6 +156,31 @@ RECORDS_A = [
     # 27a/27b: dPOS=20, dPOS2=20 → sim at slop=100 = (200-20-20)/200 = 0.80.
     bnd("chr2", 60000, "BND_A_27a", chr2="chr2", pos2=80000),
     bnd("chr2", 60020, "BND_A_27b", chr2="chr2", pos2=80020),
+    # TC30 — INS with sequence ALT only (length derives from |ALT|-|REF|).
+    # |ALT|=101, |REF|=1 → SVLEN=100. Matches INS_B_30 (sequence-resolved, identical).
+    {"chrom": "chr2", "pos": 100000, "id": "INS_A_30_seq", "ref": "N",
+     "alt": "N" + "A" * 100, "info": "SVTYPE=INS",
+     "svtype": "INS", "svlen": 100, "end": 100001},
+    # TC31 — INS with INSLEN INFO only (Delly convention).
+    # INSLEN=33 → SVLEN=33. Matches INS_B_31 at posdelta=10, sizedelta minor.
+    {"chrom": "chr2", "pos": 110000, "id": "INS_A_31_inslen", "ref": "N",
+     "alt": "<INS>", "info": "SVTYPE=INS;INSLEN=33",
+     "svtype": "INS", "svlen": 33, "end": 110001},
+    # TC32 — INS with LEFT_SVINSSEQ+RIGHT_SVINSSEQ (Manta large-insertion).
+    # Combined length 40+50=90. Matches INS_B_32 at posdelta=5 with svlen=90.
+    {"chrom": "chr2", "pos": 120000, "id": "INS_A_32_svinsseq", "ref": "N",
+     "alt": "<INS>",
+     "info": "SVTYPE=INS;LEFT_SVINSSEQ=" + "A" * 40 +
+             ";RIGHT_SVINSSEQ=" + "C" * 50,
+     "svtype": "INS", "svlen": 90, "end": 120001},
+    # TC33 — INS with no resolvable length → skipped (skUnresolvableInsLen).
+    {"chrom": "chr2", "pos": 130000, "id": "INS_A_33_no_len", "ref": "N",
+     "alt": "<INS>", "info": "SVTYPE=INS",
+     "svtype": None, "svlen": None, "end": None},
+    # TC34 — INS far outside the slop window from any B record (singleton).
+    {"chrom": "chr2", "pos": 200000, "id": "INS_A_34_alone", "ref": "N",
+     "alt": "<INS>", "info": "SVTYPE=INS;SVLEN=200",
+     "svtype": "INS", "svlen": 200, "end": 200001},
 ]
 
 RECORDS_B = [
@@ -187,6 +215,25 @@ RECORDS_B = [
     # TC23 — A's BND_A_23 has chrX mate; this B record has chr2 mate.
     # Position matches (chr1:62000) but CHR2 mismatch → must NOT pair.
     bnd("chr1", 62000, "BND_B_23", chr2="chr2", pos2=70000),
+    # TC30 — sequence ALT INS, identical to INS_A_30_seq.
+    {"chrom": "chr2", "pos": 100000, "id": "INS_B_30_seq", "ref": "N",
+     "alt": "N" + "A" * 100, "info": "SVTYPE=INS",
+     "svtype": "INS", "svlen": 100, "end": 100001},
+    # TC31 — INS with SVLEN, dPos=10 from INS_A_31_inslen, svlen=33.
+    # pos_sim = (50-10)/50 = 0.8, len_sim = 1.0 → sim = sqrt(0.8) ≈ 0.894.
+    {"chrom": "chr2", "pos": 110010, "id": "INS_B_31_close", "ref": "N",
+     "alt": "<INS>", "info": "SVTYPE=INS;SVLEN=33",
+     "svtype": "INS", "svlen": 33, "end": 110011},
+    # TC32 — INS at dPos=5 from INS_A_32_svinsseq with svlen=85 (vs 90).
+    # pos_sim=(50-5)/50=0.9, len_sim=85/90≈0.944 → sim≈sqrt(0.85)≈0.922.
+    {"chrom": "chr2", "pos": 120005, "id": "INS_B_32_close", "ref": "N",
+     "alt": "<INS>", "info": "SVTYPE=INS;SVLEN=85",
+     "svtype": "INS", "svlen": 85, "end": 120005 + 1},
+    # TC35 — INS outside slop window from INS_A_30_seq (offset=60 > slop=50).
+    # Used to verify the slop bound is honoured.
+    {"chrom": "chr2", "pos": 100060, "id": "INS_B_35_outside", "ref": "N",
+     "alt": "<INS>", "info": "SVTYPE=INS;SVLEN=100",
+     "svtype": "INS", "svlen": 100, "end": 100061},
 ]
 
 
@@ -451,6 +498,9 @@ COLLAPSE_HEADER = """\
 ##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">
 ##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="Difference in length between REF and ALT alleles">
 ##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant">
+##INFO=<ID=INSLEN,Number=1,Type=Integer,Description="Inserted sequence length">
+##INFO=<ID=LEFT_SVINSSEQ,Number=1,Type=String,Description="Manta left side of large insertion">
+##INFO=<ID=RIGHT_SVINSSEQ,Number=1,Type=String,Description="Manta right side of large insertion">
 ##contig=<ID=chr1,length=248956422>
 ##contig=<ID=chr2,length=242193529>
 ##contig=<ID=chrX,length=156040895>
@@ -475,22 +525,32 @@ def bnd_col(chrom, pos, rid, chr2, pos2, qual=".", filt="PASS"):
             "chr2": chr2, "pos2": pos2}
 
 
-# Caller1: some PASS, one LowQual, one singleton, one DUP, one BND
+# Caller1: some PASS, one LowQual, one singleton, one DUP, one BND, one INS
 RECORDS_COLLAPSE_CALLER1 = [
     col("chr1",    1000,  "DEL_D_01", "DEL", 1000, 2000,  qual=50,  filt="PASS"),
     col("chr1",    3000,  "DEL_D_02", "DEL", 1000, 4000,  qual=30,  filt="LowQual"),
     col("chr1",    5000,  "DEL_D_03", "DEL", 1000, 6000,  qual=40,  filt="PASS"),
     col("chr1",    9000,  "DUP_D_01", "DUP", 1000, 10000, qual=50,  filt="PASS"),
     bnd_col("chr1", 31000, "BND_D_01", chr2="chr1", pos2=32000, qual=50, filt="PASS"),
+    # INS with sequence-resolved ALT (50bp insertion); cluster anchor for INS_M_01.
+    {"chrom": "chr1", "pos": 40000, "id": "INS_D_01", "ref": "N",
+     "alt": "N" + "A" * 50, "info": "SVTYPE=INS",
+     "qual": "50", "filter": "PASS",
+     "svtype": "INS", "svlen": 50, "end": 40001},
 ]
 
-# Caller2: all PASS, one singleton, same positions as Caller1 (some exact, some shifted), one BND
+# Caller2: all PASS, one singleton, same positions as Caller1 (some exact, some shifted), one BND, one INS
 RECORDS_COLLAPSE_CALLER2 = [
     col("chr1",    1000,  "DEL_M_01", "DEL", 1000, 2000,  qual=80,  filt="PASS"),
     col("chr1",    3100,  "DEL_M_02", "DEL", 1000, 4100,  qual=80,  filt="PASS"),
     col("chr1",    7000,  "DEL_M_03", "DEL", 1000, 8000,  qual=80,  filt="PASS"),
     col("chr1",    9000,  "DUP_M_01", "DUP", 1000, 10000, qual=80,  filt="PASS"),
     bnd_col("chr1", 31000, "BND_M_01", chr2="chr1", pos2=32000, qual=80, filt="PASS"),
+    # INS with sequence-resolved ALT, identical to INS_D_01.
+    {"chrom": "chr1", "pos": 40000, "id": "INS_M_01", "ref": "N",
+     "alt": "N" + "A" * 50, "info": "SVTYPE=INS",
+     "qual": "80", "filter": "PASS",
+     "svtype": "INS", "svlen": 50, "end": 40001},
 ]
 
 # 1-sample collapse fixtures: same records as the 0-sample fixtures plus a
@@ -584,6 +644,7 @@ MERGE_HEADER_BASE = """\
 ##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">
 ##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="Difference in length between REF and ALT alleles">
 ##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant">
+##INFO=<ID=INSLEN,Number=1,Type=Integer,Description="Inserted sequence length">
 ##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
 ##contig=<ID=chr1,length=248956422>
 ##contig=<ID=chr2,length=242193529>
@@ -605,16 +666,27 @@ def merge_bnd(chrom, pos, rid, chr2, pos2, gt, qual=".", filt="PASS"):
             "info": "SVTYPE=BND", "qual": str(qual), "filter": filt, "gt": gt}
 
 
+def merge_ins_seq(chrom, pos, rid, ins_seq, gt, qual=".", filt="PASS"):
+    """INS record with a sequence-resolved ALT (e.g. Delly-style)."""
+    alt = "N" + ins_seq
+    return {"chrom": chrom, "pos": pos, "id": rid, "ref": "N", "alt": alt,
+            "info": "SVTYPE=INS", "qual": str(qual), "filter": filt, "gt": gt}
+
+
 MERGE_S1 = [
     merge_rec("chr1", 1000,  "DEL_S1_1",  "DEL", 1000, 2000,  "0/1"),
     merge_rec("chr1", 3000,  "DEL_S1_2",  "DEL", 1000, 4000,  "1/1"),
     merge_rec("chr1", 9000,  "DUP_S1_3",  "DUP", 1000, 10000, "0/1"),
     merge_bnd("chr1", 31000, "BND_S1_4",  "chr1", 32000,      "0/1"),
+    # 50bp sequence-resolved INS — clusters with S2's INS_S2_4.
+    merge_ins_seq("chr1", 40000, "INS_S1_5", "A" * 50,         "0/1"),
 ]
 MERGE_S2 = [
     merge_rec("chr1", 1000,  "DEL_S2_1",  "DEL", 1000, 2000,  "1/1"),
     merge_rec("chr1", 9000,  "DUP_S2_2",  "DUP", 1000, 10000, "0/0"),
     merge_bnd("chr1", 31000, "BND_S2_3",  "chr1", 32000,      "0/1"),
+    # Same INS at same pos with identical ALT → clusters with INS_S1_5.
+    merge_ins_seq("chr1", 40000, "INS_S2_4", "A" * 50,         "1/1"),
 ]
 MERGE_S3 = [
     merge_rec("chr1", 1100,  "DEL_S3_1",  "DEL", 1000, 2100,  "0/0"),
@@ -735,8 +807,8 @@ def main():
     # plus one sample column "SAMPLE1" carrying distinct GT values per record
     # (so a CT test can spot if GT round-trips correctly through the merged
     # BCF → final output path).
-    caller1_1s_gt = ["0/1", "0/0", "1/1", "0/1", "0/1"]  # one per Caller1 record (incl. BND_D_01)
-    caller2_1s_gt = ["1/1", "0/1", "0/0", "1/1", "0/1"]  # one per Caller2 record (incl. BND_M_01)
+    caller1_1s_gt = ["0/1", "0/0", "1/1", "0/1", "0/1", "0/1"]  # one per Caller1 record (incl. INS_D_01)
+    caller2_1s_gt = ["1/1", "0/1", "0/0", "1/1", "0/1", "1/1"]  # one per Caller2 record (incl. INS_M_01)
     print("Writing collapse_caller1_1sample.vcf.gz ...")
     write_collapse_vcf_with_samples(
         RECORDS_COLLAPSE_CALLER1,

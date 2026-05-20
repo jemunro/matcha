@@ -27,6 +27,8 @@ type
     metric*:       Metric
     threshold*:    float64
     bndSlop*:      int
+    insSlop*:      int
+    insMinSim*:    float64
     linkage*:      LinkageMethod
     priority*:     seq[PriorityCriterion]
     formatFields*: seq[string]   ## FORMAT fields to carry; GT auto-added
@@ -258,6 +260,7 @@ proc symbolicAlt(svt: SvType): string =
   of svDEL: "<DEL>"
   of svDUP: "<DUP>"
   of svINV: "<INV>"
+  of svINS: "<INS>"
   else: "."
 
 # Copy a single INFO field from src record (in srcHdr space) to dst record
@@ -445,8 +448,6 @@ proc writeMergeOutput(cfg: MergeConfig;
       let pick =
         if list.len == 1: list[0]
         else:
-          logWarn("merge: cluster " & $clusterIdx & " has " & $list.len &
-                  " records from sample '" & sid & "' — picking by priority")
           pickPriorityMember(list, allRecs, cfg.priority)
       slotByMember[s] = pick
 
@@ -470,18 +471,23 @@ proc writeMergeOutput(cfg: MergeConfig;
       svt = parseSvType($cast[cstring](svtBuf))
     if svtBuf != nil: c_free(svtBuf)
 
-    # REF/ALT
-    if svt == svBND:
-      # BND ALT preserved verbatim on the slim record.
+    # REF/ALT. For BND and sequence-resolved INS the slim record preserved
+    # the source REF/ALT verbatim; emit those. For other types (and INS that
+    # was symbolic on input) fall back to a symbolic ALT.
+    if svt == svBND or svt == svINS:
       discard bcf_unpack(repRec, BCF_UN_STR.cint)
-      if repRec.n_allele >= 2:
-        # Use rep's own REF/ALT strings.
-        let alleles = cast[ptr UncheckedArray[cstring]](repRec.d.allele)
+      let alleles = cast[ptr UncheckedArray[cstring]](repRec.d.allele)
+      let preserved = repRec.n_allele >= 2 and
+                      (alleles == nil or alleles[1] == nil or
+                       ($alleles[1]).len > 0)
+      if preserved and repRec.n_allele >= 2:
         var altStr = $alleles[0]
         for i in 1 ..< repRec.n_allele.int:
           altStr &= ","
           altStr &= $alleles[i]
         discard bcf_update_alleles_str(outputHdr, outRec, altStr.cstring)
+      elif svt == svINS:
+        discard bcf_update_alleles_str(outputHdr, outRec, "N,<INS>".cstring)
       else:
         discard bcf_update_alleles_str(outputHdr, outRec, "N,.".cstring)
     else:
@@ -820,6 +826,7 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
                                stampSID:         true,
                                sampleIdByCaller: sampleIds,
                                preserveBndAlt:   true,
+                               preserveInsAlt:   true,
                                keptChrs:         toHashSet(cfgMut.keptChrs))
   let im = integratedMerge(cfgMut.callers, mh, slimHdr, msc, chromOrder)
   if cfgMut.keptChrs.len > 0:
@@ -844,6 +851,8 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
     metric:         cfgMut.metric,
     threshold:      cfgMut.threshold,
     bndSlop:        cfgMut.bndSlop,
+    insSlop:        cfgMut.insSlop,
+    insMinSim:      cfgMut.insMinSim,
     nThreads:       cfgMut.nThreads,
     tmpDir:         cfgMut.tmpDir,
     selfMode:       true,

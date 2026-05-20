@@ -10,7 +10,7 @@ type
     svDUP = "DUP"
     svINV = "INV"
     svBND = "BND"
-    svINS = "INS"      ## out of scope — silently skipped in preproc
+    svINS = "INS"
     svTRA = "TRA"      ## out of scope — warned and skipped in preproc
     svUNKNOWN = "UNKNOWN"
 
@@ -46,6 +46,10 @@ type
     threshold*:       float64  ## Minimum score for the active metric (0.0-1.0).
     bndSlop*:         int      ## --bnd-slop (default 50); both breakends of a
                                ## BND pair must lie within this many bp.
+    insSlop*:         int      ## --ins-slop (default 50); max |posA - posB| for
+                               ## an INS match.
+    insMinSim*:       float64  ## --min-ins-sim (default 0.75); threshold on
+                               ## combined sim = sqrt(pos_sim * len_sim).
     nThreads*:        int
     tmpDir*:          string
     outputPath*:      string
@@ -59,7 +63,7 @@ type
                                    ## and emit as INFO_A / INFO_B columns in TSV output.
     keptChrs*:        seq[string]  ## --chrs filter; empty = no filter (keep all chroms).
 
-const SupportedSvTypes* = {svDEL, svDUP, svINV, svBND}
+const SupportedSvTypes* = {svDEL, svDUP, svINV, svBND, svINS}
 
 const OutputHeader* =
   "#CHROM_A\tPOS_A\tID_A\tCHROM_B\tPOS_B\tID_B\tSVTYPE\tSIMILARITY"

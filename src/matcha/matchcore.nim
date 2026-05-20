@@ -8,7 +8,8 @@
 ## Singleton emission (A records with no passing B match) is controlled by
 ## cfg.emitSingletons; only collapse sets this true.
 
-import std/[algorithm, deques, sequtils, tables]
+import std/[algorithm, deques, math, sequtils, tables]
+import std/options as stdopt
 import hts
 import hts/private/hts_concat
 import intervals, preproc, bins, utils
@@ -57,6 +58,14 @@ proc readChr2*(v: Variant; scratch: var string): tuple[ok: bool; chr2: string] =
     return (false, "")
   (true, scratch)
 
+proc readSvlen*(v: Variant; scratch: var seq[int32]): tuple[ok: bool; svlen: int64] =
+  ## Decode INFO/SVLEN (Number=1 Integer, abs). Returns ok=false if absent or 0.
+  if v.info().get("SVLEN", scratch) != Status.OK or scratch.len < 1:
+    return (false, 0'i64)
+  let n = abs(int64(scratch[0]))
+  if n <= 0: return (false, 0'i64)
+  (true, n)
+
 proc extractEnd*(v: Variant; endData, svlenData: var seq[int32];
                  outEnd: var int64): bool =
   ## Resolve END for a slim record. After preproc, END is always written
@@ -66,6 +75,34 @@ proc extractEnd*(v: Variant; endData, svlenData: var seq[int32];
   if v.info().get("SVLEN", svlenData) == Status.OK and svlenData.len > 0:
     outEnd = v.POS + abs(int64(svlenData[0])); return true
   false
+
+# ---------------------------------------------------------------------------
+# Sliding-cache helper — shared by BND and INS streamers
+# ---------------------------------------------------------------------------
+
+proc advanceSlidingCache*[T](
+    vcfB: VCF; chrom: string; slop: int; posA: int64;
+    cache: var Deque[T]; cacheEnd: var int64;
+    decodeB: proc(vb: Variant): stdopt.Option[T] {.closure.}) =
+  ## Maintain a position-ordered sliding cache of B records covering the
+  ## window [posA - slop + 1, posA + slop). Evicts the front below the
+  ## window and lazily fetches the right edge via a single CSI region query.
+  ## `T` must expose `pos: int64`; `decodeB` returns `none` to skip a record.
+  let winLo = posA - slop.int64 + 1
+  let winHi = posA + slop.int64
+  while cache.len > 0 and cache.peekFirst().pos < winLo:
+    cache.popFirst()
+  let queryLo = max(cacheEnd, winLo)
+  if queryLo < winHi:
+    let regLo = max(1'i64, queryLo)
+    let regHi = winHi - 1
+    if regHi >= regLo:
+      let region = chrom & ":" & $regLo & "-" & $regHi
+      for vb in vcfB.query(region):
+        if vb.POS < queryLo: continue
+        let rec = decodeB(vb)
+        if stdopt.isSome(rec): cache.addLast(stdopt.get(rec))
+    cacheEnd = winHi
 
 # ---------------------------------------------------------------------------
 # Interval matching
@@ -196,6 +233,17 @@ proc streamBndJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
   let twoSlop = float64(2 * slop)
   let bFileIdx = job.binsB[0].fileIdx
 
+  let decodeB = proc(vb: Variant): stdopt.Option[BndCacheRec] =
+    let p2B = readPos2(vb, pos2Data)
+    if not p2B.ok: return stdopt.none(BndCacheRec)
+    let c2B = readChr2(vb, chr2Data)
+    if not c2B.ok: return stdopt.none(BndCacheRec)
+    stdopt.some(BndCacheRec(
+      pos: vb.POS, pos2: p2B.pos2,
+      srcIndex: readSrcIndex(vb, idxData),
+      fileIdx:  bFileIdx,
+      chr2:     c2B.chr2))
+
   for va in vcfA.query(job.chrom):
     let posA       = va.POS
     let srcIndexA  = readSrcIndex(va, idxData)
@@ -210,33 +258,7 @@ proc streamBndJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
     let callerIdxA = (if va.info().get("CALLER_IDX", ciData) == Status.OK and
                         ciData.len > 0: int16(ciData[0]) else: 0'i16)
 
-    let winLo = posA - slop.int64 + 1
-    let winHi = posA + slop.int64
-
-    while cache.len > 0 and cache.peekFirst().pos < winLo:
-      cache.popFirst()
-
-    let queryLo = max(cacheEnd, winLo)
-    let queryHi = winHi
-    if queryLo < queryHi:
-      let regLo = max(1'i64, queryLo)
-      let regHi = queryHi - 1
-      if regHi >= regLo:
-        let region = job.chrom & ":" & $regLo & "-" & $regHi
-        for vb in vcfB.query(region):
-          let posB = vb.POS
-          if posB < queryLo: continue
-          let p2B = readPos2(vb, pos2Data)
-          if not p2B.ok: continue
-          let c2B = readChr2(vb, chr2Data)
-          if not c2B.ok: continue
-          cache.addLast(BndCacheRec(
-            pos: posB, pos2: p2B.pos2,
-            srcIndex: readSrcIndex(vb, idxData),
-            fileIdx:  bFileIdx,
-            chr2:     c2B.chr2,
-          ))
-      cacheEnd = queryHi
+    advanceSlidingCache(vcfB, job.chrom, slop, posA, cache, cacheEnd, decodeB)
 
     var anyMatch = false
     for i in 0 ..< cache.len:
@@ -247,6 +269,90 @@ proc streamBndJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
       let d1 = abs(cand.pos - posA)
       let sim = (twoSlop - float64(d1) - float64(d2)) / twoSlop
       if sim <= 0: continue
+      if cfg.selfMode and srcIndexA >= cand.srcIndex: continue
+      result.add(MatchPair(
+        srcIndexA: srcIndexA, srcIndexB: cand.srcIndex,
+        posA:      int32(posA), posB: int32(cand.pos),
+        sim:       float32(sim),
+        fileIdxA:  job.fileIdxA, fileIdxB: cand.fileIdx,
+        chromIdx:  job.chromIdx, svtype: int8(job.svtype),
+        passA: passA, qualQ: qualQ, callerIdxA: callerIdxA,
+      ))
+      anyMatch = true
+
+    if cfg.emitSingletons and not anyMatch:
+      result.add(singletonPair(job, srcIndexA, posA, passA, qualQ, callerIdxA))
+
+  tearDownVcf(vcfA)
+  tearDownVcf(vcfB)
+
+# ---------------------------------------------------------------------------
+# INS matching (point events; combined position + size similarity)
+# ---------------------------------------------------------------------------
+
+proc streamInsJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
+  ## Per-job INS matching with a sliding cache of B records, mirroring the
+  ## BND streamer. INS records all share bin 0; combined similarity is
+  ##   sim = sqrt(pos_sim * len_sim)
+  ## where pos_sim = (slop - |dPos|) / slop and len_sim = min/max(SVLEN).
+  let slop = cfg.insSlop
+  let minSim = cfg.insMinSim
+  if slop <= 0: return
+  if 0 notin job.binsB: return
+
+  var vcfA: VCF
+  if not open(vcfA, job.pathA):
+    raise newException(IOError, "cannot open A INS BCF: " & job.pathA)
+  var vcfB: VCF
+  if not open(vcfB, job.binsB[0].path):
+    raise newException(IOError, "cannot open B INS BCF: " & job.binsB[0].path)
+
+  type InsCacheRec = object
+    pos:      int64
+    svlen:    int64
+    srcIndex: int32
+    fileIdx:  int16
+
+  var cache = initDeque[InsCacheRec]()
+  var cacheEnd: int64 = low(int64)
+
+  var idxData, svlenData, ciData: seq[int32]
+  let slopF = slop.float64
+  let bFileIdx = job.binsB[0].fileIdx
+
+  let decodeB = proc(vb: Variant): stdopt.Option[InsCacheRec] =
+    let svB = readSvlen(vb, svlenData)
+    if not svB.ok: return stdopt.none(InsCacheRec)
+    stdopt.some(InsCacheRec(
+      pos:      vb.POS,
+      svlen:    svB.svlen,
+      srcIndex: readSrcIndex(vb, idxData),
+      fileIdx:  bFileIdx))
+
+  for va in vcfA.query(job.chrom):
+    let posA       = va.POS
+    let srcIndexA  = readSrcIndex(va, idxData)
+    let svA = readSvlen(va, svlenData)
+    if not svA.ok: continue
+    let svlenA = svA.svlen
+    let passA      = ($va.FILTER == "PASS")
+    let qualQ      = quantizeQual(va.QUAL.float32)
+    let callerIdxA = (if va.info().get("CALLER_IDX", ciData) == Status.OK and
+                        ciData.len > 0: int16(ciData[0]) else: 0'i16)
+
+    advanceSlidingCache(vcfB, job.chrom, slop, posA, cache, cacheEnd, decodeB)
+
+    var anyMatch = false
+    for i in 0 ..< cache.len:
+      let cand = cache[i]
+      let dPos = abs(cand.pos - posA)
+      if dPos >= slop: continue
+      let posSim = (slopF - dPos.float64) / slopF
+      let svF1 = svlenA.float64
+      let svF2 = cand.svlen.float64
+      let lenSim = min(svF1, svF2) / max(svF1, svF2)
+      let sim = sqrt(posSim * lenSim)
+      if sim < minSim: continue
       if cfg.selfMode and srcIndexA >= cand.srcIndex: continue
       result.add(MatchPair(
         srcIndexA: srcIndexA, srcIndexB: cand.srcIndex,

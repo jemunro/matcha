@@ -39,15 +39,16 @@ timed("P01", "preprocessVcf: (svtype, bin) keys + populated"):
   doAssert "chr2" in pp.populated.getOrDefault((svDUP, 1)), "DUP/bin1 missing chr2"
   doAssert "chrX" in pp.populated.getOrDefault((svINV, 1)), "INV/bin1 missing chrX"
 
-# P02 — BND records are kept; INS and TRA are skipped.
-timed("P02", "preprocessVcf: BND kept; INS and TRA excluded"):
+# P02 — BND and INS records are kept; TRA is skipped.
+timed("P02", "preprocessVcf: BND and INS kept; TRA excluded"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
   doAssert (svBND, 0) in pp.paths,
     "BND records should be in the (svBND, bin 0) temp BCF"
+  doAssert (svINS, 0) in pp.paths,
+    "INS records should be in the (svINS, bin 0) temp BCF"
   for key in pp.paths.keys:
-    doAssert key.svtype != svINS, "INS should be excluded"
     doAssert key.svtype != svTRA, "TRA should be excluded"
 
 # P02b — BND slim record carries authoritative CHR2/POS2 from ALT parse.
@@ -186,8 +187,12 @@ timed("P09", "preprocessVcf: temp BCF records have only keep-set INFO fields"):
   let pp = preprocessVcf(FixtureA, tmpDir, "A")
   let allowedInterval = ["END", "SRC_INDEX"].toHashSet
   let allowedBnd      = ["CHR2", "POS2", "SRC_INDEX"].toHashSet
+  let allowedIns      = ["SVLEN", "SRC_INDEX"].toHashSet
   for key, path in pp.paths:
-    let allowed = if key.svtype == svBND: allowedBnd else: allowedInterval
+    let allowed =
+      if key.svtype == svBND:   allowedBnd
+      elif key.svtype == svINS: allowedIns
+      else:                     allowedInterval
     for rec in readRecords(path):
       for name in rec.infoNames:
         doAssert name in allowed,

@@ -12,10 +12,11 @@
 ##   * Write to a per-(SVTYPE, bin) BCF spanning all chroms; CSI-indexed.
 ##
 ## Skip categories (counted; final summary always emitted):
-##   skUnsupportedSvtype  - INS only (silent count; out of scope)
+##   skUnsupportedSvtype  - SVTYPE outside SupportedSvTypes
 ##   skUnsupportedTra     - TRA (warn-emitting; not supported)
 ##   skUnresolvableSvtype - neither INFO/SVTYPE nor recognizable ALT
 ##   skUnresolvableEnd    - missing both INFO/END and INFO/SVLEN
+##   skUnresolvableInsLen - INS length unresolvable from INSLEN/SVLEN/ALT/SVINSSEQ
 ##   skEndLePos           - resolved END <= POS
 ##   skMalformedBnd       - BND ALT could not be parsed for mate position
 ##   skUnknownContig      - BCF_ERR_CTG_UNDEF on read
@@ -68,6 +69,7 @@ type
     skUnsupportedTra
     skUnresolvableSvtype
     skUnresolvableEnd
+    skUnresolvableInsLen
     skEndLePos
     skMalformedBnd
     skUnknownContig
@@ -115,6 +117,10 @@ const BndInfoDefs = [
   ("POS2",      "1", "Integer", "Position of mate breakend"),
   ("SRC_INDEX", "1", "Integer", "matcha-internal: sequential record index from preproc"),
 ]
+const InsInfoDefs = [
+  ("SVLEN",     "1", "Integer", "Length of the insertion"),
+  ("SRC_INDEX", "1", "Integer", "matcha-internal: sequential record index from preproc"),
+]
 
 # Standard SV INFO definitions to backfill when the input header omits them.
 # Without these, info.set() at write time fails because hts-nim resolves
@@ -135,6 +141,7 @@ proc reasonStr(r: SkipReason): string =
   of skUnsupportedTra:      "unsupported_tra"
   of skUnresolvableSvtype:  "unresolvable_svtype"
   of skUnresolvableEnd:     "unresolvable_end"
+  of skUnresolvableInsLen:  "unresolvable_ins_len"
   of skEndLePos:            "end_le_pos"
   of skMalformedBnd:        "malformed_bnd"
   of skUnknownContig:       "unknown_contig"
@@ -143,10 +150,6 @@ proc reasonStr(r: SkipReason): string =
 proc warnSkip*(reason: SkipReason, ws: var WarnState,
               chrom: string, pos: int64, id: string, detail: string) =
   inc ws.skipped[reason]
-  if ws.emitted[reason] < ws.cap:
-    inc ws.emitted[reason]
-    logWarn(chrom & ":" & $pos & " ID=" & id &
-            " reason=\"" & reasonStr(reason) & ": " & detail & "\"")
 
 proc symbolicAltSvtype(alt: string): SvType =
   ## Parse `<DEL>`, `<DUP>`, `<INV>`, `<INS>`, `<TRA>` → corresponding SvType.
@@ -250,10 +253,44 @@ proc resolveSvlen(v: Variant, endPos: int64, infoSvlen: var seq[int32]):
     return (true, derived, false)
   return (false, 0'i64, false)
 
+proc isPlainSeqAlt(alt: string): bool =
+  ## True iff `alt` is a non-empty ACGTN* string (no symbolic <...>, no
+  ## breakend bracket notation). Lower-case ACGTN accepted.
+  if alt.len == 0: return false
+  for c in alt:
+    case c
+    of 'A','C','G','T','N','a','c','g','t','n': continue
+    else: return false
+  true
+
+proc readInsLen(v: Variant; refStr, altStr: string;
+                inslenBuf, svlenBuf: var seq[int32];
+                leftBuf, rightBuf: var string): int64 =
+  ## Resolve INS length via the documented fallback chain:
+  ##   INFO/INSLEN -> INFO/SVLEN -> |ALT|-|REF| (when ALT is a plain sequence)
+  ##   -> |LEFT_SVINSSEQ|+|RIGHT_SVINSSEQ| -> 0.
+  if v.info().get("INSLEN", inslenBuf) == Status.OK and inslenBuf.len > 0:
+    let n = abs(int64(inslenBuf[0]))
+    if n > 0: return n
+  if v.info().get("SVLEN", svlenBuf) == Status.OK and svlenBuf.len > 0:
+    let n = abs(int64(svlenBuf[0]))
+    if n > 0: return n
+  if isPlainSeqAlt(altStr) and refStr.len > 0:
+    let diff = altStr.len - refStr.len
+    if diff > 0: return int64(diff)
+  let lOk = v.info().get("LEFT_SVINSSEQ", leftBuf) == Status.OK
+  let rOk = v.info().get("RIGHT_SVINSSEQ", rightBuf) == Status.OK
+  let lLen = if lOk: leftBuf.len else: 0
+  let rLen = if rOk: rightBuf.len else: 0
+  let combined = lLen + rLen
+  if combined > 0: return int64(combined)
+  0'i64
+
 proc resolveRecord(view: Variant; ws: var WarnState;
                    chrom: string; pos1: int64; curId: string;
                    svtypeBuf: var string;
-                   endBuf, svlenBuf: var seq[int32]):
+                   endBuf, svlenBuf, inslenBuf: var seq[int32];
+                   leftBuf, rightBuf: var string):
     tuple[ok: bool; svt: SvType; endPos: int64; svlen: int64; binIdx: int;
           bndChr2: string; bndPos2: int64] =
   ## Resolve SVTYPE/END/SVLEN and skip-classify a record. Emits warnSkip for
@@ -286,6 +323,19 @@ proc resolveRecord(view: Variant; ws: var WarnState;
     return (ok: true, svt: svt, endPos: pos1 + 1, svlen: 0'i64, binIdx: 0,
             bndChr2: bnd.chr2, bndPos2: bnd.pos2)
 
+  if svt == svINS:
+    let alts = view.ALT
+    let altStr = if alts.len > 0: alts[0] else: ""
+    let refStr = view.REF
+    let insLen = readInsLen(view, refStr, altStr,
+                            inslenBuf, svlenBuf, leftBuf, rightBuf)
+    if insLen <= 0:
+      warnSkip(skUnresolvableInsLen, ws, chrom, pos1, curId,
+               "could not resolve INS length from INSLEN/SVLEN/ALT/SVINSSEQ")
+      return
+    return (ok: true, svt: svt, endPos: pos1 + 1, svlen: insLen, binIdx: 0,
+            bndChr2: "", bndPos2: 0'i64)
+
   let endR = resolveEnd(view, endBuf, svlenBuf)
   if not endR.ok:
     warnSkip(skUnresolvableEnd, ws, chrom, pos1, curId,
@@ -314,7 +364,9 @@ proc ensureSvInfoDefs(h: vcf.Header) =
 
 proc normalizeRecord*(hdr: ptr bcf_hdr_t; rec: ptr bcf1_t; lineno: int;
                      ws: var WarnState; view: Variant;
-                     svtypeBuf: var string; endBuf, svlenBuf: var seq[int32];
+                     svtypeBuf: var string;
+                     endBuf, svlenBuf, inslenBuf: var seq[int32];
+                     leftBuf, rightBuf: var string;
                      vcfPath: string):
     tuple[ok: bool; svt: SvType; endPos: int64; svlen: int64; binIdx: int;
           bndChr2: string; bndPos2: int64] =
@@ -351,7 +403,8 @@ proc normalizeRecord*(hdr: ptr bcf_hdr_t; rec: ptr bcf1_t; lineno: int;
   let curId = getRecId(rec)
 
   let r = resolveRecord(view, ws, chrom, pos1, curId,
-                        svtypeBuf, endBuf, svlenBuf)
+                        svtypeBuf, endBuf, svlenBuf, inslenBuf,
+                        leftBuf, rightBuf)
   if not r.ok: return
 
   # Synthesize ID if missing
@@ -454,15 +507,19 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   # Per-SVTYPE keep-sets (HashSet membership is O(1) per INFO field per record).
   var keepSetInterval = initHashSet[string]()
   var keepSetBnd      = initHashSet[string]()
+  var keepSetIns      = initHashSet[string]()
   for (id, _, _, _) in IntervalInfoDefs: keepSetInterval.incl(id)
   for (id, _, _, _) in BndInfoDefs:      keepSetBnd.incl(id)
+  for (id, _, _, _) in InsInfoDefs:      keepSetIns.incl(id)
   for n in extraKeepInfo:
     keepSetInterval.incl(n)
     keepSetBnd.incl(n)
+    keepSetIns.incl(n)
 
   # Slim header templates: built once, duped per writer.
   let slimHdrInterval = buildSlimHdr(vcf.header.hdr, IntervalInfoDefs, extraKeepInfo)
   let slimHdrBnd      = buildSlimHdr(vcf.header.hdr, BndInfoDefs,      extraKeepInfo)
+  let slimHdrIns      = buildSlimHdr(vcf.header.hdr, InsInfoDefs,      extraKeepInfo)
 
   var writers: Table[SvtypeBin, VCF]
   var indexes: Table[SvtypeBin, ptr hts_idx_t]
@@ -471,7 +528,8 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   var srcIndex: int32 = 0  ## Increments for every record read (including skipped),
                            ## so anno's sequential A-file walk produces matching values.
   var svtypeStr: string
-  var endData, svlenData: seq[int32]
+  var endData, svlenData, inslenData: seq[int32]
+  var leftSeqBuf, rightSeqBuf: string
   var toDelete: seq[string]
 
   result.chromOrder = captureChromOrder(vcf.header)
@@ -502,7 +560,8 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
         inc ws.skipped[skChromFiltered]
         break recordBody
       let r = resolveRecord(v, ws, chrom, pos1, curId,
-                            svtypeStr, endData, svlenData)
+                            svtypeStr, endData, svlenData, inslenData,
+                            leftSeqBuf, rightSeqBuf)
       if not r.ok: break recordBody
       if keptChrs.len > 0 and r.svt == svBND and r.bndChr2 notin keptChrs:
         inc ws.skipped[skChromFiltered]
@@ -521,7 +580,10 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
 
       # Slim INFO: drop everything outside the per-SVTYPE keep-set (two-phase
       # to avoid iterator invalidation as we delete).
-      let activeKeepSet = if svt == svBND: keepSetBnd else: keepSetInterval
+      let activeKeepSet =
+        if svt == svBND:   keepSetBnd
+        elif svt == svINS: keepSetIns
+        else:              keepSetInterval
       toDelete.setLen(0)
       for fld in v.info.fields:
         if fld.name notin activeKeepSet:
@@ -537,6 +599,9 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
         discard v.info.set("CHR2", chr2Str)
         var pos2I32 = bndPos2.int32
         discard v.info.set("POS2", pos2I32)
+      elif svt == svINS:
+        var svlenI32 = svlen.int32
+        discard v.info.set("SVLEN", svlenI32)
       else:
         var endI32 = endPos.int32
         discard v.info.set("END", endI32)
@@ -549,7 +614,10 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
         if not open(wtr, path, mode = "wb"):
           raise newException(IOError, "cannot create temp BCF: " & path)
         wtr.copy_header(vcf.header)   # initializes wtr.header (open leaves it nil)
-        let slimHdr = if svt == svBND: slimHdrBnd else: slimHdrInterval
+        let slimHdr =
+          if svt == svBND:   slimHdrBnd
+          elif svt == svINS: slimHdrIns
+          else:              slimHdrInterval
         bcf_hdr_destroy(wtr.header.hdr)
         wtr.header.hdr = bcf_hdr_dup(slimHdr)
         wtr.set_samples(@["^"])   # temp BCFs carry no sample columns
@@ -593,6 +661,7 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
 
   bcf_hdr_destroy(slimHdrInterval)
   bcf_hdr_destroy(slimHdrBnd)
+  bcf_hdr_destroy(slimHdrIns)
 
   logInfo("[" & prefix & "] wrote " & $result.paths.len &
        " temp BCFs ((svtype, bin) groups)" &

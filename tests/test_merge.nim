@@ -95,7 +95,7 @@ timed("M02", "3-sample merge: exits 0 with 3 sample columns"):
   doAssert code == 0, "merge exited " & $code
   doAssert samples == @["S1", "S2", "S3"],
            "expected sample columns S1,S2,S3 in order, got " & samples.join(",")
-  doAssert rows.len == 5, "expected 5 cluster rows, got " & $rows.len
+  doAssert rows.len == 6, "expected 6 cluster rows, got " & $rows.len
 
 # M03 — DEL_1000 cluster: all 3 samples, AC=3 AN=6 AF=0.5
 timed("M03", "DEL_1000 cluster: AC=3 AN=6 AF=0.5 with S1=0/1 S2=1/1 S3=0/0"):
@@ -189,7 +189,7 @@ timed("M10", "--format DP (no GT) silently adds GT; cohort fields still correct"
   let text = readFile(outPath)
   discard tryRemoveFile(outPath)
   let parsed = parseMergeVcf(text)
-  doAssert parsed.rows.len == 5
+  doAssert parsed.rows.len == 6
   for r in parsed.rows:
     if r.pos == 1000:
       doAssert r.ac == 3
@@ -235,3 +235,20 @@ timed("M14", "cohort output does not emit N_MERGED"):
   let text = readFile(outPath)
   discard tryRemoveFile(outPath)
   doAssert "N_MERGED" notin text, "N_MERGED appeared in output"
+
+# M15 — INS cluster: S1 and S2 contribute (S1=0/1, S2=1/1, S3 missing).
+# Sequence-resolved ALT is preserved on the merged record; AC=3, AN=4, S3=./..
+timed("M15", "INS cluster: sequence ALT preserved, AC=3 AN=4 with S1/S2 only"):
+  let (samples, rows, code) = mergeRun()
+  doAssert code == 0
+  var found = false
+  for r in rows:
+    if r.chrom == "chr1" and r.pos == 40000:
+      found = true
+      doAssert r.alt.startsWith("N") and r.alt.len >= 50,
+        "INS ALT should be sequence-resolved, got: '" & r.alt & "'"
+      doAssert "<INS>" notin r.alt,
+        "INS ALT should not have collapsed to <INS>, got: '" & r.alt & "'"
+      doAssert r.ac == 3, "INS AC expected 3, got " & $r.ac
+      doAssert r.an == 4, "INS AN expected 4, got " & $r.an
+  doAssert found, "INS cluster at chr1:40000 missing from merge output"

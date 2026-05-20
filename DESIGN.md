@@ -9,7 +9,7 @@ Reference for contributors and Claude Code. For user documentation see [README.m
 Three phases per invocation (collapse adds two more):
 
 1. **Preproc** — normalize + slim each input into per-(SVTYPE, bin) temp BCFs, indexed with CSI. Each written record gets `INFO/SRC_INDEX` (sequential int32, incremented for every record read including skipped ones). `buildWorkQueue` returns `(jobs: seq[MatchJob], fileList: seq[string])`; `fileList` is the deduplicated ordered list of all slim BCF paths used as a `FILE_IDX` lookup table.
-2. **Match** — thread pool processes a work queue of `(chrom, svtype, binA)` jobs; each job pairs A records against adjacent B bins using TiledBuffer (intervals) or a sliding deque (BND). `matchcore.streamJobPairs` / `streamBndJobPairs` return 32-byte `MatchPair` structs — each A record also stamps FILTER, QUAL (Q14.2 uint16), and CALLER_IDX onto the pair, so collapse/merge can build `passQualMap` from MatchPairs alone.
+2. **Match** — thread pool processes a work queue of `(chrom, svtype, binA)` jobs; each job pairs A records against adjacent B bins using TiledBuffer (intervals), a sliding deque (BND), or a sliding deque (INS). `matchcore.streamJobPairs` / `streamBndJobPairs` / `streamInsJobPairs` return 32-byte `MatchPair` structs — each A record also stamps FILTER, QUAL (Q14.2 uint16), and CALLER_IDX onto the pair, so collapse/merge can build `passQualMap` from MatchPairs alone.
 3. **Resolve + Output** (per-mode):
    - `match` → main thread opens slim BCF handles indexed by `fileList`; per-pair CSI `chrom:pos-pos` query retrieves END + ID; writes TSV directly.
    - `anno` → B records retrieved per-match via CSI `chrom:posB-posB` query. Phase 3 streams original A, joining by incrementing SRC_INDEX counter.
@@ -23,9 +23,9 @@ Three phases per invocation (collapse adds two more):
 - **SRC_INDEX**: `INFO/SRC_INDEX` (`Number=1 Integer`) is written to every slim BCF record. It is a sequential counter incremented for every record read (including skipped ones), so an equivalent counter loop over the original A file produces matching values in anno's phase-3 join. CSI `chrom:pos-pos` queries with SRC_INDEX as tiebreaker provide O(1) record retrieval from slim BCFs.
 - **`--chrs` filter**: When supplied, only records whose primary CHROM is in the list are kept. BND records whose mate `CHR2` is on an excluded chromosome are also dropped. Filtering occurs before any other field resolution (preproc record loop; `integratedMerge` synced-reader loop). Output VCF/BCF `##contig` lines are restricted to the kept chromosomes via `addContigsUnion`. `anno` additionally strips excluded contigs from its copied input header and skips excluded records in the phase-3 output pass (while still advancing the `SRC_INDEX` counter to keep the join consistent). `match` output is TSV; header contig lines are not emitted. A post-preproc warning lists any `--chrs` entries absent from all input headers.
 - **Self-mode dedup**: `srcIndexA < srcIndexB` filter eliminates symmetric pairs and self-self. The filter is baked into `matchcore` itself (gated on `cfg.selfMode`); no adapter-side work needed. Interval work queue prunes `binsB` to `{b ≥ binA}`.
-- **BND always in bin 0**: BND records are point events, not size-binned. They always land in `(svBND, 0)` temp BCFs and bypass `adjacentBins`.
-- **Slim BCF keep-sets**: SVTYPE-specific — intervals `{END, SRC_INDEX}`, BND `{CHR2, POS2, SRC_INDEX}`. Anno passes `extraKeepInfo` to preprocess the database with user-requested DB INFO fields preserved on slim B records (so DB resolution never has to re-open the original). SVTYPE and SVLEN are not written (SVTYPE is encoded in the filename; SVLEN is derivable). REF, ALT, and QUAL are blanked (`N`, `.`, missing). Two slim header templates are built once per run (`buildSlimHdr`) — all FORMAT defs and non-keep INFO defs stripped — and duped per writer.
-- **MatchPair contract**: `streamJobPairs` and `streamBndJobPairs` return 32-byte POD structs `(srcIndexA, srcIndexB: int32; posA, posB: int32; sim: float32; fileIdxA, fileIdxB, chromIdx: int16; svtype: int8; passA: bool; qualQ: uint16; callerIdxA: int16)`. `passA`/`qualQ`/`callerIdxA` are A-side provenance fields decoded per A record — they let collapse/merge build `passQualMap` without a second slim-BCF pass. `qualQ` is Q14.2 fixed-point (range `[0, 16383.75]`, precision `0.25`). No generic parameters, no callbacks. Resolution is always main-thread.
+- **BND and INS always in bin 0**: Both are point events; neither is size-binned into the log2 bins used for intervals. They always land in `(svBND, 0)` / `(svINS, 0)` temp BCFs. `adjacentBins` for bin 0 returns the single bin 0 entry.
+- **Slim BCF keep-sets**: SVTYPE-specific — intervals `{END, SRC_INDEX}`, BND `{CHR2, POS2, SRC_INDEX}`, INS `{SVLEN, SRC_INDEX}`. Anno passes `extraKeepInfo` to preprocess the database with user-requested DB INFO fields preserved on slim B records (so DB resolution never has to re-open the original). SVTYPE is encoded in the filename; SVLEN for intervals is derivable from END. REF, ALT, and QUAL are blanked (`N`, `.`, missing) on match/anno slim BCFs. Three slim header templates are built once per run (`buildSlimHdr`) — all FORMAT defs and non-keep INFO defs stripped — and duped per writer. In collapse/merge paths, BND and INS source REF/ALT are preserved verbatim (`preserveBndAlt`/`preserveInsAlt`) so sequence-resolved insertions and strand-encoded BND bracket forms survive into cohort output.
+- **MatchPair contract**: `streamJobPairs`, `streamBndJobPairs`, and `streamInsJobPairs` return 32-byte POD structs `(srcIndexA, srcIndexB: int32; posA, posB: int32; sim: float32; fileIdxA, fileIdxB, chromIdx: int16; svtype: int8; passA: bool; qualQ: uint16; callerIdxA: int16)`. `passA`/`qualQ`/`callerIdxA` are A-side provenance fields decoded per A record — they let collapse/merge build `passQualMap` without a second slim-BCF pass. `qualQ` is Q14.2 fixed-point (range `[0, 16383.75]`, precision `0.25`). No generic parameters, no callbacks. Resolution is always main-thread.
 
 ---
 
@@ -39,16 +39,17 @@ Temp BCFs live inside a per-invocation subdirectory created via `makeRunTmpDir` 
 
 | Field | Rule | Failure action |
 |---|---|---|
-| **SVTYPE** | Prefer `INFO/SVTYPE`; fall back to symbolic ALT or bracket BND. **ALT wins on disagreement.** | Unresolvable → warn+skip. `TRA` → warn+skip. `INS` → silent count. |
+| **SVTYPE** | Prefer `INFO/SVTYPE`; fall back to symbolic ALT or bracket BND. **ALT wins on disagreement.** | Unresolvable → warn+skip. `TRA` → warn+skip. |
 | **END** (intervals) | Prefer `INFO/END`; fall back to `POS + abs(SVLEN)`. | Neither → warn+skip. `END ≤ POS` → warn+skip. |
 | **SVLEN** (intervals) | Prefer `abs(INFO/SVLEN)`; fall back to `END − POS`. | If both provided and disagree >10%, warn and use `END − POS`. |
 | **BND mate** | Parse `CHR2`/`POS2` from ALT bracket notation; **ALT is authoritative** — overwrites any stale INFO. `endPos = POS + 1` is used only for `hts_idx_push`; neither END nor SVLEN is written to the slim record. | Malformed ALT → warn+skip. |
+| **INS length** | Fallback chain: `INFO/INSLEN` → `INFO/SVLEN` → `len(ALT) − len(REF)` (plain-sequence ALTs only, not symbolic/BND) → `len(LEFT_SVINSSEQ) + len(RIGHT_SVINSSEQ)`. Written as `INFO/SVLEN` in the slim record. `endPos = POS + 1` (point event). INS records land in `(svINS, 0)`. | No resolvable length → `skUnresolvableInsLen`, warn+skip. |
 | **ID** | Synthesize `CHROM_POS_SVTYPE_LINENUMBER` when absent or `.`. | Always succeeds. |
 | **SRC_INDEX** | Sequential int32 counter, incremented per record read (before skip checks). Written to slim BCF INFO as `Number=1 Integer`. | Always succeeds. |
 | **Size bin** | `binIndexFor(svlen)`: log2 scale from 1024 bp. BND always lands in bin 0. | Clamped to 0 for non-positive SVLEN. |
 | **Chrom filter** | When `--chrs` is supplied, records on non-listed chromosomes are rejected before any other field resolution. BND records whose mate `CHR2` is on an excluded chromosome are also rejected (after BND resolution). Counted as `skChromFiltered`. | Silent skip; reflected in per-callset summary. |
 
-Slim BCF content: intervals carry only `END` + `SRC_INDEX`; BND carry only `CHR2` + `POS2` + `SRC_INDEX`. REF is set to `N`, ALT to `.`, QUAL to BCF missing — all unused by matchcore.
+Slim BCF content: intervals carry only `END` + `SRC_INDEX`; BND carry only `CHR2` + `POS2` + `SRC_INDEX`; INS carry only `SVLEN` + `SRC_INDEX`. REF is set to `N`, ALT to `.`, QUAL to BCF missing — all unused by matchcore (except in collapse/merge where BND and INS source REF/ALT are preserved verbatim).
 
 Warnings go to stderr with prefix `[matcha preproc WARN]`, throttled at 5 per reason per callset (override: `MATCHA_WARN_CAP`). After preprocessing completes, a single warning is emitted listing any `--chrs` entries that were not found in any input header (indicating a possible typo).
 
@@ -78,6 +79,10 @@ Uses a **TiledBuffer** per B bin — a lazy, eviction-based cache keyed by tile 
 ### BND path — `matchcore.streamBndJobPairs`
 
 Maintains a `Deque[BndCacheRec]` of B records in the window `(posA − slop, posA + slop)`. On each A advance: evict left-side records, then CSI-query only the delta `[cacheEnd, posA + slop)` on the right. Each B record is fetched and decoded at most once across all A records whose windows include it.
+
+### INS path — `matchcore.streamInsJobPairs`
+
+Identical sliding-cache structure as BND (both use the shared `advanceSlidingCache[T]` generic helper). Cache records carry `pos` + `svlen`. For each A/B candidate pair: `pos_sim = (slop − |dPOS|) / slop`; `len_sim = min(svlenA, svlenB) / max(svlenA, svlenB)`; `sim = sqrt(pos_sim · len_sim)`. Pairs with `sim < cfg.insMinSim` are rejected. Self-mode dedup is the same `srcIndexA < srcIndexB` filter as BND.
 
 ### Thread pool
 
@@ -144,11 +149,10 @@ callsets (typically `matcha collapse` outputs). Steps (see
    plus conditional `CALLERS` / `N_CALLERS` (only when any input header
    declares `INFO/CALLERS`). No `FORMAT/SID` (slim-internal only) and no
    `N_MERGED` (collapse-only).
-6. **`integratedMerge`** with `stampSID=true` and `preserveBndAlt=true`:
+6. **`integratedMerge`** with `stampSID=true`, `preserveBndAlt=true`, `preserveInsAlt=true`:
    - Each slim record carries `FORMAT/SID = sampleIdByCaller[ci]`.
-   - BND records keep their source ALT verbatim (bracket form encodes
-     strand orientation not derivable from CHR2/POS2). Non-BND records
-     continue to blank REF/ALT to `N,.`.
+   - BND records keep their source ALT verbatim (bracket form encodes strand orientation not derivable from CHR2/POS2).
+   - INS records keep their source REF/ALT verbatim when present (preserves sequence-resolved insertions). Non-BND/INS records blank REF/ALT to `N,.`.
 7. **Self-match → cluster** — identical pipeline to collapse: pair
    matchcore (selfMode + emitSingletons), `buildSimilarityMap`,
    `clusterAll`, `passQualMap` from MatchPair fields (no second
@@ -190,8 +194,8 @@ callsets (typically `matcha collapse` outputs). Steps (see
 | [src/matcha/utils.nim](src/matcha/utils.nim) | Shared types: `SvType`, `Metric`, `MatchPair` (32-byte POD), `MatchConfig`, `OutputHeader`, `NO_MATCH`; `quantizeQual` (Q14.2 QUAL encoder) |
 | [src/matcha/intervals.nim](src/matcha/intervals.nim) | `reciprocalOverlap`, `jaccard` |
 | [src/matcha/bins.nim](src/matcha/bins.nim) | `binIndexFor`, `adjacentBins`, `TiledBuffer`, `BufferedRec` |
-| [src/matcha/preproc.nim](src/matcha/preproc.nim) | Normalize → per-(svtype,bin) BCF + work queue; BND ALT parsing; `extraKeepInfo` (anno); `SRC_INDEX` assignment; `buildWorkQueue` → `(jobs, fileList)`; `parseChrsArg` + `warnMissingChrs` for `--chrs` filter; `skChromFiltered` skip reason |
-| [src/matcha/matchcore.nim](src/matcha/matchcore.nim) | `streamJobPairs` (interval, tiled-buffer) and `streamBndJobPairs` (BND, deque+delta), both returning `seq[MatchPair]`. Per A record: decodes FILTER, QUAL, and CALLER_IDX and stamps `passA`/`qualQ`/`callerIdxA` onto every emitted pair. Slim-BCF INFO decode helpers (`readSrcIndex`, `readPos2`, `readChr2`, `extractEnd`). |
+| [src/matcha/preproc.nim](src/matcha/preproc.nim) | Normalize → per-(svtype,bin) BCF + work queue; BND ALT parsing; INS length resolution (`readInsLen`); `extraKeepInfo` (anno); `SRC_INDEX` assignment; `buildWorkQueue` → `(jobs, fileList)`; `parseChrsArg` + `warnMissingChrs` for `--chrs` filter; `skChromFiltered` / `skUnresolvableInsLen` skip reasons |
+| [src/matcha/matchcore.nim](src/matcha/matchcore.nim) | `streamJobPairs` (interval, tiled-buffer), `streamBndJobPairs` (BND, deque+delta), and `streamInsJobPairs` (INS, deque+delta with combined pos·size sim), all returning `seq[MatchPair]`. Shared `advanceSlidingCache[T]` generic helper used by BND and INS streamers. Per A record: decodes FILTER, QUAL, and CALLER_IDX and stamps `passA`/`qualQ`/`callerIdxA` onto every emitted pair. Slim-BCF INFO decode helpers (`readSrcIndex`, `readPos2`, `readChr2`, `extractEnd`, `readSvlen`). |
 | [src/matcha/match.nim](src/matcha/match.nim) | match-mode: `runMatchPairJobsWithPool`, main-thread chr:pos CSI resolution via `fileList`, TSV output |
 | [src/matcha/anno.nim](src/matcha/anno.nim) | anno-mode: expression parser, `applyAggFunc`, per-match chr:pos CSI B retrieval, SRC_INDEX counter phase-3 join, output VCF assembly |
 | [src/matcha/mergecore.nim](src/matcha/mergecore.nim) | Header merge (`resolveHeaders`), `buildSimilarityMap`, union-find components, agglomerative clustering, `selectRepresentative`; `selfMatchAndCluster` shared pipeline (self-match → `passQualMap` from MatchPairs → clustering → representative selection) |

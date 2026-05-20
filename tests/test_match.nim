@@ -394,3 +394,76 @@ timed("B09", "mixed DEL+BND run produces both kinds of rows"):
       if row[6] == "BND": sawBnd = true
   doAssert sawDel and sawBnd,
     "expected both DEL and BND rows; saw DEL=" & $sawDel & " BND=" & $sawBnd
+
+# I01 — INS exact-match pair (sequence ALT, SVLEN derived from |ALT|-|REF|).
+# INS_A_30_seq vs INS_B_30_seq: identical pos, identical svlen=100 → sim=1.0.
+timed("I01", "INS exact match (sequence ALT): sim=1.0"):
+  let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+  doAssert code == 0, "exit " & $code & ": " & outp
+  var found = false
+  var sim = 0.0
+  for row in parseTsv(outp):
+    if row.len >= 8 and row[2] == "INS_A_30_seq" and row[5] == "INS_B_30_seq":
+      found = true
+      sim = parseFloat(row[7])
+  doAssert found, "INS_A_30_seq/INS_B_30_seq pair missing from output"
+  doAssert abs(sim - 1.0) < 1e-5, "INS exact match sim != 1.0: " & $sim
+
+# I02 — INS INSLEN-only resolution; combined sim = sqrt(pos_sim * len_sim).
+# INS_A_31_inslen (pos=110000, svlen=33 via INSLEN) vs INS_B_31_close
+# (pos=110010, svlen=33). pos_sim=(50-10)/50=0.8, len_sim=1.0 → sim=sqrt(0.8)≈0.8944.
+timed("I02", "INS INSLEN resolution + combined sim formula"):
+  let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+  doAssert code == 0, "exit " & $code & ": " & outp
+  var found = false
+  var sim = 0.0
+  for row in parseTsv(outp):
+    if row.len >= 8 and row[2] == "INS_A_31_inslen" and row[5] == "INS_B_31_close":
+      found = true
+      sim = parseFloat(row[7])
+  doAssert found, "INS_A_31_inslen pair missing"
+  let expected = 0.8944  # sqrt(0.8)
+  doAssert abs(sim - expected) < 1e-3,
+    "INS INSLEN sim != " & $expected & ": " & $sim
+
+# I03 — INS LEFT_SVINSSEQ+RIGHT_SVINSSEQ resolution.
+# INS_A_32_svinsseq (pos=120000, svlen=40+50=90) vs INS_B_32_close
+# (pos=120005, svlen=85). pos_sim=(50-5)/50=0.9, len_sim=85/90 → sim=sqrt(0.85)≈0.922.
+timed("I03", "INS Manta SVINSSEQ resolution"):
+  let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+  doAssert code == 0, "exit " & $code & ": " & outp
+  var found = false
+  for row in parseTsv(outp):
+    if row.len >= 8 and row[2] == "INS_A_32_svinsseq" and row[5] == "INS_B_32_close":
+      found = true
+  doAssert found, "INS_A_32_svinsseq pair missing"
+
+# I04 — INS with no resolvable length is skipped (skUnresolvableInsLen).
+timed("I04", "INS without length is warn-skipped and absent from output"):
+  let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+  doAssert code == 0
+  for row in parseTsv(outp):
+    if row.len >= 8:
+      doAssert row[2] != "INS_A_33_no_len" and row[5] != "INS_A_33_no_len",
+        "INS_A_33_no_len (unresolvable length) should not appear"
+
+# I05 — --ins-slop 20 rejects the INS_A_31/B_31 pair (offset=10 OK, but
+# pos_sim=(20-10)/20=0.5; len_sim=1 → sim=sqrt(0.5)≈0.707 < default 0.75).
+timed("I05", "--ins-slop 20: tightens window, drops borderline pair"):
+  let (outp, code) = run(
+    "match --min-overlap 0.5 --ins-slop 20 " & FixtureA & " " & FixtureB)
+  doAssert code == 0
+  for row in parseTsv(outp):
+    if row.len >= 8:
+      doAssert row[2] != "INS_A_31_inslen" or row[5] != "INS_B_31_close",
+        "INS_A_31 pair should drop below threshold at --ins-slop 20"
+
+# I06 — INS at posdelta=60 (INS_B_35_outside) is beyond --ins-slop 50 from
+# INS_A_30_seq; pair must not appear.
+timed("I06", "INS pair outside slop window not emitted"):
+  let (outp, code) = run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+  doAssert code == 0
+  for row in parseTsv(outp):
+    if row.len >= 8:
+      doAssert not (row[2] == "INS_A_30_seq" and row[5] == "INS_B_35_outside"),
+        "INS pair beyond slop window should not be emitted"

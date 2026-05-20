@@ -91,11 +91,12 @@ timed("C02", "2-caller collapse: exits 0, BCF readable"):
   doAssert "SVTYPE" in view, "BCF appears empty or malformed"
   discard tryRemoveFile(outBcf)
 
-# C03 — correct record count: 6 output records for 2-caller fixture (5 interval + 1 BND cluster)
-timed("C03", "correct output record count (6 for the 2-caller fixture)"):
+# C03 — correct record count: 7 output records for 2-caller fixture
+# (5 interval + 1 BND cluster + 1 INS cluster).
+timed("C03", "correct output record count (7 for the 2-caller fixture)"):
   let (recs, code) = collapseRun()
   doAssert code == 0, "collapse failed"
-  doAssert recs.len == 6, "expected 6 records, got " & $recs.len &
+  doAssert recs.len == 7, "expected 7 records, got " & $recs.len &
     ": " & recs.mapIt(it.id).join(", ")
 
 # C04 — PASS filter beats LowQual: DEL_M_02 chosen over DEL_D_02
@@ -189,7 +190,7 @@ timed("C11", "--min-overlap 0.5 produces the same cluster topology"):
   doAssert code == 0, "collapse --min-overlap failed"
   let recs = parseCollapsed(viewBcf(outBcf))
   discard tryRemoveFile(outBcf)
-  doAssert recs.len == 6, "expected 6 records with --min-overlap 0.5, got " & $recs.len
+  doAssert recs.len == 7, "expected 7 records with --min-overlap 0.5, got " & $recs.len
 
 # C12 — --info filter: requesting only SVTYPE in output drops END/SVLEN
 timed("C12", "--info SVTYPE filter keeps SVTYPE, drops END and SVLEN"):
@@ -317,3 +318,19 @@ timed("CT05", "3-caller run: streaming across 3 readers produces sensible counts
   for r in recs:
     if "Caller1b" in r.sourceList: sawCaller1b = true
   doAssert sawCaller1b, "Caller1b (third caller) absent from any cluster SOURCELIST"
+
+# CI01 — INS cluster: INS_D_01 and INS_M_01 share pos and sequence ALT →
+# single output record with preserved sequence ALT and N_MERGED=2.
+timed("CI01", "INS cluster: sequence ALT preserved, N_MERGED=2"):
+  let (recs, code) = collapseRun()
+  doAssert code == 0
+  var found = false
+  for r in recs:
+    if r.pos == 40000:
+      found = true
+      doAssert r.alt.startsWith("N") and r.alt.len >= 50,
+        "INS rep should preserve sequence ALT (got: '" & r.alt & "')"
+      doAssert "<INS>" notin r.alt, "INS rep should not have collapsed to <INS>"
+      doAssert r.nMerged == 2,
+        "INS cluster should have N_MERGED=2, got " & $r.nMerged
+  doAssert found, "INS cluster at chr1:40000 missing from output"

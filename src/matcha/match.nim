@@ -91,8 +91,9 @@ proc runJobsWithPool[R](jobs: seq[MatchJob]; cfg: MatchConfig;
 
 proc dispatchPairJob*(job: MatchJob, cfg: MatchConfig): seq[MatchPair] =
   ## Stream MatchPairs for one job. Used by match, collapse, and anno.
-  if job.svtype == svBND: streamBndJobPairs(job, cfg)
-  else:                   streamJobPairs(job, cfg)
+  if   job.svtype == svBND: streamBndJobPairs(job, cfg)
+  elif job.svtype == svINS: streamInsJobPairs(job, cfg)
+  else:                     streamJobPairs(job, cfg)
 
 proc runMatchPairJobsWithPool*(jobs: seq[MatchJob]; cfg: MatchConfig): seq[seq[MatchPair]] =
   runJobsWithPool[MatchPair](jobs, cfg, dispatchPairJob, "pairs")

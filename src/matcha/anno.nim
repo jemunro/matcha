@@ -49,7 +49,9 @@ type
   AnnoConfig* = object
     metric*:        Metric       ## Active interval metric (mOverlap | mJaccard).
     threshold*:     float64      ## Minimum score for the active metric.
-    bndSlop*:       int          ## --bnd-slop (default 100)
+    bndSlop*:       int          ## --bnd-slop (default 50)
+    insSlop*:       int          ## --ins-slop (default 50)
+    insMinSim*:     float64      ## --min-ins-sim (default 0.75)
     overwrite*:     bool
     nThreads*:      int
     tmpDir*:        string
@@ -264,25 +266,35 @@ proc resolveAnnoPairs(job: MatchJob; pairs: seq[MatchPair];
       similarity: float64(p.sim), payload: f.payload,
     ))
 
+proc annoMatchCfg(cfg: AnnoConfig): MatchConfig {.inline.} =
+  MatchConfig(metric: cfg.metric, threshold: cfg.threshold,
+              bndSlop: cfg.bndSlop, insSlop: cfg.insSlop,
+              insMinSim: cfg.insMinSim)
+
 proc runAnnoJob*(job: MatchJob; cfg: AnnoConfig;
                  dbTypes: Table[string, string]): seq[AnnoMatch] =
   ## Anno-mode adapter: run the minimal matcher, then resolve DB INFO
   ## for matched B records via a single sequential scan of the slim B BCFs.
-  let pairs = streamJobPairs(job, MatchConfig(
-    metric: cfg.metric, threshold: cfg.threshold, bndSlop: cfg.bndSlop))
+  let pairs = streamJobPairs(job, annoMatchCfg(cfg))
   resolveAnnoPairs(job, pairs, cfg.dbFields, dbTypes)
 
 proc runAnnoBndJob*(job: MatchJob; cfg: AnnoConfig;
                     dbTypes: Table[string, string]): seq[AnnoMatch] =
   ## Anno-mode BND adapter: slop-based proximity, same resolution model.
-  let pairs = streamBndJobPairs(job, MatchConfig(
-    metric: cfg.metric, threshold: cfg.threshold, bndSlop: cfg.bndSlop))
+  let pairs = streamBndJobPairs(job, annoMatchCfg(cfg))
+  resolveAnnoPairs(job, pairs, cfg.dbFields, dbTypes)
+
+proc runAnnoInsJob*(job: MatchJob; cfg: AnnoConfig;
+                    dbTypes: Table[string, string]): seq[AnnoMatch] =
+  ## Anno-mode INS adapter: combined position + size similarity.
+  let pairs = streamInsJobPairs(job, annoMatchCfg(cfg))
   resolveAnnoPairs(job, pairs, cfg.dbFields, dbTypes)
 
 proc dispatchAnnoJob(job: MatchJob; cfg: AnnoConfig;
                      dbTypes: Table[string, string]): seq[AnnoMatch] {.inline.} =
-  if job.svtype == svBND: runAnnoBndJob(job, cfg, dbTypes)
-  else:                   runAnnoJob(job, cfg, dbTypes)
+  if   job.svtype == svBND: runAnnoBndJob(job, cfg, dbTypes)
+  elif job.svtype == svINS: runAnnoInsJob(job, cfg, dbTypes)
+  else:                     runAnnoJob(job, cfg, dbTypes)
 
 # ---------------------------------------------------------------------------
 # Aggregation kernel
@@ -490,6 +502,7 @@ proc runAnno*(cfg: var AnnoConfig) =
   # buildWorkQueue takes a MatchConfig; build a shim with matching thresholds.
   var matchCfg = MatchConfig(
     metric: cfg.metric, threshold: cfg.threshold,
+    bndSlop: cfg.bndSlop, insSlop: cfg.insSlop, insMinSim: cfg.insMinSim,
     nThreads: cfg.nThreads, tmpDir: cfg.tmpDir, selfMode: false,
   )
   let (jobs, _) = buildWorkQueue(filesA, filesB, matchCfg)
