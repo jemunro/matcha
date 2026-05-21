@@ -38,6 +38,7 @@ type
     tmpDir*:       string
     callers*:      seq[CallerInput]
     keptChrs*:     seq[string]    ## --chrs filter; empty = no filter.
+    missingToRef*: bool           ## --missing-to-ref: absent samples → 0/0.
 
 # ---------------------------------------------------------------------------
 # Sample-ID validation
@@ -586,8 +587,12 @@ proc writeMergeOutput(cfg: MergeConfig;
       of BCF_HT_INT.int:
         if maxK == 0: maxK = 1
         # GT uses bcf_gt_missing (= 0) for missing alleles, not INT32_MIN.
+        # With --missing-to-ref, absent samples get encoded REF (= 2,
+        # i.e. (0+1)<<1 | 0 = REF allele unphased) instead.
         let missingVal: int32 =
-          if fieldName == "GT": 0'i32 else: bcfInt32Missing
+          if fieldName == "GT":
+            if cfg.missingToRef: 2'i32 else: 0'i32
+          else: bcfInt32Missing
         var buf = newSeq[int32](nSamples * maxK)
         for s in 0 ..< nSamples:
           let mi = slotByMember[s]

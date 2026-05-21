@@ -547,6 +547,7 @@ proc mergeUsage(code: int = 1) =
   f.writeLine "  -o, --output PATH             output file (.vcf | .vcf.gz | .bcf)"
   f.writeLine "                                default: uncompressed VCF to stdout"
   f.writeLine "  --chrs CHR[,CHR...]           restrict to listed chromosomes (filters records + headers)"
+  f.writeLine "  --missing-to-ref              treat absent samples as 0/0 (count toward AN; like bcftools merge)"
   f.writeLine "  --threads INT                 worker threads (default: 1)"
   f.writeLine "  --tmp-dir PATH                temp directory (default: system temp)"
   f.writeLine "  -v, --verbose                 verbose logging to stderr"
@@ -558,6 +559,7 @@ proc mergeUsage(code: int = 1) =
   f.writeLine "If no name prefix is given, the basename without extension is used."
   f.writeLine ""
   f.writeLine "Output INFO fields added: AC, AN, AF (always); CALLERS, N_CALLERS (when inputs had them)."
+  f.writeLine "AC/AN reflect --missing-to-ref: absent samples are counted as 0/0 when the flag is set."
   quit(code)
 
 proc runMergeCli(rawArgs: seq[string]) =
@@ -625,6 +627,8 @@ proc runMergeCli(rawArgs: seq[string]) =
         cfg.tmpDir = nextVal(p, "tmp-dir")
       of "chrs":
         cfg.keptChrs = parseChrsArg(nextVal(p, "chrs"))
+      of "missing-to-ref":
+        cfg.missingToRef = true
       of "v", "verbose": setVerbose(true)
       of "h", "help":    mergeUsage(0)
       else:

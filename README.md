@@ -214,6 +214,7 @@ matcha merge [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
                                 default: only auto-extracted + cohort + CALLERS
   -o, --output PATH             output (.vcf | .vcf.gz | .bcf); default stdout VCF
   --chrs CHR[,CHR...]           restrict to listed chromosomes (filters records + header contigs)
+  --missing-to-ref              treat absent samples as 0/0 (count toward AN; like bcftools merge)
   --threads INT                 default 1
   --tmp-dir PATH
   -v, --verbose
@@ -236,7 +237,7 @@ matcha merge [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
 - When any input record carries `INFO/CALLERS`, the output also emits:
   - `CALLERS` — union across cluster members (representative caller first).
   - `N_CALLERS` — distinct count.
-- Missing samples are written as `GT=./.` with missing values for other carried FORMAT fields.
+- Missing samples are written as `GT=./.` with missing values for other carried FORMAT fields. With `--missing-to-ref`, absent samples are instead written as `GT=0/0` and counted toward `AN` (mirroring `bcftools merge --missing-to-ref`); the AF denominator changes accordingly. The flag affects absent samples only — present samples with in-call missing alleles (e.g. `./1`) are untouched.
 - For BND records, the original bracket-form ALT (`N[chr:pos[` etc.) is preserved.
 - For INS records, the original sequence-resolved ALT (e.g. from Delly or sequence-resolved Manta calls) is preserved on the representative record when present; symbolic `<INS>` is used otherwise.
 

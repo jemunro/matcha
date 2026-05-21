@@ -169,7 +169,12 @@ callsets (typically `matcha collapse` outputs). Steps (see
        `N × maxK` buffer; copy member's data into its sample column,
        fill missing samples with appropriate sentinels (`bcf_gt_missing=0`
        for GT, `bcf_int32_missing` for other ints, NaN-tagged missing for
-       floats, `.` for strings).
+       floats, `.` for strings). With `--missing-to-ref` (`MergeConfig.missingToRef`),
+       the GT sentinel for absent samples becomes BCF-encoded REF unphased
+       (`2` = `(0+1)<<1 | 0`) instead of `bcf_gt_missing`, so the
+       downstream AC/AN accumulator naturally counts them as `0/0`. Only
+       absent samples (`mi < 0`) are affected; in-call missing alleles
+       from present samples still write `0` and are skipped.
      - Cohort INFO: AC/AN/AF computed from the assembled GT array
        (BCF-encoded; `bcf_gt_missing` skipped, otherwise allele =
        `(v shr 1) - 1`).

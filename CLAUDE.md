@@ -28,6 +28,6 @@ python3 tests/generate_fixtures.py   # regenerate fixtures (needs bcftools + bgz
 | `anno.nim` | anno-mode: expression parser, `applyAggFunc`, per-match chr:pos CSI B retrieval, SRC_INDEX counter join for phase 3, output VCF assembly |
 | `mergecore.nim` | header merge (`resolveHeaders`), `buildSimilarityMap`, union-find, agglomerative clustering, `selectRepresentative` |
 | `collapse.nim` | collapse-mode driver: `integratedMerge` (fused preproc+merge via `synced_bcf_reader`), self-match with singleton emission, clustering, representative output |
-| `merge.nim` | merge-mode driver: cohort pVCF across N single-sample inputs. Builds slimHdr (1 dummy `SAMPLE` + `FORMAT/SID`) and outputHdr (N samples + AC/AN/AF); per-sample FORMAT routing via SID. |
+| `merge.nim` | merge-mode driver: cohort pVCF across N single-sample inputs. Builds slimHdr (1 dummy `SAMPLE` + `FORMAT/SID`) and outputHdr (N samples + AC/AN/AF); per-sample FORMAT routing via SID. `--missing-to-ref` writes absent samples as `0/0` (encoded GT = `2`) so AC/AN counts them. |
 | `log.nim` | Verbose/warn/error logging (stderr, timestamped); `warnCap` throttle |
 | `synced_bcf_reader.nim` | FFI bindings for htslib `bcf_srs_t`; `newVariantView`/`setRecView`; `csrc/synced_bcf_wrap.c` macro wrappers |
