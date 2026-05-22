@@ -419,14 +419,17 @@ proc normalizeRecord*(hdr: ptr bcf_hdr_t; rec: ptr bcf1_t; lineno: int;
 
 proc emitSummary*(ws: WarnState) =
   let nSkipped = ws.nRead - ws.nKept
-  logWarn(ws.callset & " summary: read " & $ws.nRead &
-          " records, kept " & $ws.nKept & ", skipped " & $nSkipped)
   var parts: seq[string]
   for r in SkipReason:
-    parts.add(reasonStr(r) & "=" & $ws.skipped[r])
-  logWarn("  by reason: " & parts.join(", "))
+    if ws.skipped[r] > 0:
+      parts.add(reasonStr(r) & "=" & $ws.skipped[r])
+  var msg = ws.callset & " summary: read " & $ws.nRead &
+            " records, kept " & $ws.nKept & ", skipped " & $nSkipped
+  if parts.len > 0:
+    msg &= "; by reason: " & parts.join(", ")
+  logInfo(msg)
   if ws.syntheticId > 0:
-    logWarn("  ids synthesized: " & $ws.syntheticId)
+    logInfo("  ids synthesized: " & $ws.syntheticId)
 
 proc tempBcfPath(tmpDir, prefix, svtype: string, binIdx: int): string =
   tmpDir / "matcha_" & $getCurrentProcessId() & "_" & prefix & "_" &

@@ -8,10 +8,10 @@
 ##   buildSimilarityMap    — MatchPair seq → (canonicalPair → similarity) table
 ##   buildComponents       — union-find over pairs → offset→componentId table
 ##   agglomerateComponent  — Lance-Williams agglomerative clustering
-##   clusterAll            — full pipeline: components → agglomerate each
+##   clusterAll            — agglomerate every connected component
 ##   selectRepresentative  — priority-cascade representative selection
 
-import std/[os, sequtils, sets, strutils, tables]
+import std/[heapqueue, os, sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
 import utils, preproc, match, log, synced_bcf_reader
@@ -383,13 +383,16 @@ type
     members: seq[int32]
     size:    int
 
-proc agglomerateComponent*(offsets: seq[int32];
-                            simMap: Table[(int32, int32), float64];
-                            linkage: LinkageMethod;
-                            threshold: float64): seq[seq[int32]] =
-  ## Agglomerative clustering of one connected component.
-  ## Returns a seq of clusters (each cluster = seq[int32] of member SRC_INDEX values).
-  ## Singletons that never exceed threshold are returned as single-element clusters.
+const AggDenseThreshold* = 256
+  ## Components at or below this size use the dense O(N³) reference impl.
+  ## Above this, switch to the heap-based sparse impl which is O((N+E) log N).
+
+proc agglomerateDense*(offsets: seq[int32];
+                       simMap: Table[(int32, int32), float64];
+                       linkage: LinkageMethod;
+                       threshold: float64): seq[seq[int32]] =
+  ## Reference O(N³) agglomerative clustering. Used for small components and
+  ## as the trusted baseline against which agglomerateSparse is regression-tested.
   if offsets.len == 0: return
   if offsets.len == 1:
     return @[@[offsets[0]]]
@@ -461,6 +464,117 @@ proc agglomerateComponent*(offsets: seq[int32];
     if active[i]:
       result.add(members[i])
 
+# Heap entry for sparse agglomeration. Tuple lex-order puts smallest negSim
+# (= largest similarity) first, then smallest (i, j) — matching the dense
+# scan's row-major tie-break. (vi, vj) ride along for lazy invalidation.
+type SparseHeapEntry = tuple[negSim: float64; i, j, vi, vj: int32]
+
+proc agglomerateSparse*(offsets: seq[int32];
+                        simMap: Table[(int32, int32), float64];
+                        linkage: LinkageMethod;
+                        threshold: float64): seq[seq[int32]] =
+  ## Heap-based sparse agglomeration with lazy invalidation. O((N + E) log N)
+  ## for E = simMap edges within the component. Produces output identical to
+  ## agglomerateDense for the same inputs (deterministic tie-break preserved).
+  if offsets.len == 0: return
+  if offsets.len == 1:
+    return @[@[offsets[0]]]
+
+  let n = offsets.len
+  var offIdx: Table[int32, int32]
+  for i, off in offsets.pairs:
+    offIdx[off] = int32(i)
+
+  # Sparse adjacency: neighbors[i][j] = current similarity between active
+  # clusters i and j (stored symmetrically for cheap O(1) lookup during merges).
+  var neighbors = newSeq[Table[int32, float64]](n)
+  var heap: HeapQueue[SparseHeapEntry]
+  for key, sim in simMap.pairs:
+    let ia = offIdx.getOrDefault(key[0], -1'i32)
+    let ib = offIdx.getOrDefault(key[1], -1'i32)
+    if ia < 0 or ib < 0: continue  # endpoint not in this component
+    neighbors[ia][ib] = sim
+    neighbors[ib][ia] = sim
+    if sim >= threshold:
+      let lo = if ia < ib: ia else: ib
+      let hi = if ia < ib: ib else: ia
+      heap.push((-sim, lo, hi, 0'i32, 0'i32))
+
+  var members = newSeq[seq[int32]](n)
+  var sizes = newSeq[int](n)
+  var active = newSeq[bool](n)
+  var version = newSeq[int32](n)
+  for i in 0 ..< n:
+    members[i] = @[offsets[i]]
+    sizes[i] = 1
+    active[i] = true
+
+  while heap.len > 0:
+    let top = heap.pop()
+    let i = top.i
+    let j = top.j
+    if not active[i] or not active[j]: continue
+    if version[i] != top.vi or version[j] != top.vj: continue
+    let sim = -top.negSim
+    if sim < threshold: break  # no more merges above threshold
+
+    # Merge cluster j into cluster i (keep i, deactivate j). Lance-Williams
+    # update for every neighbor of either i or j; missing edges treated as 0.0
+    # (matching the dense path's matrix-of-zeros init).
+    let sA = float64(sizes[i])
+    let sB = float64(sizes[j])
+    var nbrs: HashSet[int32]
+    for x in neighbors[i].keys: nbrs.incl(x)
+    for x in neighbors[j].keys: nbrs.incl(x)
+    nbrs.excl(i); nbrs.excl(j)
+
+    # Invalidate any stale heap entries that referenced cluster i (its
+    # similarity to every other cluster is about to change). version[j] does
+    # not need bumping — j becomes inactive and is filtered on pop.
+    inc version[i]
+
+    for x in nbrs:
+      let dAX = neighbors[i].getOrDefault(x, 0.0)
+      let dBX = neighbors[j].getOrDefault(x, 0.0)
+      let merged =
+        case linkage
+        of lmSingle:   max(dAX, dBX)
+        of lmComplete: min(dAX, dBX)
+        of lmAverage:  (sA * dAX + sB * dBX) / (sA + sB)
+      if merged > 0:
+        neighbors[i][x] = merged
+        neighbors[x][i] = merged
+      else:
+        neighbors[i].del(x)
+        neighbors[x].del(i)
+      neighbors[x].del(j)
+      if merged >= threshold:
+        let lo = if i < x: i else: x
+        let hi = if i < x: x else: i
+        heap.push((-merged, lo, hi, version[lo], version[hi]))
+
+    for off in members[j]:
+      members[i].add(off)
+    sizes[i] += sizes[j]
+    active[j] = false
+    neighbors[j].clear()  # free per-cluster adjacency once inactive
+
+  for i in 0 ..< n:
+    if active[i]:
+      result.add(members[i])
+
+proc agglomerateComponent*(offsets: seq[int32];
+                            simMap: Table[(int32, int32), float64];
+                            linkage: LinkageMethod;
+                            threshold: float64): seq[seq[int32]] =
+  ## Agglomerative clustering of one connected component.
+  ## Dispatches to a dense O(N³) reference impl for small components and a
+  ## heap-based sparse impl for large ones. Output is identical either way.
+  if offsets.len <= AggDenseThreshold:
+    agglomerateDense(offsets, simMap, linkage, threshold)
+  else:
+    agglomerateSparse(offsets, simMap, linkage, threshold)
+
 # ---------------------------------------------------------------------------
 # Representative selection
 # ---------------------------------------------------------------------------
@@ -530,16 +644,17 @@ proc selectRepresentative*(cluster: seq[int32];
 # Cluster all records
 # ---------------------------------------------------------------------------
 
-proc clusterAll*(allOffsets: seq[int32];
+const LargeComponentWarn* = 500
+  ## Components at or above this size trigger a logWarn flagging the chrom,
+  ## svtype, and dominant caller. Surface for caller pathology like delly's
+  ## known chr2 LowQual SV flood on some samples.
+
+proc clusterAll*(byComp: Table[int, seq[int32]];
                  simMap: Table[(int32, int32), float64];
                  linkage: LinkageMethod;
                  threshold: float64): seq[seq[int32]] =
-  ## Build connected components, then agglomerate each independently.
+  ## Agglomerate each connected component independently.
   ## Missing pairs within a component are treated as similarity 0.
-  let compId = buildComponents(simMap, allOffsets)
-  var byComp: Table[int, seq[int32]]
-  for off in allOffsets:
-    byComp.mgetOrPut(compId.getOrDefault(off, -1), @[]).add(off)
   for offsets in byComp.values:
     for cl in agglomerateComponent(offsets, simMap, linkage, threshold):
       result.add(cl)
@@ -589,7 +704,44 @@ proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
       result.locByIdx[p.srcIndexB] = (p.chromIdx, p.posB, p.fileIdxB)
   logVerbose(modeTag & ": " & $allOffsets.len & " unique record(s)")
 
-  let clusters = clusterAll(allOffsets, simMap, linkage, threshold)
+  # Build connected components and agglomerate each. For components at or
+  # above LargeComponentWarn, emit a logWarn (lazily building the per-srcIndex
+  # caller metadata the first time a large component is encountered).
+  let compId = buildComponents(simMap, allOffsets)
+  var byComp: Table[int, seq[int32]]
+  for off in allOffsets:
+    byComp.mgetOrPut(compId.getOrDefault(off, -1), @[]).add(off)
+
+  type Meta = tuple[chromIdx: int16; svtype: int8; callerIdx: int16]
+  var meta: Table[int32, Meta]
+  var metaBuilt = false
+  var clusters: seq[seq[int32]]
+  for offsets in byComp.values:
+    if offsets.len >= LargeComponentWarn:
+      if not metaBuilt:
+        for p in allPairs:
+          if p.srcIndexA notin meta:
+            meta[p.srcIndexA] = (p.chromIdx, p.svtype, p.callerIdxA)
+        metaBuilt = true
+      let repMeta = meta.getOrDefault(offsets[0])
+      var callerCounts: Table[int16, int]
+      for srcIdx in offsets:
+        let ci = meta.getOrDefault(srcIdx).callerIdx
+        callerCounts[ci] = callerCounts.getOrDefault(ci, 0) + 1
+      var callerK: int16 = 0
+      var callerBest = -1
+      for k, c in callerCounts.pairs:
+        if c > callerBest: callerBest = c; callerK = k
+      let chromName = if repMeta.chromIdx.int < mergedPreproc.chromOrder.len:
+                        mergedPreproc.chromOrder[repMeta.chromIdx.int]
+                      else: "?"
+      logWarn(modeTag & ": large cluster component: " & chromName & "/" &
+              $SvType(repMeta.svtype) & " N=" & $offsets.len &
+              " dominant=caller" & $callerK & ":" &
+              formatFloat(100.0 * float(callerBest) / float(offsets.len),
+                          ffDecimal, 2) & "% — possible caller artifact")
+    for cl in agglomerateComponent(offsets, simMap, linkage, threshold):
+      clusters.add(cl)
 
   # Build passQualMap from MatchPair metadata stamped by matchcore.
   # Every offset appears as srcIndexA in at least one pair (emitSingletons=true
@@ -606,7 +758,7 @@ proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
     for idx in cl:
       if idx != rep: ordered.add(idx)
     result.finalClusters.add(ordered)
-  logInfo(modeTag & ": " & $result.finalClusters.len & " cluster(s)")
+  logInfo(modeTag & ": " & $allOffsets.len & " record(s) -> " & $result.finalClusters.len & " cluster(s)")
   result.fileList = fileList
 
 # ---------------------------------------------------------------------------
@@ -1063,7 +1215,7 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
         discard bcf_write(vcfHtsFile(writers[key]), writerHdrs[key], rec)
         let woff = uint64(bgzf_tell(bgzfHandle(writers[key])))
         discard hts_idx_push(indexes[key], rec.rid, int64(rec.pos),
-                             nr.endPos, woff, 1.cint)
+                             int64(rec.pos) + int64(rec.rlen), woff, 1.cint)
 
         bcf_destroy(rec)
 

@@ -26,7 +26,7 @@ python3 tests/generate_fixtures.py   # regenerate fixtures (needs bcftools + bgz
 | `matchcore.nim` | `streamJobPairs` (interval), `streamBndJobPairs` (BND), `streamInsJobPairs` (INS) — all return `seq[MatchPair]`. Shared `advanceSlidingCache[T]` helper used by BND and INS. Slim-BCF decode helpers (`readSrcIndex`, `readPos2`, `readChr2`, `extractEnd`, `readSvlen`). |
 | `match.nim` | match-mode: pair-only pool (`runMatchPairJobsWithPool`), main-thread chr:pos CSI resolution, TSV output |
 | `anno.nim` | anno-mode: expression parser, `applyAggFunc`, per-match chr:pos CSI B retrieval, SRC_INDEX counter join for phase 3, output VCF assembly |
-| `mergecore.nim` | header merge (`resolveHeaders`), `buildSimilarityMap`, union-find, agglomerative clustering, `selectRepresentative` |
+| `mergecore.nim` | header merge (`resolveHeaders`), `buildSimilarityMap`, union-find (`buildComponents`), agglomerative clustering (`agglomerateComponent` dispatcher → `agglomerateDense` O(N³) for N ≤ 256, `agglomerateSparse` heap+lazy-invalidation O((N+E) log N) for N > 256), large-component warning (`LargeComponentWarn = 500`), `selectRepresentative` |
 | `collapse.nim` | collapse-mode driver: `integratedMerge` (fused preproc+merge via `synced_bcf_reader`), self-match with singleton emission, clustering, representative output |
 | `merge.nim` | merge-mode driver: cohort pVCF across N single-sample inputs. Builds slimHdr (1 dummy `SAMPLE` + `FORMAT/SID`) and outputHdr (N samples + AC/AN/AF); per-sample FORMAT routing via SID. `--missing-to-ref` writes absent samples as `0/0` (encoded GT = `2`) so AC/AN counts them. |
 | `log.nim` | Verbose/warn/error logging (stderr, timestamped); `warnCap` throttle |

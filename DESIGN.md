@@ -127,6 +127,62 @@ Threading: preproc+merge runs in one integrated streaming pass (`integratedMerge
 
 ---
 
+## Agglomerative clustering
+
+Used by both collapse and merge (step 5 of each pipeline). Entry point: `clusterAll(byComp, simMap, linkage, threshold)` → `seq[seq[int32]]`.
+
+### Connected components
+
+`buildComponents(simMap)` runs union-find over all (i, j) pairs in the similarity map. Returns `byComp: Table[int32, seq[int32]]` — one entry per component root, value is the sorted list of offsets in that component.
+
+Connected components can grow larger than the direct-match size-bin window suggests. Adjacent size bins can produce edges between bin N and bin N+1; a chain of such edges (bin 7 ↔ 8 ↔ … ↔ 18) transitively links the entire size spectrum into one component via union-find, even though the smallest and largest records in the chain would never directly match. This is expected — agglomeration then correctly splits the chained component at the threshold. The problem only arises when caller artefacts produce thousands of records in a single component (see large-component warning below).
+
+### Dispatcher
+
+`agglomerateComponent(offsets, simMap, linkage, threshold)` dispatches based on component size:
+
+- `len(offsets) ≤ AggDenseThreshold` (256) → `agglomerateDense`
+- `len(offsets) > 256` → `agglomerateSparse`
+
+Both procs return `seq[seq[int32]]` with the same semantics. `agglomerateDense` is the reference implementation and is exercised by all existing test fixtures.
+
+### Dense path — `agglomerateDense`
+
+O(N²) space (full N×N similarity matrix), O(N³) time (full rescan per merge). Correct for N up to ~200; unacceptable at N ≈ thousands.
+
+Each iteration scans all active pairs for the maximum similarity; if it meets the threshold the two clusters are merged using the appropriate Lance-Williams update:
+
+- **single**: `max(dAX, dBX)`
+- **complete**: `min(dAX, dBX)`
+- **average**: `(sA·dAX + sB·dBX) / (sA + sB)`
+
+Missing edges in the simMap are treated as 0.0 — absent pairs never trigger a merge.
+
+### Sparse path — `agglomerateSparse`
+
+O((N + E) log N) time, O(E) space (plus heap accumulation). Used when N > 256.
+
+Data structures:
+- `neighbors: seq[Table[int32, float64]]` — sparse adjacency indexed by cluster id, initialised from simMap edges within this component only.
+- `heap: HeapQueue[SparseHeapEntry]` — Nim min-heap with negated similarity so the largest edge pops first. Entry tuple: `(negSim, i, j, vi, vj)` — tuple lex-order gives a smallest-`(i, j)` tiebreak, matching the dense path's row-major scan tiebreak for determinism.
+- `version: seq[int32]` — one per cluster, incremented on every merge. Stale heap entries are detected and skipped on pop when `version[i] != vi` or `version[j] != vj` (lazy invalidation — the heap is never rebuilt).
+
+Initial heap: one entry per simMap pair with `sim ≥ threshold`. Pop loop: skip if either cluster is inactive or versions don't match; otherwise the popped entry is the current global maximum — merge and continue. Merge (j into i, keep i): apply Lance-Williams update for all `x ∈ neighbors[i] ∪ neighbors[j]` (excluding i and j), write updated weight to `neighbors[i][x]` and `neighbors[x][i]`, remove `neighbors[x][j]`, push new heap entry iff updated weight `≥ threshold`. Mark cluster j inactive; append `members[j]` to `members[i]`; `inc version[i]`. Terminate when the heap is empty or the next valid pop is below threshold.
+
+All three linkages are reducible under Lance-Williams, so the heap-based "pop current global max and merge" strategy produces the same dendrogram as the dense rescan — output is bit-identical. Absent edges in the simMap are treated as 0.0, same as the dense path.
+
+### Large-component warning
+
+Emitted in `selfMatchAndCluster` (mergecore.nim) per component with `len(offsets) ≥ LargeComponentWarn` (500), before agglomeration runs on that component:
+
+```
+[WARN T+s] <mode>: large cluster component: <chrom>/<svtype> N=<N> dominant=<caller>:<pct>% — possible caller artifact
+```
+
+Chrom and svtype are invariant within a connected component (matching is partitioned by both), so they are read from any one member. Caller attribution is computed lazily — a `Table[int32, Meta]` is built from the `allPairs` A-side fields only on the first large component encountered; typical runs with no large components pay zero overhead.
+
+---
+
 ## Merge pipeline
 
 `matcha merge` produces a cohort multi-sample pVCF from N single-sample SV
