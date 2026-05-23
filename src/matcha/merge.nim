@@ -153,8 +153,6 @@ proc buildSlimHdr(callers: seq[CallerInput]; mh: MergedHeader;
 # buildOutputHdr — header for the final N-sample cohort pVCF
 # ---------------------------------------------------------------------------
 
-const MergeVersion {.strdefine.} = "dev"
-
 proc buildOutputHdr(callers: seq[CallerInput]; sampleIds: seq[string];
                     mh: MergedHeader; cfg: MergeConfig;
                     inputsHadCallers: bool;
@@ -203,7 +201,7 @@ proc buildOutputHdr(callers: seq[CallerInput]; sampleIds: seq[string];
       "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">".cstring)
 
   discard bcf_hdr_append(result,
-    ("##source=matcha merge " & MergeVersion).cstring)
+    ("##source=matcha merge " & MatchaVersion).cstring)
   if cmdLine.len > 0:
     discard bcf_hdr_append(result, ("##matcha_cmdline=" & cmdLine).cstring)
 

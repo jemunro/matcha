@@ -1,5 +1,5 @@
 # Package
-version     = "0.1.0"
+version     = "0"
 author      = "Jacob Munro"
 description = "Structural variant matching and annotation"
 license     = "MIT"

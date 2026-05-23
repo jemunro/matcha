@@ -1,0 +1,80 @@
+name: CI
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v26.04) — leave empty for test-only run'
+        required: false
+        default: ''
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+    container:
+      image: ghcr.io/${{ github.repository }}/ci:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Trust workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Stamp version from tag
+        if: inputs.tag != ''
+        run: |
+          raw='${{ inputs.tag }}'
+          ver="${raw#v}"
+          ver=$(printf '%s' "$ver" | tr -cd '0-9A-Za-z.-')
+          if [ -z "$ver" ]; then
+            echo "tag '$raw' produced an empty nimble-safe version" >&2
+            exit 1
+          fi
+          sed -i -E "s/^version[[:space:]]*=.*/version     = \"$ver\"/" matcha.nimble
+          echo "stamped matcha.nimble:"
+          grep '^version' matcha.nimble
+
+      - name: Cache test fixtures
+        uses: actions/cache@v4
+        with:
+          path: tests/fixtures/
+          key: test-fixtures-${{ hashFiles('tests/generate_fixtures.py') }}
+
+      - name: Generate test fixtures
+        run: python3 tests/generate_fixtures.py
+
+      - name: Test
+        run: nimble test -y
+
+      - name: Build release
+        run: rm -f matcha && nimble release -y && strip matcha
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: matcha-binary
+          path: matcha
+
+  release:
+    needs: build-and-test
+    if: inputs.tag != ''
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: matcha-binary
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          generate_release_notes: true
+          files: matcha

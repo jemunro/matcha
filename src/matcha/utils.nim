@@ -4,6 +4,16 @@ import std/strutils
 
 const NO_MATCH* = -1'i32  ## Sentinel for srcIndexB / fileIdxB in singleton MatchPairs.
 
+const NimblePkgVersion* {.strdefine.} = "dev"
+  ## Populated by nimble from `version` in matcha.nimble. CI rewrites that
+  ## field to the release tag before building so binaries are self-stamping.
+
+# Human-visible version. `matcha.nimble` keeps `version = "0"` as the
+# dev-build sentinel (nimble rejects non-numeric versions); CI rewrites it
+# to the tag on release. Anything else is taken verbatim.
+const MatchaVersion* =
+  if NimblePkgVersion == "0": "dev" else: NimblePkgVersion
+
 type
   SvType* = enum
     svDEL = "DEL"

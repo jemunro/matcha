@@ -274,8 +274,6 @@ proc writeOutput(cfg: CollapseConfig;
 # Top-level entry point
 # ---------------------------------------------------------------------------
 
-const CollapseVersion {.strdefine.} = "dev"
-
 proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
   logInfo("matcha collapse: " & $cfg.callers.len & " caller(s)" &
           " linkage=" & $cfg.linkage & " threads=" & $cfg.nThreads)
@@ -338,7 +336,7 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
 
   # Phase 2: build shared output header, then integrated preproc+merge.
   var outSampleName: string
-  let finalHdr = buildFinalHdr(cfg.callers, mh, cfg, CollapseVersion, cmdLine,
+  let finalHdr = buildFinalHdr(cfg.callers, mh, cfg, MatchaVersion, cmdLine,
                                outSampleName)
   logInfo("integrated preproc+merge over " & $cfg.callers.len & " caller(s)")
   let msc = MergeStreamConfig(formatFields:   cfg.formatFields,

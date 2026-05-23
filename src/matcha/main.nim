@@ -4,8 +4,7 @@
 import std/[os, parseopt, sequtils, strutils]
 import utils, match, anno, collapse, merge, mergecore, preproc, log
 
-const NimblePkgVersion {.strdefine.} = "dev"
-const VERSION = NimblePkgVersion
+const VERSION = MatchaVersion
 
 const ShortNoVal = {'h', 'v'}
 
