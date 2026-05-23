@@ -39,6 +39,24 @@ mv matcha /usr/local/bin/  # or anywhere on your PATH
 
 The binary dynamically links against `libhts.so` — see [Providing htslib](#providing-htslib). To build from source instead, see [Build from source](#build-from-source).
 
+### Container image
+
+Pre-built images bundling matcha alongside `bcftools` (which also satisfies the `libhts.so` runtime dependency) are published to GHCR for every tagged release. `:latest` tracks the most recent release.
+
+```bash
+# Docker
+docker pull ghcr.io/jemunro/matcha/matcha-bcftools:latest
+docker run --rm -v "$PWD:/data" -w /data ghcr.io/jemunro/matcha/matcha-bcftools \
+  matcha match truth.vcf.gz calls.vcf.gz > pairs.tsv
+
+# Apptainer / Singularity
+apptainer pull docker://ghcr.io/jemunro/matcha/matcha-bcftools:latest
+apptainer exec matcha-bcftools_latest.sif \
+  matcha match truth.vcf.gz calls.vcf.gz > pairs.tsv
+```
+
+The image works as a drop-in container for Nextflow / Snakemake pipelines — both binaries `matcha` and `bcftools` are on `$PATH`.
+
 ---
 
 ## Quick start
