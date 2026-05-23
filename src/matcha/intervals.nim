@@ -4,14 +4,14 @@
 ## END is the value from INFO/END (1-based in VCF, treated here as exclusive
 ## upper bound so that length = END - POS = abs(SVLEN) for canonical SVs).
 
-proc overlapData(posA, endA, posB, endB: int64): tuple[lenA, lenB, overlap: int64] =
+proc overlapData(posA, endA, posB, endB: int64): tuple[lenA, lenB, overlap: int64] {.inline.} =
   let lenA = endA - posA
   let lenB = endB - posB
   if lenA <= 0 or lenB <= 0: return
   let ov = min(endA, endB) - max(posA, posB)
   result = (lenA, lenB, max(0, ov))
 
-proc reciprocalOverlap*(posA, endA, posB, endB: int64): float64 =
+proc reciprocalOverlap*(posA, endA, posB, endB: int64): float64 {.inline.} =
   ## Reciprocal overlap = overlap / max(lenA, lenB).
   ## Equivalent to requiring overlap/lenA >= t AND overlap/lenB >= t
   ## simultaneously (the standard definition used by truvari/bedtools).
@@ -20,7 +20,7 @@ proc reciprocalOverlap*(posA, endA, posB, endB: int64): float64 =
   if overlap <= 0: return 0.0
   result = float64(overlap) / float64(max(lenA, lenB))
 
-proc jaccard*(posA, endA, posB, endB: int64): float64 =
+proc jaccard*(posA, endA, posB, endB: int64): float64 {.inline.} =
   ## Jaccard index = overlap / union.
   ## Returns 0.0 if intervals do not overlap or either has degenerate length.
   let (_, _, overlap) = overlapData(posA, endA, posB, endB)

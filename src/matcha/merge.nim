@@ -548,8 +548,8 @@ proc writeMergeOutput(cfg: MergeConfig;
                                         BCF_HT_INT.cint)
           if n > 0 and fmtReadBuf != nil:
             let arr = cast[ptr UncheckedArray[int32]](fmtReadBuf)
-            var vals: seq[int32]
-            for k in 0 ..< n.int: vals.add(arr[k])
+            var vals = newSeq[int32](n.int)
+            for k in 0 ..< n.int: vals[k] = arr[k]
             perSampleInt[s] = vals
             if vals.len > maxK: maxK = vals.len
           if fmtReadBuf != nil:
@@ -562,8 +562,8 @@ proc writeMergeOutput(cfg: MergeConfig;
                                         BCF_HT_REAL.cint)
           if n > 0 and fmtReadBuf != nil:
             let arr = cast[ptr UncheckedArray[float32]](fmtReadBuf)
-            var vals: seq[float32]
-            for k in 0 ..< n.int: vals.add(arr[k])
+            var vals = newSeq[float32](n.int)
+            for k in 0 ..< n.int: vals[k] = arr[k]
             perSampleFloat[s] = vals
             if vals.len > maxK: maxK = vals.len
           if fmtReadBuf != nil:

@@ -40,6 +40,22 @@ proc tearDownVcf*(v: VCF) =
 # Slim-BCF INFO decode helpers
 # ---------------------------------------------------------------------------
 
+proc passFilterId*(v: VCF): cint {.inline.} =
+  ## FILTER dictionary ID for "PASS" in this VCF's header. Cache once per VCF
+  ## handle to avoid per-record string allocation by hts-nim's FILTER getter.
+  bcf_hdr_id2int(v.header.hdr, BCF_DT_ID.cint, "PASS".cstring)
+
+proc isPass*(va: Variant; passId: cint): bool {.inline.} =
+  ## True iff FILTER is unset (n_flt == 0, treated as PASS by hts-nim) or
+  ## a single entry equal to PASS. Matches `$va.FILTER == "PASS"` exactly
+  ## without the string allocation.
+  let n = va.c.d.n_flt
+  if n == 0: return true
+  if n == 1:
+    let arr = cast[ptr UncheckedArray[cint]](va.c.d.flt)
+    return arr[0] == passId
+  false
+
 proc readSrcIndex*(v: Variant; scratch: var seq[int32]): int32 =
   ## Decode INFO/SRC_INDEX (Number=1 Integer). Returns -1 if absent.
   if v.info().get("SRC_INDEX", scratch) != Status.OK or scratch.len < 1:
@@ -137,6 +153,8 @@ proc streamJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
     buffers[binB] = initTiledBuffer(binRange(binB).hi, job.chrom)
 
   var endData, svlenData, idxData, ciData: seq[int32]
+  let passId = passFilterId(vcfA)
+  let metricIsOverlap = cfg.metric == mOverlap
 
   proc fetchTile(binB, tileIdx: int): seq[BufferedRec] =
     if binB notin vcfsB:
@@ -163,7 +181,7 @@ proc streamJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
     if not extractEnd(va, endData, svlenData, endA): continue
     let posA       = va.POS
     let srcIndexA  = readSrcIndex(va, idxData)
-    let passA      = ($va.FILTER == "PASS")
+    let passA      = isPass(va, passId)
     let qualQ      = quantizeQual(va.QUAL.float32)
     let callerIdxA = (if va.info().get("CALLER_IDX", ciData) == Status.OK and
                         ciData.len > 0: int16(ciData[0]) else: 0'i16)
@@ -176,7 +194,7 @@ proc streamJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
       for cand in cands:
         if cfg.selfMode and srcIndexA >= cand.srcIndex: continue
         let sim =
-          if cfg.metric == mOverlap:
+          if metricIsOverlap:
             reciprocalOverlap(posA, endA, cand.pos, cand.endPos)
           else:
             jaccard(posA, endA, cand.pos, cand.endPos)
@@ -232,6 +250,7 @@ proc streamBndJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
   var chr2Data: string
   let twoSlop = float64(2 * slop)
   let bFileIdx = job.binsB[0].fileIdx
+  let passId = passFilterId(vcfA)
 
   let decodeB = proc(vb: Variant): stdopt.Option[BndCacheRec] =
     let p2B = readPos2(vb, pos2Data)
@@ -253,7 +272,7 @@ proc streamBndJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
     if not c2A.ok: continue
     let pos2A = p2A.pos2
     let chr2A = c2A.chr2
-    let passA      = ($va.FILTER == "PASS")
+    let passA      = isPass(va, passId)
     let qualQ      = quantizeQual(va.QUAL.float32)
     let callerIdxA = (if va.info().get("CALLER_IDX", ciData) == Status.OK and
                         ciData.len > 0: int16(ciData[0]) else: 0'i16)
@@ -319,6 +338,7 @@ proc streamInsJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
   var idxData, svlenData, ciData: seq[int32]
   let slopF = slop.float64
   let bFileIdx = job.binsB[0].fileIdx
+  let passId = passFilterId(vcfA)
 
   let decodeB = proc(vb: Variant): stdopt.Option[InsCacheRec] =
     let svB = readSvlen(vb, svlenData)
@@ -335,7 +355,7 @@ proc streamInsJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
     let svA = readSvlen(va, svlenData)
     if not svA.ok: continue
     let svlenA = svA.svlen
-    let passA      = ($va.FILTER == "PASS")
+    let passA      = isPass(va, passId)
     let qualQ      = quantizeQual(va.QUAL.float32)
     let callerIdxA = (if va.info().get("CALLER_IDX", ciData) == Status.OK and
                         ciData.len > 0: int16(ciData[0]) else: 0'i16)

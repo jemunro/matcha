@@ -125,9 +125,9 @@ type
     rec:           ptr bcf1_t  ## owned; caller must bcf_destroy
 
   ClusterProv = object
-    callers:   seq[string]  # representative first, then others (CLI order)
-    nCallers:  int
-    nMerged:   int
+    callersStr: string  # comma-joined names: representative first, then others
+    nCallers:   int
+    nMerged:    int
 
 proc writeOutput(cfg: CollapseConfig;
                  finalHdr: ptr bcf_hdr_t;
@@ -157,9 +157,9 @@ proc writeOutput(cfg: CollapseConfig;
     others.sort()
     for ci in others: callers.add(cfg.callers[ci].name)
     repProv[repIdx] = ClusterProv(
-      callers:  callers,
-      nCallers: callerIdxSeen.len,
-      nMerged:  cl.len,
+      callersStr: callers.join(","),
+      nCallers:   callerIdxSeen.len,
+      nMerged:    cl.len,
     )
 
   # chrom → header-order index for sort.
@@ -190,7 +190,7 @@ proc writeOutput(cfg: CollapseConfig;
       if si notin repProv: continue
       let prov = repProv[si]
 
-      var callersStr = prov.callers.join(",")
+      var callersStr = prov.callersStr
       discard v.info.set("CALLERS", callersStr)
       var nCallers = prov.nCallers.int32
       discard v.info.set("N_CALLERS", nCallers)

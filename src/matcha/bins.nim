@@ -14,7 +14,7 @@
 ## loads lazily, and evicts tiles once A has advanced far enough that no
 ## future A record can need them.
 
-import std/[bitops, sequtils, sets, tables]
+import std/[bitops, sets, tables]
 
 const BinZeroUpper = 1024'i64
 
@@ -64,6 +64,7 @@ type
     chrom*:     string
     tiles*:     Table[int, seq[BufferedRec]]
     fetched*:   HashSet[int]   ## tile indexes already attempted (even if empty)
+    evictBuf:   seq[int]       ## scratch reused across evict() calls
 
 proc initTiledBuffer*(tileWidth: int64, chrom: string): TiledBuffer =
   TiledBuffer(tileWidth: tileWidth, chrom: chrom)
@@ -103,7 +104,9 @@ proc evict*(buf: var TiledBuffer, posA: int64) =
   if buf.tileWidth <= 0:
     return
   let limit = int(posA div buf.tileWidth) - 1
-  for k in toSeq(buf.fetched):
-    if k < limit:
-      buf.fetched.excl(k)
-      buf.tiles.del(k)
+  buf.evictBuf.setLen(0)
+  for k in buf.fetched:
+    if k < limit: buf.evictBuf.add(k)
+  for k in buf.evictBuf:
+    buf.fetched.excl(k)
+    buf.tiles.del(k)

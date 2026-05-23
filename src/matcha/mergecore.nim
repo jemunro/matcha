@@ -403,15 +403,14 @@ proc agglomerateDense*(offsets: seq[int32];
   for i, off in offsets.pairs:
     offIdx[off] = i
 
-  # clusterSim[i][j] = current similarity between active clusters i and j (i < j).
-  # Initialise from simMap (missing entries → 0.0).
-  var clusterSim = newSeq[seq[float64]](n)
-  for i in 0 ..< n:
-    clusterSim[i] = newSeq[float64](n)
+  # clusterSim[i*n + j] = current similarity between active clusters i and j
+  # (i < j). Flat layout: one allocation, row-major, contiguous for cache.
+  # Lower triangle is unused.
+  var clusterSim = newSeq[float64](n * n)
   for i in 0 ..< n:
     for j in i + 1 ..< n:
       let key = pairKey(offsets[i], offsets[j])
-      clusterSim[i][j] = simMap.getOrDefault(key, 0.0)
+      clusterSim[i*n + j] = simMap.getOrDefault(key, 0.0)
 
   # Track active cluster membership. Start: each record is its own cluster.
   var members = newSeq[seq[int32]](n)
@@ -429,10 +428,12 @@ proc agglomerateDense*(offsets: seq[int32];
     var bestJ = -1
     for i in 0 ..< n:
       if not active[i]: continue
+      let rowBase = i * n
       for j in i + 1 ..< n:
         if not active[j]: continue
-        if clusterSim[i][j] > bestSim:
-          bestSim  = clusterSim[i][j]
+        let s = clusterSim[rowBase + j]
+        if s > bestSim:
+          bestSim  = s
           bestI    = i
           bestJ    = j
     if bestSim < threshold or bestI < 0:
@@ -444,15 +445,15 @@ proc agglomerateDense*(offsets: seq[int32];
 
     for x in 0 ..< n:
       if not active[x] or x == bestI or x == bestJ: continue
-      let dAX = if bestI < x: clusterSim[bestI][x] else: clusterSim[x][bestI]
-      let dBX = if bestJ < x: clusterSim[bestJ][x] else: clusterSim[x][bestJ]
+      let dAX = if bestI < x: clusterSim[bestI*n + x] else: clusterSim[x*n + bestI]
+      let dBX = if bestJ < x: clusterSim[bestJ*n + x] else: clusterSim[x*n + bestJ]
       let merged =
         case linkage
         of lmSingle:   max(dAX, dBX)
         of lmComplete: min(dAX, dBX)
         of lmAverage:  (sA * dAX + sB * dBX) / (sA + sB)
-      if bestI < x: clusterSim[bestI][x] = merged
-      else:         clusterSim[x][bestI] = merged
+      if bestI < x: clusterSim[bestI*n + x] = merged
+      else:         clusterSim[x*n + bestI] = merged
 
     for off in members[bestJ]:
       members[bestI].add(off)
@@ -509,6 +510,8 @@ proc agglomerateSparse*(offsets: seq[int32];
     sizes[i] = 1
     active[i] = true
 
+  var nbrs: HashSet[int32]  # reused across merges to avoid per-merge alloc
+
   while heap.len > 0:
     let top = heap.pop()
     let i = top.i
@@ -523,7 +526,7 @@ proc agglomerateSparse*(offsets: seq[int32];
     # (matching the dense path's matrix-of-zeros init).
     let sA = float64(sizes[i])
     let sB = float64(sizes[j])
-    var nbrs: HashSet[int32]
+    nbrs.clear()
     for x in neighbors[i].keys: nbrs.incl(x)
     for x in neighbors[j].keys: nbrs.incl(x)
     nbrs.excl(i); nbrs.excl(j)
