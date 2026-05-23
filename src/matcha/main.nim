@@ -537,7 +537,7 @@ proc runCollapseCli(rawArgs: seq[string]) =
 proc mergeUsage(code: int = 1) =
   let f = if code == 0: stdout else: stderr
   f.writeLine "Usage:"
-  f.writeLine "  matcha merge [options] [Name:]callset1.bcf [Name:]callset2.bcf ..."
+  f.writeLine "  matcha merge [options] callset1.bcf callset2.bcf ..."
   f.writeLine ""
   f.writeLine "Merge per-sample SV callsets (≥2 inputs, exactly 1 sample each, distinct"
   f.writeLine "sample IDs) into a multi-sample cohort pVCF. One row per cluster; FORMAT"
@@ -566,9 +566,6 @@ proc mergeUsage(code: int = 1) =
   f.writeLine "  -h, --help                    show this help"
   f.writeLine ""
   f.writeLine "Default metric: --min-jaccard 0.75. Specify --min-overlap or --min-jaccard to override."
-  f.writeLine ""
-  f.writeLine "Input names: positional args may be prefixed with 'Name:' (e.g. S1:s1.bcf)."
-  f.writeLine "If no name prefix is given, the basename without extension is used."
   f.writeLine ""
   f.writeLine "Output INFO fields added: AC, AN, AF (always); CALLERS, N_CALLERS (when inputs had them)."
   f.writeLine "AC/AN reflect --missing-to-ref: absent samples are counted as 0/0 when the flag is set."
@@ -661,16 +658,11 @@ proc runMergeCli(rawArgs: seq[string]) =
     mergeUsage()
 
   for arg in positionals:
-    let colonIdx = arg.find(':')
-    var name, path: string
-    if colonIdx >= 0:
-      name = arg[0 ..< colonIdx]
-      path = arg[colonIdx + 1 .. ^1]
-    else:
-      path = arg
-      name = splitFile(path).name
-    if name.len == 0: name = splitFile(path).name
-    cfg.callers.add(CallerInput(name: name, path: path))
+    if ':' in arg:
+      logError("matcha merge does not support 'Name:' prefix on inputs " &
+               "(sample IDs come from the input BCF headers); got '" & arg & "'")
+      quit(1)
+    cfg.callers.add(CallerInput(name: splitFile(arg).name, path: arg))
 
   for caller in cfg.callers:
     if not fileExists(caller.path):

@@ -73,7 +73,7 @@ proc parseMergeVcf(text: string): tuple[samples: seq[string]; rows: seq[MergeRec
 proc mergeRun(extra = ""; outExt = ".vcf"): (seq[string], seq[MergeRec], int) =
   let outPath = tmpOut(outExt)
   let (_, code) = run("merge --min-jaccard 0.75 " &
-                      "S1:" & FixS1 & " S2:" & FixS2 & " S3:" & FixS3 &
+                      FixS1 & " " & FixS2 & " " & FixS3 &
                       " -o " & outPath & " " & extra)
   if code != 0:
     discard tryRemoveFile(outPath)
@@ -183,7 +183,7 @@ timed("M09", "duplicate sample IDs across inputs rejected"):
 timed("M10", "--format DP (no GT) silently adds GT; cohort fields still correct"):
   let outPath = tmpOut()
   let (_, code) = run("merge --min-jaccard 0.75 --format DP " &
-                      "S1:" & FixS1 & " S2:" & FixS2 & " S3:" & FixS3 &
+                      FixS1 & " " & FixS2 & " " & FixS3 &
                       " -o " & outPath)
   doAssert code == 0, "merge with --format DP failed"
   let text = readFile(outPath)
@@ -207,7 +207,7 @@ timed("M11", "output rows sorted by (chrom, pos)"):
 timed("M12", "no SRC_INDEX, CALLER_IDX, or FORMAT/SID in output"):
   let outPath = tmpOut()
   let (_, code) = run("merge --min-jaccard 0.75 " &
-                      "S1:" & FixS1 & " S2:" & FixS2 & " S3:" & FixS3 &
+                      FixS1 & " " & FixS2 & " " & FixS3 &
                       " -o " & outPath)
   doAssert code == 0
   let text = readFile(outPath)
@@ -229,7 +229,7 @@ timed("M13", "single input file rejected"):
 timed("M14", "cohort output does not emit N_MERGED"):
   let outPath = tmpOut()
   let (_, code) = run("merge --min-jaccard 0.75 " &
-                      "S1:" & FixS1 & " S2:" & FixS2 & " S3:" & FixS3 &
+                      FixS1 & " " & FixS2 & " " & FixS3 &
                       " -o " & outPath)
   doAssert code == 0
   let text = readFile(outPath)

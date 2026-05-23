@@ -150,7 +150,7 @@ matcha collapse [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
 
 ### Input naming
 
-Each positional may be prefixed with `Name:` (e.g. `Delly:delly.bcf`); without a prefix, the basename without extension is used. Names appear in provenance fields and drive the `CENTRE` priority criterion.
+Each positional may be prefixed with `Name:` (e.g. `Delly:delly.bcf`); without a prefix, the basename without extension is used. Names appear in provenance fields and drive the `ORDER` priority criterion.
 
 ### Representative selection
 
@@ -158,8 +158,10 @@ Within each cluster, the representative record is picked by walking the `--prior
 
 - `PASS` — prefer records with `FILTER=PASS`.
 - `QUAL` — prefer higher `QUAL` (BCF missing values lose).
-- `CENTRE` — prefer callers earlier in the command line.
-- `ORDER` — implicit final tiebreaker; preserves record order from the input.
+- `CENTRE` — prefer records closest to the cluster centre, i.e. those with the highest mean pairwise similarity to other cluster members.
+- `ORDER` — prefer records from callers listed earlier on the command line (via `CALLER_IDX`). Always appended as the final criterion in the cascade.
+
+Any remaining ties are broken deterministically by taking the first record in input order (lowest `SRC_INDEX`, which for records from a single caller corresponds to the lowest position since inputs are coordinate-sorted).
 
 ### Linkage
 
@@ -188,7 +190,7 @@ multi-sample cohort pVCF: one row per cluster, per-sample FORMAT columns,
 cohort INFO (AC/AN/AF) computed from the assembled GTs.
 
 ```
-matcha merge [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
+matcha merge [options] callset1.bcf callset2.bcf ...
 
   --min-overlap FLOAT           (mutually exclusive; default: --min-jaccard 0.75)
   --min-jaccard FLOAT

@@ -55,14 +55,13 @@ proc validateMergeInputs(callers: seq[CallerInput]): seq[string] =
       logError("cannot open: " & caller.path); quit(1)
     let n = bcf_hdr_nsamples(vcf.header.hdr).int
     if n != 1:
-      logError("merge: input '" & caller.name & "' (" & caller.path &
-               ") has " & $n & " sample column(s); merge requires " &
-               "exactly 1 per input")
+      logError("merge: input '" & caller.path & "' has " & $n &
+               " sample column(s); merge requires exactly 1 per input")
       vcf.close(); quit(1)
     let s = $cast[cstringArray](vcf.header.hdr.samples)[0]
     if s in seen:
       logError("merge: duplicate sample ID '" & s & "' in input '" &
-               caller.name & "' (" & caller.path & ")")
+               caller.path & "'")
       vcf.close(); quit(1)
     seen.incl(s)
     result[ci] = s
@@ -294,7 +293,6 @@ proc writeMergeOutput(cfg: MergeConfig;
                      locByIdx: Table[int32, tuple[chromIdx: int16; pos: int32; fileIdx: int16]];
                      passQualMap: Table[int32, tuple[hasPASS: bool; qual: uint16; callerIdx: int32]];
                      finalClusters: seq[seq[int32]];
-                     callerNames: seq[string];
                      emitCallers: bool) =
 
   let nSamples = sampleIds.len
@@ -872,10 +870,9 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
   for i, s in sampleIds.pairs: sampleIdxBySID[s] = i
 
   # Output.
-  let callerNames = cfgMut.callers.mapIt(it.name)
   writeMergeOutput(cfgMut, outputHdr, slimHdr, sampleIds, sampleIdxBySID,
                   chromOrder, im.paths, cpr.fileList, cpr.locByIdx,
-                  cpr.passQualMap, cpr.finalClusters, callerNames,
+                  cpr.passQualMap, cpr.finalClusters,
                   inputsHadCallers)
 
   # Teardown.
