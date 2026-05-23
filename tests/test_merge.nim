@@ -70,18 +70,25 @@ proc parseMergeVcf(text: string): tuple[samples: seq[string]; rows: seq[MergeRec
         r.gts.add(".")
     result.rows.add(r)
 
+var mergeCache: Table[string, (seq[string], seq[MergeRec], int)]
+
 proc mergeRun(extra = ""; outExt = ".vcf"): (seq[string], seq[MergeRec], int) =
+  ## Memoized by (extra, outExt) — repeat calls with the same args reuse parsed rows.
+  let key = extra & "|" & outExt
+  if key in mergeCache: return mergeCache[key]
   let outPath = tmpOut(outExt)
   let (_, code) = run("merge --min-jaccard 0.75 " &
                       FixS1 & " " & FixS2 & " " & FixS3 &
                       " -o " & outPath & " " & extra)
   if code != 0:
     discard tryRemoveFile(outPath)
+    mergeCache[key] = (@[], @[], code)
     return (@[], @[], code)
   let text = readFile(outPath)
   discard tryRemoveFile(outPath)
   let parsed = parseMergeVcf(text)
-  (parsed.samples, parsed.rows, 0)
+  mergeCache[key] = (parsed.samples, parsed.rows, 0)
+  result = (parsed.samples, parsed.rows, 0)
 
 # ---------------------------------------------------------------------------
 

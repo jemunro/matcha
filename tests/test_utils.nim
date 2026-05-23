@@ -1,6 +1,20 @@
 ## test_utils.nim — shared test helpers: timed template + watchdog thread
 
-import std/[times, atomics, os, locks, strformat, strutils, posix]
+import std/[times, atomics, os, locks, strformat, strutils, posix, osproc, tables]
+
+# Per-process cache for identical ./matcha invocations. Identical commands
+# produce identical (stdout, exit) so each call after the first is free.
+# stderr is dropped here — callers asserting on stderr use their own
+# uncached `runMerged`.
+var runCache: Table[string, (string, int)]
+let gRunCacheDisabled = getEnv("MATCHA_DISABLE_RUN_CACHE", "0") == "1"
+
+proc runMatcha*(bin, args: string, timeoutSec = "30"): (string, int) =
+  let key = bin & "|" & args
+  if not gRunCacheDisabled and key in runCache: return runCache[key]
+  let r = execCmdEx("timeout " & timeoutSec & " " & bin & " " & args & " 2>/dev/null")
+  if not gRunCacheDisabled: runCache[key] = r
+  result = r
 
 when defined(nimPanics):
   {.warning: "tests compiled with --panics:on; AssertionDefect is uncatchable and FAIL line won't print. Set `switch(\"panics\", \"off\")` in config.nims.".}

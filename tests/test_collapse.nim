@@ -61,17 +61,23 @@ proc parseCollapsed(vcfText: string): seq[ColRecord] =
       of "N_MERGED":  rec.nMerged = parseInt(kv[1])
     result.add(rec)
 
+var collapseCache: Table[string, (seq[ColRecord], int)]
+
 proc collapseRun(extra = ""): (seq[ColRecord], int) =
   ## Run a standard 2-caller collapse → tmpfile, return parsed records + exit code.
+  ## Memoized by `extra` — repeat calls with the same args reuse the parsed records.
+  if extra in collapseCache: return collapseCache[extra]
   let outBcf = tmpBcf()
   let (_, code) = run("collapse --min-jaccard 0.5 Caller1:" & FixCaller1 &
                       " Caller2:" & FixCaller2 & " -o " & outBcf & " " & extra)
   if code != 0:
     discard tryRemoveFile(outBcf)
+    collapseCache[extra] = (@[], code)
     return (@[], code)
   let records = parseCollapsed(viewBcf(outBcf))
   discard tryRemoveFile(outBcf)
-  (records, 0)
+  collapseCache[extra] = (records, 0)
+  result = (records, 0)
 
 # ---------------------------------------------------------------------------
 

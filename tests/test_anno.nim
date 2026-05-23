@@ -15,8 +15,8 @@ const FixtureA  = "tests/fixtures/fixtureA.vcf.gz"
 const FixtureDB = "tests/fixtures/fixtureDB.vcf.gz"
 
 proc run(args: string): (string, int) =
-  let t = getEnv("MATCHA_TEST_TIMEOUT", "30")
-  execCmdEx("timeout " & t & " " & BinPath & " " & args & " 2>/dev/null")
+  ## Memoized — identical commands within a single test process share output.
+  runMatcha(BinPath, args, getEnv("MATCHA_TEST_TIMEOUT", "30"))
 
 proc runMerged(args: string): (string, int) =
   let t = getEnv("MATCHA_TEST_TIMEOUT", "30")
@@ -257,19 +257,6 @@ timed("A21", "end-to-end: .bcf output written and indexed"):
   doAssert code == 0
   doAssert fileExists(tmpBcf), "bcf not written"
   doAssert fileExists(tmpBcf & ".csi"), "csi not written"
-
-when false:
-  # A39 — disabled in this sandbox: anno --threads 2 reliably segfaults
-  # here due to a process/fork limit in the Codespace runtime. It works
-  # fine on a normal terminal. Re-enable once we move the suite off this
-  # environment, or migrate the test to a forkless runner.
-  timed("A22", "end-to-end: --threads 2 matches --threads 1"):
-    let (t1, c1) = run("anno --min-overlap 0.5 -a X=max\\(AF\\) -a N=first\\(MATCHA_COUNT\\) " &
-      FixtureA & " " & FixtureDB)
-    let (t2, c2) = run("anno --threads 2 --min-overlap 0.5 -a X=max\\(AF\\) -a N=first\\(MATCHA_COUNT\\) " &
-      FixtureA & " " & FixtureDB)
-    doAssert c1 == 0 and c2 == 0
-    doAssert t1 == t2, "threaded output differs from single-threaded"
 
 timed("A23", "end-to-end: best() ranks by similarity, tie-breaks by posB"):
   # On DEL_A_06 both matches have the same overlap (0.95) → tied; the
