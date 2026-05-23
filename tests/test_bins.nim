@@ -2,7 +2,7 @@
 ## Run from project root: nim c --hints:off -r tests/test_bins.nim
 echo "--------------- Test Bins ---------------"
 
-import std/[sets, tables]
+import std/sets
 import test_utils
 import matcha/bins
 

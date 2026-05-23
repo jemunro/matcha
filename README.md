@@ -2,6 +2,8 @@
 
 Compiled, efficient structural variant (SV) matching and annotation tool written in Nim using [hts-nim](https://github.com/brentp/hts-nim) and [htslib](https://github.com/samtools/htslib).
 
+---
+
 ## Modes
 
 | Mode | Description | Typical usage |
@@ -11,7 +13,75 @@ Compiled, efficient structural variant (SV) matching and annotation tool written
 | [`matcha collapse`](#matcha-collapse) | Cluster SVs from multiple callers run on one sample; emit one representative per cluster | `matcha collapse Delly:delly.bcf Manta:manta.bcf CNVnator:cnvnator.bcf -o sample.bcf` |
 | [`matcha merge`](#matcha-merge) | Merge per-sample SV callsets into a multi-sample cohort pVCF with AC/AN/AF | `matcha merge sample1.bcf sample2.bcf sample3.bcf -o cohort.bcf` |
 
-DEL/DUP/INV match by coordinate + size (reciprocal overlap or Jaccard). BND records match by breakend proximity. INS records match by position proximity plus size ratio. Genotypes are ignored.
+---
+
+## How it works
+
+Matcha decides which structural variants from different callsets refer to the same underlying event. Two records match when they share SVTYPE and CHROM and their coordinates and sizes agree closely enough — reciprocal overlap or Jaccard for DEL/DUP/INV, breakend proximity for BND, position and size similarity for INS. Genotypes are ignored.
+
+`match` and `anno` emit those pairwise matches directly. `collapse` and `merge` go further: they group records into clusters by agglomerative linkage, then pick one representative per cluster.
+
+Inputs are streamed and indexed lazily, so memory stays flat in callset size and the work parallelises over chromosomes and size bins. See [DESIGN.md](DESIGN.md) for the architecture.
+
+---
+
+## Installation
+
+### Precompiled binary (recommended)
+
+Download the latest Linux x86_64 binary from the [latest release](https://github.com/jemunro/matcha/releases/latest):
+
+```bash
+curl -fsSL https://github.com/jemunro/matcha/releases/latest/download/matcha -o matcha
+chmod +x matcha
+mv matcha /usr/local/bin/  # or anywhere on your PATH
+```
+
+The binary dynamically links against `libhts.so` — see [Providing htslib](#providing-htslib). To build from source instead, see [Build from source](#build-from-source).
+
+---
+
+## Quick start
+
+```bash
+# 1. Pairwise match — find SVs in calls.vcf.gz that recur in truth.vcf.gz
+matcha match --min-jaccard 0.75 truth.vcf.gz calls.vcf.gz > pairs.tsv
+
+# 2. Annotate calls with population AF from a database VCF
+matcha anno -a AF=max(AF) -a AC=first(AC) calls.bcf gnomad-sv.bcf -o annotated.bcf
+
+# 3. Collapse three caller outputs from the same sample into a unified callset
+matcha collapse \
+  Delly:delly.bcf Manta:manta.bcf CNVnator:cnvnator.bcf \
+  --priority PASS,QUAL,CENTRE,ORDER -o sample.bcf
+
+# 4. Merge per-sample callsets into a multi-sample cohort pVCF
+matcha merge sample1.bcf sample2.bcf sample3.bcf --missing-to-ref -o cohort.bcf
+```
+
+---
+
+## Matching semantics
+
+All four subcommands share the same matching engine and the same threshold options. SVTYPE-specific rules:
+
+**DEL / DUP / INV** — candidates share CHROM and SVTYPE with sizes within the active threshold ratio.
+- **Reciprocal overlap** (`--min-overlap`): `overlap / max(lenA, lenB)` — the standard truvari/bedtools definition.
+- **Jaccard** (`--min-jaccard`): `overlap / union`.
+
+The two metrics are mutually exclusive; the default is `--min-jaccard 0.75`.
+
+**BND** — candidates share CHROM and CHR2 with both breakends within `--bnd-slop` (default 50):
+`|POS_A − POS_B| < slop` and `|POS2_A − POS2_B| < slop`. Similarity is `(2·slop − |dPOS| − |dPOS2|) / (2·slop)`. Strand is ignored.
+
+**INS** — candidates share CHROM with `|POS_A − POS_B| < --ins-slop` (default 50). Similarity combines position and size:
+- `pos_sim = (slop − |dPOS|) / slop`
+- `len_sim = min(SVLEN_A, SVLEN_B) / max(SVLEN_A, SVLEN_B)`
+- `sim = sqrt(pos_sim · len_sim)` — must be ≥ `--min-ins-sim` (default 0.75).
+
+SVLEN for INS is resolved from the first available of: `INFO/INSLEN`, `INFO/SVLEN`, `len(ALT) − len(REF)` (sequence-resolved ALTs only), `len(LEFT_SVINSSEQ) + len(RIGHT_SVINSSEQ)`. Records with no resolvable length are skipped with reason `unresolvable_ins_len`.
+
+`TRA` records are not supported; they are warned and skipped.
 
 ---
 
@@ -39,24 +109,7 @@ Options:
   -h, --help
 ```
 
-Inputs may be `.vcf.gz` or `.bcf`; format is auto-detected. `-v` is accepted before or after the subcommand.
-
-### Matching logic
-
-**DEL/DUP/INV** — candidates share CHROM and SVTYPE with sizes within the active threshold ratio.
-- **Reciprocal overlap** (`--min-overlap`): `overlap / max(lenA, lenB)` — standard truvari/bedtools definition.
-- **Jaccard** (`--min-jaccard`): `overlap / union`.
-
-**BND** — candidates share CHROM and CHR2 with both breakends within `--bnd-slop`:  
-`|POS_A − POS_B| < slop` and `|POS2_A − POS2_B| < slop`.  
-Similarity: `(2·slop − |dPOS| − |dPOS2|) / (2·slop)`. Strand is ignored.
-
-**INS** — candidates share CHROM with `|POS_A − POS_B| < --ins-slop`. Similarity combines position and size:
-- `pos_sim = (slop − |dPOS|) / slop`
-- `len_sim = min(SVLEN_A, SVLEN_B) / max(SVLEN_A, SVLEN_B)`
-- `sim = sqrt(pos_sim · len_sim)` — must be ≥ `--min-ins-sim`.
-
-SVLEN is resolved from the first available of: `INFO/INSLEN`, `INFO/SVLEN`, `len(ALT) − len(REF)` (sequence-resolved ALTs only), `len(LEFT_SVINSSEQ) + len(RIGHT_SVINSSEQ)`. Records with no resolvable length are skipped with reason `unresolvable_ins_len`.
+Inputs may be `.vcf.gz` or `.bcf`; format is auto-detected. `-v` is accepted before or after the subcommand. See [Matching semantics](#matching-semantics) for how candidates are evaluated.
 
 ### Output
 
@@ -99,6 +152,8 @@ matcha anno [options] input database
   -v, --verbose
   -h, --help
 ```
+
+See [Matching semantics](#matching-semantics) for matching rules.
 
 ### Aggregation functions
 
@@ -147,6 +202,8 @@ matcha collapse [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
   -v, --verbose
   -h, --help
 ```
+
+See [Matching semantics](#matching-semantics) for how cluster candidates are evaluated.
 
 ### Input naming
 
@@ -213,6 +270,8 @@ matcha merge [options] callset1.bcf callset2.bcf ...
   -h, --help
 ```
 
+See [Matching semantics](#matching-semantics) for how cluster candidates are evaluated.
+
 ### Input requirements
 
 - ≥ 2 input files.
@@ -243,17 +302,19 @@ matcha merge [options] callset1.bcf callset2.bcf ...
 
 ---
 
-## Build
+## Build from source
 
 ```
+git clone --recurse-submodules https://github.com/jemunro/matcha
+cd matcha
 nimble build    # → ./matcha
+nimble release  # optimised, stripped
 nimble test     # run test suite
 ```
 
-Requires Nim ≥ 2.0 and hts-nim (vendored at `vendor/hts-nim/`, pinned v0.3.31), which links against htslib ≥ 1.10.  
-Fixture regeneration: `python3 tests/generate_fixtures.py` (needs `bcftools` + `bgzip`).
+Requirements: Nim ≥ 2.0, a C compiler, and hts-nim (vendored at `vendor/hts-nim/`, pinned v0.3.31), which links against htslib ≥ 1.10. Tests additionally require `bcftools` and `bgzip` for fixture generation (`python3 tests/generate_fixtures.py`).
 
-### Providing htslib ≥ 1.10
+## Providing htslib
 
 `hts-nim` links against the system `libhts.so` at runtime. Pick whichever route fits your environment:
 
@@ -263,12 +324,6 @@ Fixture regeneration: `python3 tests/generate_fixtures.py` (needs `bcftools` + `
 - **From source**: clone `https://github.com/samtools/htslib`, check out a `1.x` tag (≥ 1.10), then `autoreconf -i && ./configure && make && sudo make install`.
 
 If `libhts.so` is not on the default loader path, point to it at runtime with `LD_LIBRARY_PATH=/path/to/htslib/lib ./matcha …`. Confirm which library is being picked up with `ldd ./matcha | grep hts` (Linux) or `otool -L ./matcha | grep hts` (macOS).
-
-## Dependencies
-
-- [hts-nim](vendor/hts-nim/) — VCF/BCF I/O (vendored, pinned v0.3.31)
-- `bcftools` — fixture generation only
-- Nim ≥ 2.0 standard library
 
 ## Citations
 
