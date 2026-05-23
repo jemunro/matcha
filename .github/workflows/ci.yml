@@ -42,12 +42,6 @@ jobs:
           echo "stamped matcha.nimble:"
           grep '^version' matcha.nimble
 
-      - name: Cache test fixtures
-        uses: actions/cache@v4
-        with:
-          path: tests/fixtures/
-          key: test-fixtures-${{ hashFiles('tests/generate_fixtures.py') }}
-
       - name: Generate test fixtures
         run: python3 tests/generate_fixtures.py
 
