@@ -101,9 +101,13 @@ proc runMatch(rawArgs: seq[string]) =
       case p.key
       of "min-overlap":
         cfg.threshold = parseFloatOpt(nextVal(p, "min-overlap"), "min-overlap")
+        if cfg.threshold <= 0 or cfg.threshold > 1:
+          logError("--min-overlap must be in (0, 1]"); quit(1)
         cfg.metric = mOverlap; overlapSet = true
       of "min-jaccard":
         cfg.threshold = parseFloatOpt(nextVal(p, "min-jaccard"), "min-jaccard")
+        if cfg.threshold <= 0 or cfg.threshold > 1:
+          logError("--min-jaccard must be in (0, 1]"); quit(1)
         cfg.metric = mJaccard; jaccardSet = true
       of "bnd-slop":
         cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
@@ -306,9 +310,13 @@ proc runAnnoCli(rawArgs: seq[string]) =
         cfg.outputPath = nextVal(p, "o")
       of "min-overlap":
         cfg.threshold = parseFloatOpt(nextVal(p, "min-overlap"), "min-overlap")
+        if cfg.threshold <= 0 or cfg.threshold > 1:
+          logError("--min-overlap must be in (0, 1]"); quit(1)
         cfg.metric = mOverlap; overlapSet = true
       of "min-jaccard":
         cfg.threshold = parseFloatOpt(nextVal(p, "min-jaccard"), "min-jaccard")
+        if cfg.threshold <= 0 or cfg.threshold > 1:
+          logError("--min-jaccard must be in (0, 1]"); quit(1)
         cfg.metric = mJaccard; jaccardSet = true
       of "bnd-slop":
         cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
@@ -438,9 +446,13 @@ proc runCollapseCli(rawArgs: seq[string]) =
       case p.key
       of "min-overlap":
         cfg.threshold = parseFloatOpt(nextVal(p, "min-overlap"), "min-overlap")
+        if cfg.threshold <= 0 or cfg.threshold > 1:
+          logError("--min-overlap must be in (0, 1]"); quit(1)
         cfg.metric = mOverlap; overlapSet = true
       of "min-jaccard":
         cfg.threshold = parseFloatOpt(nextVal(p, "min-jaccard"), "min-jaccard")
+        if cfg.threshold <= 0 or cfg.threshold > 1:
+          logError("--min-jaccard must be in (0, 1]"); quit(1)
         cfg.metric = mJaccard; jaccardSet = true
       of "bnd-slop":
         cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
@@ -586,9 +598,13 @@ proc runMergeCli(rawArgs: seq[string]) =
       case p.key
       of "min-overlap":
         cfg.threshold = parseFloatOpt(nextVal(p, "min-overlap"), "min-overlap")
+        if cfg.threshold <= 0 or cfg.threshold > 1:
+          logError("--min-overlap must be in (0, 1]"); quit(1)
         cfg.metric = mOverlap; overlapSet = true
       of "min-jaccard":
         cfg.threshold = parseFloatOpt(nextVal(p, "min-jaccard"), "min-jaccard")
+        if cfg.threshold <= 0 or cfg.threshold > 1:
+          logError("--min-jaccard must be in (0, 1]"); quit(1)
         cfg.metric = mJaccard; jaccardSet = true
       of "bnd-slop":
         cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")

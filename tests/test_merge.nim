@@ -4,7 +4,7 @@
 ##   nim c --hints:off -r tests/test_merge.nim
 echo "--------------- Test Merge ---------------"
 
-import std/[os, osproc, sequtils, strutils, tables]
+import std/[os, osproc, strutils, tables]
 import test_utils
 
 const BinPath = "./matcha"
@@ -252,3 +252,36 @@ timed("M15", "INS cluster: sequence ALT preserved, AC=3 AN=4 with S1/S2 only"):
       doAssert r.ac == 3, "INS AC expected 3, got " & $r.ac
       doAssert r.an == 4, "INS AN expected 4, got " & $r.an
   doAssert found, "INS cluster at chr1:40000 missing from merge output"
+
+# M16 — --missing-to-ref: absent samples encoded as 0/0, counted toward AN.
+# Without the flag DEL_3000 has AN=2 (only S1 present); with the flag S2/S3
+# fill in as 0/0 → AN=6, AC unchanged at 2.
+timed("M16", "--missing-to-ref: absent samples become 0/0 and count toward AN"):
+  let (_, rows, code) = mergeRun("--missing-to-ref")
+  doAssert code == 0
+  var sawDel3000, sawDup9000, sawInv28000, sawDel1000 = false
+  for r in rows:
+    case r.pos
+    of 1000:
+      # All 3 samples present already — flag should not change anything.
+      sawDel1000 = true
+      doAssert r.ac == 3 and r.an == 6, "DEL_1000 AC=" & $r.ac & " AN=" & $r.an
+      doAssert r.gts == @["0/1", "1/1", "0/0"], "DEL_1000 GTs=" & r.gts.join(",")
+    of 3000:
+      sawDel3000 = true
+      doAssert r.ac == 2, "DEL_3000 AC=" & $r.ac
+      doAssert r.an == 6, "DEL_3000 AN=" & $r.an
+      doAssert r.gts == @["1/1", "0/0", "0/0"], "DEL_3000 GTs=" & r.gts.join(",")
+    of 9000:
+      sawDup9000 = true
+      doAssert r.ac == 1, "DUP_9000 AC=" & $r.ac
+      doAssert r.an == 6, "DUP_9000 AN=" & $r.an
+      doAssert r.gts == @["0/1", "0/0", "0/0"], "DUP_9000 GTs=" & r.gts.join(",")
+    of 28000:
+      sawInv28000 = true
+      doAssert r.ac == 1, "INV_28000 AC=" & $r.ac
+      doAssert r.an == 6, "INV_28000 AN=" & $r.an
+      doAssert r.gts == @["0/0", "0/0", "0/1"], "INV_28000 GTs=" & r.gts.join(",")
+    else: discard
+  doAssert sawDel1000 and sawDel3000 and sawDup9000 and sawInv28000,
+           "expected to see DEL_1000, DEL_3000, DUP_9000 and INV_28000 rows"

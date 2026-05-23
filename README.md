@@ -1,27 +1,17 @@
 # sv-matcha
 
-Compiled, efficient structural variant (SV) matching and annotation tool written in Nim using hts-nim.
+Compiled, efficient structural variant (SV) matching and annotation tool written in Nim using [hts-nim](https://github.com/brentp/hts-nim) and [htslib](https://github.com/samtools/htslib).
 
 ## Modes
 
-| Mode | Status |
-|---|---|
-| `matcha match` — pairwise matching between two SV callsets | complete |
-| `matcha anno` — annotate a query callset from a population database VCF | complete |
-| `matcha collapse` — cluster SVs from multiple callers within one sample, emit one representative per cluster | complete |
-| `matcha merge` — merge SVs across samples into a cohort pVCF | complete |
+| Mode | Description | Typical usage |
+|---|---|---|
+| [`matcha match`](#matcha-match) | Pairwise matching between two SV callsets; emits a TSV of matched pairs | `matcha match truth.vcf.gz calls.vcf.gz > pairs.tsv` |
+| [`matcha anno`](#matcha-anno) | Annotate a query callset with INFO fields from a population database VCF | `matcha anno -a AF=max(AF) calls.bcf gnomad-sv.bcf -o annotated.bcf` |
+| [`matcha collapse`](#matcha-collapse) | Cluster SVs from multiple callers run on one sample; emit one representative per cluster | `matcha collapse Delly:delly.bcf Manta:manta.bcf CNVnator:cnvnator.bcf -o sample.bcf` |
+| [`matcha merge`](#matcha-merge) | Merge per-sample SV callsets into a multi-sample cohort pVCF with AC/AN/AF | `matcha merge sample1.bcf sample2.bcf sample3.bcf -o cohort.bcf` |
 
 DEL/DUP/INV match by coordinate + size (reciprocal overlap or Jaccard). BND records match by breakend proximity. INS records match by position proximity plus size ratio. Genotypes are ignored.
-
-## Build
-
-```
-nimble build    # → ./matcha
-nimble test     # run test suite
-```
-
-Requires Nim ≥ 2.0 and hts-nim (vendored at `vendor/hts-nim/`, pinned v0.3.31).  
-Fixture regeneration: `python3 tests/generate_fixtures.py` (needs `bcftools` + `bgzip`).
 
 ---
 
@@ -34,8 +24,8 @@ matcha match [options] callsetA callsetB    # cross-callset
 matcha match --self [options] INPUT         # self-match (each pair once, no self-self)
 
 Options:
-  --min-overlap FLOAT    minimum reciprocal overlap (0.0–1.0)  ← exactly one required
-  --min-jaccard FLOAT    minimum Jaccard index (0.0–1.0)       ←
+  --min-overlap FLOAT    minimum reciprocal overlap (0.0–1.0)  ← mutually exclusive;
+  --min-jaccard FLOAT    minimum Jaccard index (0.0–1.0)       ← default --min-jaccard 0.75
   --bnd-slop INT         max breakend offset for BND matches (default: 50)
   --min-ins-sim FLOAT    minimum INS combined sim = sqrt(pos_sim·len_sim) (default: 0.75)
   --ins-slop INT         max position offset for INS matches (default: 50)
@@ -97,7 +87,7 @@ matcha anno [options] input database
 
   -a OUTFIELD=FUNC(SRCFIELD)    annotation expression (repeatable, ≥1 required)
   -o PATH                       output (.vcf | .vcf.gz | .bcf); default stdout VCF
-  --min-overlap FLOAT           (exactly one of these two is required)
+  --min-overlap FLOAT           (mutually exclusive; default: --min-jaccard 0.75)
   --min-jaccard FLOAT
   --bnd-slop INT                default 50
   --min-ins-sim FLOAT           default 0.75
@@ -137,7 +127,7 @@ Cluster equivalent SVs from N single-sample callsets (e.g. Delly + Manta + GRIDS
 ```
 matcha collapse [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
 
-  --min-overlap FLOAT          (exactly one of these two is required)
+  --min-overlap FLOAT          (mutually exclusive; default: --min-jaccard 0.75)
   --min-jaccard FLOAT
   --bnd-slop INT               default 50
   --min-ins-sim FLOAT          default 0.75
@@ -149,7 +139,7 @@ matcha collapse [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
                                ORDER is always appended as the final tiebreaker
   --format FIELDS              comma-separated FORMAT fields to carry (default: GT)
   --info FIELDS                comma-separated INFO fields to keep
-                               (default: all, post conflict resolution)
+                               (default: SVTYPE,SVLEN,END,CHR2,POS2 only)
   -o, --output PATH            output (.vcf | .vcf.gz | .bcf); default stdout VCF
   --chrs CHR[,CHR...]          restrict to listed chromosomes (filters records + header contigs)
   --threads INT                default 1
@@ -200,7 +190,7 @@ cohort INFO (AC/AN/AF) computed from the assembled GTs.
 ```
 matcha merge [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
 
-  --min-overlap FLOAT           (exactly one of these two is required)
+  --min-overlap FLOAT           (mutually exclusive; default: --min-jaccard 0.75)
   --min-jaccard FLOAT
   --bnd-slop INT                default 50
   --min-ins-sim FLOAT           default 0.75
@@ -251,8 +241,33 @@ matcha merge [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
 
 ---
 
+## Build
+
+```
+nimble build    # → ./matcha
+nimble test     # run test suite
+```
+
+Requires Nim ≥ 2.0 and hts-nim (vendored at `vendor/hts-nim/`, pinned v0.3.31), which links against htslib ≥ 1.10.  
+Fixture regeneration: `python3 tests/generate_fixtures.py` (needs `bcftools` + `bgzip`).
+
+### Providing htslib ≥ 1.10
+
+`hts-nim` links against the system `libhts.so` at runtime. Pick whichever route fits your environment:
+
+- **conda/mamba**: `mamba install -c bioconda 'htslib>=1.10'` — gets you a recent build (`libhts.so` lands in `$CONDA_PREFIX/lib`).
+- **Debian/Ubuntu**: `apt install libhts-dev` — check the version with `apt-cache policy libhts-dev`; Ubuntu ≥ 22.04 ships ≥ 1.13. Older releases need a backport or source build.
+- **macOS**: `brew install htslib`.
+- **From source**: clone `https://github.com/samtools/htslib`, check out a `1.x` tag (≥ 1.10), then `autoreconf -i && ./configure && make && sudo make install`.
+
+If `libhts.so` is not on the default loader path, point to it at runtime with `LD_LIBRARY_PATH=/path/to/htslib/lib ./matcha …`. Confirm which library is being picked up with `ldd ./matcha | grep hts` (Linux) or `otool -L ./matcha | grep hts` (macOS).
+
 ## Dependencies
 
 - [hts-nim](vendor/hts-nim/) — VCF/BCF I/O (vendored, pinned v0.3.31)
 - `bcftools` — fixture generation only
 - Nim ≥ 2.0 standard library
+
+## Citations
+
+> Brent S Pedersen, Aaron R Quinlan. **hts-nim: scripting high-performance genomic analyses.** *Bioinformatics*, Volume 34, Issue 19, October 2018, Pages 3387–3389. <https://doi.org/10.1093/bioinformatics/bty358>

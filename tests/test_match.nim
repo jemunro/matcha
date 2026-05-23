@@ -467,3 +467,29 @@ timed("I06", "INS pair outside slop window not emitted"):
     if row.len >= 8:
       doAssert not (row[2] == "INS_A_30_seq" and row[5] == "INS_B_35_outside"),
         "INS pair beyond slop window should not be emitted"
+
+# X01 — --chrs filter restricts processing to listed chromosomes.
+# fixtureA/B carry rows on chr1, chr2, chrX. Filtering to chr2 must keep only
+# chr2 rows and drop chr1/chrX rows that would otherwise appear.
+timed("X01", "--chrs chr2 restricts output to chr2 only"):
+  let (outpAll, codeAll) =
+    run("match --min-overlap 0.5 " & FixtureA & " " & FixtureB)
+  doAssert codeAll == 0
+  var sawChr1Full, sawChrXFull = false
+  for row in parseTsv(outpAll):
+    if row.len >= 8:
+      if row[0] == "chr1": sawChr1Full = true
+      if row[0] == "chrX": sawChrXFull = true
+  doAssert sawChr1Full and sawChrXFull,
+    "baseline expected chr1 and chrX rows in unfiltered match output"
+
+  let (outp, code) =
+    run("match --min-overlap 0.5 --chrs chr2 " & FixtureA & " " & FixtureB)
+  doAssert code == 0, "exit " & $code & ": " & outp
+  var anyChr2 = false
+  for row in parseTsv(outp):
+    if row.len >= 8:
+      doAssert row[0] == "chr2",
+        "--chrs chr2 leaked non-chr2 row: " & row.join("\t")
+      anyChr2 = true
+  doAssert anyChr2, "--chrs chr2 produced no rows; expected at least one chr2 match"

@@ -32,13 +32,12 @@ proc viewBcf(path: string): string =
 type ColRecord = object
   chrom, id, filter, alt: string
   pos:                    int
-  source, sourceList:     string
-  nSource, nMerged:       int
+  caller, callers:        string
+  nCallers, nMerged:      int
 
 proc parseCollapsed(vcfText: string): seq[ColRecord] =
   ## Collapse emits CALLERS (Number=. comma-list, representative-first) +
-  ## N_CALLERS + N_MERGED. Map them to the legacy `source`/`sourceList`/
-  ## `nSource` field names the tests below were written against.
+  ## N_CALLERS + N_MERGED.
   for line in vcfText.splitLines:
     if line.len == 0 or line[0] == '#': continue
     let cols = line.split('\t')
@@ -55,10 +54,10 @@ proc parseCollapsed(vcfText: string): seq[ColRecord] =
       if kv.len != 2: continue
       case kv[0]
       of "CALLERS":
-        rec.sourceList = kv[1]
+        rec.callers = kv[1]
         let first = kv[1].split(',')
-        if first.len > 0: rec.source = first[0]
-      of "N_CALLERS": rec.nSource = parseInt(kv[1])
+        if first.len > 0: rec.caller = first[0]
+      of "N_CALLERS": rec.nCallers = parseInt(kv[1])
       of "N_MERGED":  rec.nMerged = parseInt(kv[1])
     result.add(rec)
 
@@ -105,7 +104,7 @@ timed("C04", "PASS priority: Caller2 DEL_M_02 preferred over LowQual DEL_D_02"):
   doAssert code == 0
   var found = false
   for r in recs:
-    if r.pos == 3100 and r.source == "Caller2":
+    if r.pos == 3100 and r.caller == "Caller2":
       doAssert r.id == "DEL_M_02", "expected DEL_M_02, got " & r.id
       doAssert r.filter == "PASS", "expected PASS, got " & r.filter
       found = true
@@ -118,39 +117,39 @@ timed("C05", "ORDER tiebreak: Caller1 DEL_D_01 preferred over Caller2 DEL_M_01")
   var found = false
   for r in recs:
     if r.pos == 1000 and r.nMerged == 2:
-      doAssert r.source == "Caller1", "expected source=Caller1, got " & r.source
+      doAssert r.caller == "Caller1", "expected caller=Caller1, got " & r.caller
       doAssert r.id == "DEL_D_01", "expected DEL_D_01, got " & r.id
       found = true
   doAssert found, "no merged record at pos 1000"
 
 # C06 — singletons preserved: DEL_D_03 and DEL_M_03 both appear
-timed("C06", "singletons preserved with N_MERGED=1 and N_SOURCE=1"):
+timed("C06", "singletons preserved with N_MERGED=1 and N_CALLERS=1"):
   let (recs, code) = collapseRun()
   doAssert code == 0
   var d03, m03: bool
   for r in recs:
     if r.id == "DEL_D_03":
       doAssert r.nMerged == 1, "DEL_D_03 nMerged=" & $r.nMerged
-      doAssert r.nSource == 1, "DEL_D_03 nSource=" & $r.nSource
-      doAssert r.sourceList == "Caller1", "DEL_D_03 sourceList=" & r.sourceList
+      doAssert r.nCallers == 1, "DEL_D_03 nCallers=" & $r.nCallers
+      doAssert r.callers == "Caller1", "DEL_D_03 callers=" & r.callers
       d03 = true
     elif r.id == "DEL_M_03":
       doAssert r.nMerged == 1, "DEL_M_03 nMerged=" & $r.nMerged
-      doAssert r.nSource == 1, "DEL_M_03 nSource=" & $r.nSource
-      doAssert r.sourceList == "Caller2", "DEL_M_03 sourceList=" & r.sourceList
+      doAssert r.nCallers == 1, "DEL_M_03 nCallers=" & $r.nCallers
+      doAssert r.callers == "Caller2", "DEL_M_03 callers=" & r.callers
       m03 = true
   doAssert d03, "DEL_D_03 singleton not found"
   doAssert m03, "DEL_M_03 singleton not found"
 
-# C07 — merged records carry N_MERGED=2 and N_SOURCE=2
-timed("C07", "merged records: N_MERGED=2, N_SOURCE=2, SOURCELIST contains both"):
+# C07 — merged records carry N_MERGED=2 and N_CALLERS=2
+timed("C07", "merged records: N_MERGED=2, N_CALLERS=2, CALLERS contains both"):
   let (recs, code) = collapseRun()
   doAssert code == 0
   for r in recs:
     if r.nMerged == 2:
-      doAssert r.nSource == 2, r.id & " nSource=" & $r.nSource
-      doAssert "Caller1" in r.sourceList and "Caller2" in r.sourceList,
-               r.id & " sourceList=" & r.sourceList
+      doAssert r.nCallers == 2, r.id & " nCallers=" & $r.nCallers
+      doAssert "Caller1" in r.callers and "Caller2" in r.callers,
+               r.id & " callers=" & r.callers
 
 # C08 — DUP cluster: Caller1 wins (ORDER), N_MERGED=2
 timed("C08", "DUP cluster: DUP_D_01 selected by ORDER, N_MERGED=2"):
@@ -159,7 +158,7 @@ timed("C08", "DUP cluster: DUP_D_01 selected by ORDER, N_MERGED=2"):
   var found = false
   for r in recs:
     if r.id == "DUP_D_01":
-      doAssert r.source == "Caller1"
+      doAssert r.caller == "Caller1"
       doAssert r.nMerged == 2
       found = true
   doAssert found, "DUP_D_01 not found in output"
@@ -316,7 +315,7 @@ timed("CT05", "3-caller run: streaming across 3 readers produces sensible counts
   doAssert recs.len > 0, "no records in 3-caller output"
   var sawCaller1b: bool
   for r in recs:
-    if "Caller1b" in r.sourceList: sawCaller1b = true
+    if "Caller1b" in r.callers: sawCaller1b = true
   doAssert sawCaller1b, "Caller1b (third caller) absent from any cluster SOURCELIST"
 
 # CI01 — INS cluster: INS_D_01 and INS_M_01 share pos and sequence ALT →
