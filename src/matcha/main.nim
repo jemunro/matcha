@@ -6,6 +6,11 @@ import utils, match, anno, collapse, merge, mergecore, preproc, log
 
 const VERSION = MatchaVersion
 
+# Embedded at compile time so the release binary is self-contained for
+# distribution. Paths are relative to this source file.
+const matchaLicense = staticRead("../../LICENSE")
+const htsNimLicense = staticRead("../../vendor/hts-nim/LICENSE")
+
 const ShortNoVal = {'h', 'v'}
 
 proc nextVal(p: var OptParser; flag: string): string =
@@ -42,6 +47,7 @@ proc usage(code: int = 1) =
   f.writeLine ""
   f.writeLine "Flags:"
   f.writeLine "  --version       show version"
+  f.writeLine "  --license       show license information"
   f.writeLine "  -v, --verbose   verbose logging to stderr"
   f.writeLine "  -h, --help      show this help"
   f.writeLine ""
@@ -693,6 +699,13 @@ proc mainEntry*() =
     runMergeCli(args[1 .. ^1])
   of "--version":
     echo "matcha v" & VERSION
+  of "--license":
+    echo "=== matcha ==="
+    echo ""
+    echo matchaLicense
+    echo "=== hts-nim ==="
+    echo ""
+    echo htsNimLicense
   of "--help", "-h":
     usage(0)
   else:
