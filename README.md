@@ -122,6 +122,8 @@ Options:
   --chrs CHR[,CHR...]    restrict to listed chromosomes (filters records; no header change for TSV output)
   --threads INT          worker threads (default: 1)
   --tmp-dir PATH         temp directory (default: system temp)
+  --use-shm              write slim BCF temp files to /dev/shm (RAM); faster when
+                         $TMPDIR is on a network filesystem; risks OOM for large inputs
   --output PATH          output file (default: stdout)
   -v, --verbose          verbose logging to stderr
   -h, --help
@@ -167,6 +169,8 @@ matcha anno [options] input database
   --chrs CHR[,CHR...]           restrict to listed chromosomes (filters records + header contigs)
   --threads INT                 default 1
   --tmp-dir PATH
+  --use-shm                     write slim BCF temp files to /dev/shm (RAM); faster when
+                                $TMPDIR is on a network filesystem; risks OOM for large inputs
   -v, --verbose
   -h, --help
 ```
@@ -205,7 +209,8 @@ matcha collapse [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
   --bnd-slop INT               default 50
   --min-ins-sim FLOAT          default 0.75
   --ins-slop INT               default 50
-  --linkage average|single|complete   agglomerative linkage (default: average)
+  --linkage MODE               agglomerative clustering linkage (default: average)
+                               one of: average, single, complete
   --priority CRITERIA          comma-separated tiebreak cascade for representative
                                selection: PASS, QUAL, CENTRE, ORDER
                                default: PASS,CENTRE,ORDER
@@ -217,6 +222,8 @@ matcha collapse [options] [Name:]callset1.bcf [Name:]callset2.bcf ...
   --chrs CHR[,CHR...]          restrict to listed chromosomes (filters records + header contigs)
   --threads INT                default 1
   --tmp-dir PATH
+  --use-shm                    write slim BCF temp files to /dev/shm (RAM); faster when
+                               $TMPDIR is on a network filesystem; risks OOM for large inputs
   -v, --verbose
   -h, --help
 ```
@@ -272,7 +279,8 @@ matcha merge [options] callset1.bcf callset2.bcf ...
   --bnd-slop INT                default 50
   --min-ins-sim FLOAT           default 0.75
   --ins-slop INT                default 50
-  --linkage average|single|complete   agglomerative linkage (default: average)
+  --linkage MODE                agglomerative clustering linkage (default: average)
+                                one of: average, single, complete
   --priority CRITERIA           tiebreak cascade for representative selection
                                 default: PASS,CENTRE,ORDER
   --format FIELDS               comma-separated FORMAT fields to carry per sample
@@ -284,6 +292,8 @@ matcha merge [options] callset1.bcf callset2.bcf ...
   --missing-to-ref              treat absent samples as 0/0 (count toward AN; like bcftools merge)
   --threads INT                 default 1
   --tmp-dir PATH
+  --use-shm                     write slim BCF temp files to /dev/shm (RAM); faster when
+                                $TMPDIR is on a network filesystem; risks OOM for large inputs
   -v, --verbose
   -h, --help
 ```

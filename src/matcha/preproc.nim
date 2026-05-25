@@ -443,6 +443,19 @@ proc makeRunTmpDir*(parent: string): string =
   result = createTempDir("matcha_", "", parent)
   logInfo("tmp dir: " & result)
 
+proc makeShmRunTmpDir*(): string =
+  ## Try to create the run tmp dir in /dev/shm (RAM-backed tmpfs).
+  ## Falls back to getTempDir() with a warning if /dev/shm is unavailable.
+  logWarn("--use-shm: slim BCF temp files will be written to RAM (/dev/shm). " &
+          "Large inputs may exhaust memory and kill the process.")
+  const shmRoot = "/dev/shm"
+  try:
+    result = makeRunTmpDir(shmRoot)
+  except CatchableError:
+    logWarn("--use-shm: failed to create dir in /dev/shm (" &
+            getCurrentExceptionMsg() & "); falling back to " & getTempDir())
+    result = makeRunTmpDir(getTempDir())
+
 proc hrecToLine(h: ptr bcf_hrec_t): string =
   let keys = cast[ptr UncheckedArray[cstring]](h.keys)
   let vals = cast[ptr UncheckedArray[cstring]](h.vals)

@@ -33,6 +33,174 @@ proc parseIntOpt(v, flag: string): int =
   except ValueError:
     logError("--" & flag & " must be an integer, got: " & v); quit(1)
 
+# Shared CLI state for the flags that are identical across all subcommands.
+type SharedOpts = object
+  metric:    Metric
+  threshold: float64
+  bndSlop, insSlop, nThreads: int
+  insMinSim: float64
+  tmpDir:    string
+  keptChrs:  seq[string]
+  overlapSet, jaccardSet, useShm: bool
+
+proc initSharedOpts(): SharedOpts =
+  SharedOpts(metric: mJaccard, threshold: 0.75,
+             bndSlop: 50, insSlop: 50, insMinSim: 0.75, nThreads: 1)
+
+proc parseSharedOpt(s: var SharedOpts, p: var OptParser, key: string): bool =
+  result = true
+  case key
+  of "min-overlap":
+    s.threshold = parseFloatOpt(nextVal(p, "min-overlap"), "min-overlap")
+    if s.threshold <= 0 or s.threshold > 1:
+      logError("--min-overlap must be in (0, 1]"); quit(1)
+    s.metric = mOverlap; s.overlapSet = true
+  of "min-jaccard":
+    s.threshold = parseFloatOpt(nextVal(p, "min-jaccard"), "min-jaccard")
+    if s.threshold <= 0 or s.threshold > 1:
+      logError("--min-jaccard must be in (0, 1]"); quit(1)
+    s.metric = mJaccard; s.jaccardSet = true
+  of "bnd-slop":
+    s.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
+    if s.bndSlop <= 0:
+      logError("--bnd-slop must be > 0"); quit(1)
+  of "ins-slop":
+    s.insSlop = parseIntOpt(nextVal(p, "ins-slop"), "ins-slop")
+    if s.insSlop <= 0:
+      logError("--ins-slop must be > 0"); quit(1)
+  of "min-ins-sim":
+    s.insMinSim = parseFloatOpt(nextVal(p, "min-ins-sim"), "min-ins-sim")
+    if s.insMinSim <= 0 or s.insMinSim > 1:
+      logError("--min-ins-sim must be in (0, 1]"); quit(1)
+  of "threads":
+    s.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
+    if s.nThreads < 1:
+      logError("--threads must be >= 1"); quit(1)
+  of "tmp-dir":
+    s.tmpDir = nextVal(p, "tmp-dir")
+  of "use-shm":
+    s.useShm = true
+  of "chrs":
+    s.keptChrs = parseChrsArg(nextVal(p, "chrs"))
+  of "v", "verbose":
+    setVerbose(true)
+  else:
+    result = false
+
+proc resolveTmpDir(explicit: string, useShm: bool): string =
+  if explicit != "":
+    if useShm: logWarn("--use-shm ignored because --tmp-dir was also given")
+    makeRunTmpDir(explicit)
+  elif useShm:
+    makeShmRunTmpDir()
+  else:
+    makeRunTmpDir(getTempDir())
+
+template applySharedOpts(s: SharedOpts, cfg: typed) =
+  cfg.metric    = s.metric
+  cfg.threshold = s.threshold
+  cfg.bndSlop   = s.bndSlop
+  cfg.insSlop   = s.insSlop
+  cfg.insMinSim = s.insMinSim
+  cfg.nThreads  = s.nThreads
+  cfg.keptChrs  = s.keptChrs
+  cfg.tmpDir    = resolveTmpDir(s.tmpDir, s.useShm)
+
+# Cluster CLI state for the flags shared between collapse and merge.
+type ClusterOpts = object
+  linkage:      LinkageMethod
+  priority:     seq[PriorityCriterion]
+  formatFields: seq[string]
+  infoFields:   seq[string]
+  outputPath:   string
+
+proc initClusterOpts(): ClusterOpts =
+  ClusterOpts(linkage: lmAverage,
+              priority: @[pcPass, pcCentre, pcOrder],
+              formatFields: @["GT"])
+
+proc parsePriority(s: string): seq[PriorityCriterion] =
+  for tok in s.split(','):
+    case tok.strip.toUpperAscii
+    of "PASS":   result.add(pcPass)
+    of "QUAL":   result.add(pcQual)
+    of "CENTRE", "CENTER": result.add(pcCentre)
+    of "ORDER":  result.add(pcOrder)
+    else:
+      logError("unknown priority criterion '" & tok & "' — valid values: PASS, QUAL, CENTRE, ORDER")
+      quit(1)
+  # ORDER is always the final tiebreaker; append if not already last.
+  if result.len == 0 or result[^1] != pcOrder:
+    result.add(pcOrder)
+
+proc parseClusterOpt(c: var ClusterOpts, p: var OptParser, key: string): bool =
+  result = true
+  case key
+  of "linkage":
+    let v = nextVal(p, "linkage").toLowerAscii
+    case v
+    of "average":  c.linkage = lmAverage
+    of "single":   c.linkage = lmSingle
+    of "complete": c.linkage = lmComplete
+    else:
+      logError("--linkage must be average, single, or complete")
+      quit(1)
+  of "priority":
+    c.priority = parsePriority(nextVal(p, "priority"))
+  of "format":
+    c.formatFields = nextVal(p, "format").split(',').mapIt(it.strip)
+  of "info":
+    c.infoFields = nextVal(p, "info").split(',').mapIt(it.strip)
+  of "o", "output":
+    c.outputPath = nextVal(p, "o")
+  else:
+    result = false
+
+template applyClusterOpts(c: ClusterOpts, cfg: typed) =
+  cfg.linkage      = c.linkage
+  cfg.priority     = c.priority
+  cfg.formatFields = c.formatFields
+  cfg.infoFields   = c.infoFields
+  cfg.outputPath   = c.outputPath
+
+# Column width 34: option text padded to 34 chars before the description.
+proc writeMetricUsageLines(f: File) =
+  f.writeLine "  --min-overlap FLOAT             minimum reciprocal overlap (0.0-1.0)"
+  f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
+  f.writeLine "  --bnd-slop INT                  max breakend offset for BND (default: 50)"
+  f.writeLine "  --min-ins-sim FLOAT             minimum INS combined sim = sqrt(pos*len) (default: 0.75)"
+  f.writeLine "  --ins-slop INT                  max position offset for INS (default: 50)"
+
+proc writePreprocUsageLines(f: File) =
+  f.writeLine "  --chrs CHR[,CHR...]             restrict to listed chromosomes (filters records + headers)"
+  f.writeLine "  --threads INT                   number of worker threads (default: 1)"
+  f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
+  f.writeLine "  --use-shm                       write temp BCFs to /dev/shm (RAM); faster if $TMPDIR"
+  f.writeLine "                                  is on a network filesystem; risks OOM for large inputs"
+
+proc writeVerboseHelpLines(f: File, helpDesc = "show this help") =
+  f.writeLine "  -v, --verbose                   verbose logging to stderr"
+  f.writeLine "  -h, --help                      " & helpDesc
+
+proc writeClusterUsageLines(f: File,
+                            priorityDefault: string,
+                            includeOrderNote: bool,
+                            formatDefault: string,
+                            infoFirstLine: string,
+                            infoDefault: string) =
+  f.writeLine "  --linkage MODE                  agglomerative clustering linkage (default: average)"
+  f.writeLine "                                  one of: average, single, complete"
+  f.writeLine "  --priority CRITERIA             comma-separated: PASS,QUAL,CENTRE,ORDER"
+  f.writeLine "                                  default: " & priorityDefault
+  if includeOrderNote:
+    f.writeLine "                                  ORDER is always appended as final tiebreaker"
+  f.writeLine "  --format FIELDS                 comma-separated FORMAT fields to carry"
+  f.writeLine "                                  default: " & formatDefault
+  f.writeLine "  --info FIELDS                   " & infoFirstLine
+  f.writeLine "                                  default: " & infoDefault
+  f.writeLine "  -o, --output PATH               output file (.vcf | .vcf.gz | .bcf)"
+  f.writeLine "                                  default: uncompressed VCF to stdout"
+
 proc usage(code: int = 1) =
   let f = if code == 0: stdout else: stderr
   f.writeLine "matcha v" & VERSION
@@ -63,20 +231,13 @@ proc matchUsage(code: int = 1) =
   f.writeLine "Inputs may be VCF.gz (.vcf.gz) or BCF (.bcf); format is detected automatically."
   f.writeLine ""
   f.writeLine "Options:"
-  f.writeLine "  --min-overlap FLOAT             minimum reciprocal overlap (0.0-1.0)"
-  f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
-  f.writeLine "  --bnd-slop INT                  max breakend offset for BND matches (default: 50)"
-  f.writeLine "  --min-ins-sim FLOAT             minimum INS combined sim = sqrt(pos*len) (default: 0.75)"
-  f.writeLine "  --ins-slop INT                  max position offset for INS matches (default: 50)"
+  writeMetricUsageLines(f)
   f.writeLine "  --self                          match a single input against itself"
   f.writeLine "                                  (each pair emitted once; no self-self)"
   f.writeLine "  --info FIELDS                   comma-separated INFO fields to add as INFO_A/INFO_B columns"
-  f.writeLine "  --chrs CHR[,CHR...]             restrict to listed chromosomes (filters records + headers)"
-  f.writeLine "  --threads INT                   number of worker threads (default: 1)"
-  f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
+  writePreprocUsageLines(f)
   f.writeLine "  --output PATH                   output file (default: stdout)"
-  f.writeLine "  -v, --verbose                   verbose logging to stderr"
-  f.writeLine "  -h, --help                      show this help"
+  writeVerboseHelpLines(f)
   f.writeLine ""
   f.writeLine "Default metric: --min-jaccard 0.75. Specify --min-overlap or --min-jaccard to override."
   f.writeLine "BND rows use --bnd-slop independently."
@@ -90,58 +251,23 @@ proc matchUsage(code: int = 1) =
 
 proc runMatch(rawArgs: seq[string]) =
   if rawArgs.len == 0: matchUsage(0)
-  var cfg = MatchConfig(nThreads: 1, bndSlop: 50, insSlop: 50,
-                        insMinSim: 0.75, metric: mJaccard, threshold: 0.75)
+  var cfg = MatchConfig()
+  var s = initSharedOpts()
   var positionals: seq[string]
-  # Track which metric flag(s) were supplied so we can enforce the xor rule
-  # after parsing. The cfg.metric / cfg.threshold fields don't carry "unset"
-  # state on their own.
-  var overlapSet, jaccardSet: bool
   var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
   while true:
     p.next()
     case p.kind
     of cmdEnd: break
     of cmdShortOption, cmdLongOption:
+      if parseSharedOpt(s, p, p.key): continue
       case p.key
-      of "min-overlap":
-        cfg.threshold = parseFloatOpt(nextVal(p, "min-overlap"), "min-overlap")
-        if cfg.threshold <= 0 or cfg.threshold > 1:
-          logError("--min-overlap must be in (0, 1]"); quit(1)
-        cfg.metric = mOverlap; overlapSet = true
-      of "min-jaccard":
-        cfg.threshold = parseFloatOpt(nextVal(p, "min-jaccard"), "min-jaccard")
-        if cfg.threshold <= 0 or cfg.threshold > 1:
-          logError("--min-jaccard must be in (0, 1]"); quit(1)
-        cfg.metric = mJaccard; jaccardSet = true
-      of "bnd-slop":
-        cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
-        if cfg.bndSlop <= 0:
-          logError("--bnd-slop must be > 0"); quit(1)
-      of "ins-slop":
-        cfg.insSlop = parseIntOpt(nextVal(p, "ins-slop"), "ins-slop")
-        if cfg.insSlop <= 0:
-          logError("--ins-slop must be > 0"); quit(1)
-      of "min-ins-sim":
-        cfg.insMinSim = parseFloatOpt(nextVal(p, "min-ins-sim"), "min-ins-sim")
-        if cfg.insMinSim <= 0 or cfg.insMinSim > 1:
-          logError("--min-ins-sim must be in (0, 1]"); quit(1)
-      of "threads":
-        cfg.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
-        if cfg.nThreads < 1:
-          logError("--threads must be >= 1"); quit(1)
-      of "tmp-dir":
-        cfg.tmpDir = nextVal(p, "tmp-dir")
       of "output":
         cfg.outputPath = nextVal(p, "output")
       of "info":
         cfg.infoFields = nextVal(p, "info").split(',').mapIt(it.strip)
-      of "chrs":
-        cfg.keptChrs = parseChrsArg(nextVal(p, "chrs"))
       of "self":
         cfg.selfMode = true
-      of "v", "verbose":
-        setVerbose(true)
       of "h", "help":
         matchUsage(0)
       else:
@@ -150,7 +276,7 @@ proc runMatch(rawArgs: seq[string]) =
     of cmdArgument:
       positionals.add(p.key)
 
-  if overlapSet and jaccardSet:
+  if s.overlapSet and s.jaccardSet:
     logError("--min-overlap and --min-jaccard are mutually exclusive")
     matchUsage()
   let expected = if cfg.selfMode: 1 else: 2
@@ -170,10 +296,7 @@ proc runMatch(rawArgs: seq[string]) =
     logError("input file not found: " & cfg.callsetB)
     quit(1)
 
-  if cfg.tmpDir == "":
-    cfg.tmpDir = getTempDir()
-  cfg.tmpDir = makeRunTmpDir(cfg.tmpDir)
-
+  applySharedOpts(s, cfg)
   runMatch(cfg)
 
 proc annoUsage(code: int = 1) =
@@ -188,17 +311,10 @@ proc annoUsage(code: int = 1) =
   f.writeLine "Options:"
   f.writeLine "  -a OUTFIELD=FUNC(SRCFIELD)      annotation expression (repeatable, >=1 required)"
   f.writeLine "  -o PATH                         output (.vcf | .vcf.gz | .bcf); default stdout VCF"
-  f.writeLine "  --min-overlap FLOAT             minimum reciprocal overlap (0.0-1.0)"
-  f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
-  f.writeLine "  --bnd-slop INT                  max breakend offset for BND matches (default: 50)"
-  f.writeLine "  --min-ins-sim FLOAT             minimum INS combined sim = sqrt(pos*len) (default: 0.75)"
-  f.writeLine "  --ins-slop INT                  max position offset for INS matches (default: 50)"
+  writeMetricUsageLines(f)
   f.writeLine "  --overwrite                     replace OUTFIELDs already in input header"
-  f.writeLine "  --chrs CHR[,CHR...]             restrict to listed chromosomes (filters records + headers)"
-  f.writeLine "  --threads INT                   number of worker threads (default: 1)"
-  f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
-  f.writeLine "  -v, --verbose                   verbose logging to stderr"
-  f.writeLine "  -h, --help                      show full help (functions, MATCHA_* variables)"
+  writePreprocUsageLines(f)
+  writeVerboseHelpLines(f, "show full help (functions, MATCHA_* variables)")
   f.writeLine ""
   f.writeLine "Default metric: --min-jaccard 0.75. Specify --min-overlap or --min-jaccard to override."
   f.writeLine ""
@@ -230,17 +346,10 @@ proc annoHelp() =
   f.writeLine "                                    .vcf.gz  → bgzipped VCF (+ .csi index)"
   f.writeLine "                                    .bcf     → BCF (+ .csi index)"
   f.writeLine "                                  Default: uncompressed VCF to stdout."
-  f.writeLine "  --min-overlap FLOAT             minimum reciprocal overlap (0.0-1.0)"
-  f.writeLine "  --min-jaccard FLOAT             minimum Jaccard index (0.0-1.0)"
-  f.writeLine "  --bnd-slop INT                  max breakend offset for BND matches (default: 50)"
-  f.writeLine "  --min-ins-sim FLOAT             minimum INS combined sim = sqrt(pos*len) (default: 0.75)"
-  f.writeLine "  --ins-slop INT                  max position offset for INS matches (default: 50)"
+  writeMetricUsageLines(f)
   f.writeLine "  --overwrite                     replace OUTFIELDs that already exist in input header"
-  f.writeLine "  --chrs CHR[,CHR...]             restrict to listed chromosomes (filters records + headers)"
-  f.writeLine "  --threads INT                   number of worker threads (default: 1)"
-  f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
-  f.writeLine "  -v, --verbose                   verbose logging to stderr"
-  f.writeLine "  -h, --help                      show this help"
+  writePreprocUsageLines(f)
+  writeVerboseHelpLines(f)
   f.writeLine ""
   f.writeLine "Default metric: --min-jaccard 0.75. Specify --min-overlap or --min-jaccard to override."
   f.writeLine ""
@@ -293,16 +402,16 @@ proc annoHelp() =
 
 proc runAnnoCli(rawArgs: seq[string]) =
   if rawArgs.len == 0: annoUsage(0)
-  var cfg = AnnoConfig(nThreads: 1, bndSlop: 50, insSlop: 50,
-                       insMinSim: 0.75, metric: mJaccard, threshold: 0.75)
+  var cfg = AnnoConfig()
+  var s = initSharedOpts()
   var positionals: seq[string]
-  var overlapSet, jaccardSet: bool
   var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
   while true:
     p.next()
     case p.kind
     of cmdEnd: break
     of cmdShortOption, cmdLongOption:
+      if parseSharedOpt(s, p, p.key): continue
       case p.key
       of "a":
         let raw = nextVal(p, "a")
@@ -313,40 +422,8 @@ proc runAnnoCli(rawArgs: seq[string]) =
           quit(1)
       of "o", "output":
         cfg.outputPath = nextVal(p, "o")
-      of "min-overlap":
-        cfg.threshold = parseFloatOpt(nextVal(p, "min-overlap"), "min-overlap")
-        if cfg.threshold <= 0 or cfg.threshold > 1:
-          logError("--min-overlap must be in (0, 1]"); quit(1)
-        cfg.metric = mOverlap; overlapSet = true
-      of "min-jaccard":
-        cfg.threshold = parseFloatOpt(nextVal(p, "min-jaccard"), "min-jaccard")
-        if cfg.threshold <= 0 or cfg.threshold > 1:
-          logError("--min-jaccard must be in (0, 1]"); quit(1)
-        cfg.metric = mJaccard; jaccardSet = true
-      of "bnd-slop":
-        cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
-        if cfg.bndSlop <= 0:
-          logError("--bnd-slop must be > 0"); quit(1)
-      of "ins-slop":
-        cfg.insSlop = parseIntOpt(nextVal(p, "ins-slop"), "ins-slop")
-        if cfg.insSlop <= 0:
-          logError("--ins-slop must be > 0"); quit(1)
-      of "min-ins-sim":
-        cfg.insMinSim = parseFloatOpt(nextVal(p, "min-ins-sim"), "min-ins-sim")
-        if cfg.insMinSim <= 0 or cfg.insMinSim > 1:
-          logError("--min-ins-sim must be in (0, 1]"); quit(1)
       of "overwrite":
         cfg.overwrite = true
-      of "threads":
-        cfg.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
-        if cfg.nThreads < 1:
-          logError("--threads must be >= 1"); quit(1)
-      of "tmp-dir":
-        cfg.tmpDir = nextVal(p, "tmp-dir")
-      of "chrs":
-        cfg.keptChrs = parseChrsArg(nextVal(p, "chrs"))
-      of "v", "verbose":
-        setVerbose(true)
       of "h", "help":
         annoHelp()
       else:
@@ -355,7 +432,7 @@ proc runAnnoCli(rawArgs: seq[string]) =
     of cmdArgument:
       positionals.add(p.key)
 
-  if overlapSet and jaccardSet:
+  if s.overlapSet and s.jaccardSet:
     logError("--min-overlap and --min-jaccard are mutually exclusive")
     annoUsage()
   if positionals.len != 2:
@@ -369,10 +446,7 @@ proc runAnnoCli(rawArgs: seq[string]) =
   if not fileExists(cfg.callsetB):
     logError("database file not found: " & cfg.callsetB)
     quit(1)
-  if cfg.tmpDir == "":
-    cfg.tmpDir = getTempDir()
-  cfg.tmpDir = makeRunTmpDir(cfg.tmpDir)
-
+  applySharedOpts(s, cfg)
   runAnno(cfg)
 
 proc collapseUsage(code: int = 1) =
@@ -384,26 +458,15 @@ proc collapseUsage(code: int = 1) =
   f.writeLine "representative record per cluster with provenance INFO fields."
   f.writeLine ""
   f.writeLine "Options:"
-  f.writeLine "  --min-overlap FLOAT           minimum reciprocal overlap (0.0-1.0)"
-  f.writeLine "  --min-jaccard FLOAT           minimum Jaccard index (0.0-1.0)"
-  f.writeLine "  --bnd-slop INT                max breakend offset for BND (default: 50)"
-  f.writeLine "  --min-ins-sim FLOAT           minimum INS combined sim = sqrt(pos*len) (default: 0.75)"
-  f.writeLine "  --ins-slop INT                max position offset for INS matches (default: 50)"
-  f.writeLine "  --linkage average|single|complete  agglomerative linkage (default: average)"
-  f.writeLine "  --priority CRITERIA           comma-separated: PASS,QUAL,CENTRE,ORDER"
-  f.writeLine "                                default: PASS,CENTRE,ORDER"
-  f.writeLine "                                ORDER is always appended as final tiebreaker"
-  f.writeLine "  --format FIELDS               comma-separated FORMAT fields to carry"
-  f.writeLine "                                default: GT"
-  f.writeLine "  --info FIELDS                 comma-separated INFO fields to keep"
-  f.writeLine "                                default: SVTYPE,SVLEN,END,CHR2,POS2 only"
-  f.writeLine "  -o, --output PATH             output file (.vcf | .vcf.gz | .bcf)"
-  f.writeLine "                                default: uncompressed VCF to stdout"
-  f.writeLine "  --chrs CHR[,CHR...]           restrict to listed chromosomes (filters records + headers)"
-  f.writeLine "  --threads INT                 worker threads (default: 1)"
-  f.writeLine "  --tmp-dir PATH                temp directory (default: system temp)"
-  f.writeLine "  -v, --verbose                 verbose logging to stderr"
-  f.writeLine "  -h, --help                    show this help"
+  writeMetricUsageLines(f)
+  writeClusterUsageLines(f,
+    priorityDefault  = "PASS,CENTRE,ORDER",
+    includeOrderNote = true,
+    formatDefault    = "GT",
+    infoFirstLine    = "comma-separated INFO fields to keep",
+    infoDefault      = "SVTYPE,SVLEN,END,CHR2,POS2 only")
+  writePreprocUsageLines(f)
+  writeVerboseHelpLines(f)
   f.writeLine ""
   f.writeLine "Default metric: --min-jaccard 0.75. Specify --min-overlap or --min-jaccard to override."
   f.writeLine ""
@@ -413,98 +476,30 @@ proc collapseUsage(code: int = 1) =
   f.writeLine "Output INFO fields added: CALLERS, N_CALLERS, N_MERGED."
   quit(code)
 
-proc parsePriority(s: string): seq[PriorityCriterion] =
-  for tok in s.split(','):
-    case tok.strip.toUpperAscii
-    of "PASS":   result.add(pcPass)
-    of "QUAL":   result.add(pcQual)
-    of "CENTRE", "CENTER": result.add(pcCentre)
-    of "ORDER":  result.add(pcOrder)
-    else:
-      logError("unknown priority criterion '" & tok & "' — valid values: PASS, QUAL, CENTRE, ORDER")
-      quit(1)
-  # ORDER is always the final tiebreaker; append if not already last.
-  if result.len == 0 or result[^1] != pcOrder:
-    result.add(pcOrder)
-
 proc runCollapseCli(rawArgs: seq[string]) =
   if rawArgs.len == 0: collapseUsage(0)
-  var cfg = CollapseConfig(
-    nThreads:     1,
-    bndSlop:      50,
-    insSlop:      50,
-    insMinSim:    0.75,
-    metric:       mJaccard,
-    threshold:    0.75,
-    linkage:      lmAverage,
-    priority:     @[pcPass, pcCentre, pcOrder],
-    formatFields: @["GT"],
-  )
+  var cfg = CollapseConfig()
+  var s = initSharedOpts()
+  var c = initClusterOpts()
   var positionals: seq[string]
-  var overlapSet, jaccardSet: bool
   var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
   while true:
     p.next()
     case p.kind
     of cmdEnd: break
     of cmdShortOption, cmdLongOption:
+      if parseSharedOpt(s, p, p.key): continue
+      if parseClusterOpt(c, p, p.key): continue
       case p.key
-      of "min-overlap":
-        cfg.threshold = parseFloatOpt(nextVal(p, "min-overlap"), "min-overlap")
-        if cfg.threshold <= 0 or cfg.threshold > 1:
-          logError("--min-overlap must be in (0, 1]"); quit(1)
-        cfg.metric = mOverlap; overlapSet = true
-      of "min-jaccard":
-        cfg.threshold = parseFloatOpt(nextVal(p, "min-jaccard"), "min-jaccard")
-        if cfg.threshold <= 0 or cfg.threshold > 1:
-          logError("--min-jaccard must be in (0, 1]"); quit(1)
-        cfg.metric = mJaccard; jaccardSet = true
-      of "bnd-slop":
-        cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
-        if cfg.bndSlop <= 0:
-          logError("--bnd-slop must be > 0"); quit(1)
-      of "ins-slop":
-        cfg.insSlop = parseIntOpt(nextVal(p, "ins-slop"), "ins-slop")
-        if cfg.insSlop <= 0:
-          logError("--ins-slop must be > 0"); quit(1)
-      of "min-ins-sim":
-        cfg.insMinSim = parseFloatOpt(nextVal(p, "min-ins-sim"), "min-ins-sim")
-        if cfg.insMinSim <= 0 or cfg.insMinSim > 1:
-          logError("--min-ins-sim must be in (0, 1]"); quit(1)
-      of "linkage":
-        let v = nextVal(p, "linkage").toLowerAscii
-        case v
-        of "average":  cfg.linkage = lmAverage
-        of "single":   cfg.linkage = lmSingle
-        of "complete": cfg.linkage = lmComplete
-        else:
-          logError("--linkage must be average, single, or complete")
-          quit(1)
-      of "priority":
-        cfg.priority = parsePriority(nextVal(p, "priority"))
-      of "format":
-        cfg.formatFields = nextVal(p, "format").split(',').mapIt(it.strip)
-      of "info":
-        cfg.infoFields = nextVal(p, "info").split(',').mapIt(it.strip)
-      of "o", "output":
-        cfg.outputPath = nextVal(p, "o")
-      of "threads":
-        cfg.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
-        if cfg.nThreads < 1:
-          logError("--threads must be >= 1"); quit(1)
-      of "tmp-dir":
-        cfg.tmpDir = nextVal(p, "tmp-dir")
-      of "chrs":
-        cfg.keptChrs = parseChrsArg(nextVal(p, "chrs"))
-      of "v", "verbose": setVerbose(true)
-      of "h", "help":    collapseUsage(0)
+      of "h", "help":
+        collapseUsage(0)
       else:
         logError("unknown option: --" & p.key)
         collapseUsage()
     of cmdArgument:
       positionals.add(p.key)
 
-  if overlapSet and jaccardSet:
+  if s.overlapSet and s.jaccardSet:
     logError("--min-overlap and --min-jaccard are mutually exclusive")
     collapseUsage()
 
@@ -530,9 +525,8 @@ proc runCollapseCli(rawArgs: seq[string]) =
       logError("input file not found: " & caller.path)
       quit(1)
 
-  if cfg.tmpDir == "":
-    cfg.tmpDir = getTempDir()
-  cfg.tmpDir = makeRunTmpDir(cfg.tmpDir)
+  applySharedOpts(s, cfg)
+  applyClusterOpts(c, cfg)
 
   # Build command line string for provenance header.
   let cmdLine = "matcha collapse " & rawArgs.join(" ")
@@ -549,26 +543,16 @@ proc mergeUsage(code: int = 1) =
   f.writeLine "columns per sample; cohort INFO AC/AN/AF computed from assembled GTs."
   f.writeLine ""
   f.writeLine "Options:"
-  f.writeLine "  --min-overlap FLOAT           minimum reciprocal overlap (0.0-1.0)"
-  f.writeLine "  --min-jaccard FLOAT           minimum Jaccard index (0.0-1.0)"
-  f.writeLine "  --bnd-slop INT                max breakend offset for BND (default: 50)"
-  f.writeLine "  --min-ins-sim FLOAT           minimum INS combined sim = sqrt(pos*len) (default: 0.75)"
-  f.writeLine "  --ins-slop INT                max position offset for INS matches (default: 50)"
-  f.writeLine "  --linkage average|single|complete  agglomerative linkage (default: average)"
-  f.writeLine "  --priority CRITERIA           comma-separated: PASS,QUAL,CENTRE,ORDER"
-  f.writeLine "                                default: PASS,CENTRE,ORDER (drives representative)"
-  f.writeLine "  --format FIELDS               comma-separated FORMAT fields to carry"
-  f.writeLine "                                default: GT (auto-added if absent)"
-  f.writeLine "  --info FIELDS                 comma-separated INFO fields to keep from rep"
-  f.writeLine "                                default: only auto-extracted + cohort + CALLERS"
-  f.writeLine "  -o, --output PATH             output file (.vcf | .vcf.gz | .bcf)"
-  f.writeLine "                                default: uncompressed VCF to stdout"
-  f.writeLine "  --chrs CHR[,CHR...]           restrict to listed chromosomes (filters records + headers)"
-  f.writeLine "  --missing-to-ref              treat absent samples as 0/0 (count toward AN; like bcftools merge)"
-  f.writeLine "  --threads INT                 worker threads (default: 1)"
-  f.writeLine "  --tmp-dir PATH                temp directory (default: system temp)"
-  f.writeLine "  -v, --verbose                 verbose logging to stderr"
-  f.writeLine "  -h, --help                    show this help"
+  writeMetricUsageLines(f)
+  writeClusterUsageLines(f,
+    priorityDefault  = "PASS,CENTRE,ORDER (drives representative)",
+    includeOrderNote = false,
+    formatDefault    = "GT (auto-added if absent)",
+    infoFirstLine    = "comma-separated INFO fields to keep from rep",
+    infoDefault      = "only auto-extracted + cohort + CALLERS")
+  f.writeLine "  --missing-to-ref                treat absent samples as 0/0 (count toward AN; like bcftools merge)"
+  writePreprocUsageLines(f)
+  writeVerboseHelpLines(f)
   f.writeLine ""
   f.writeLine "Default metric: --min-jaccard 0.75. Specify --min-overlap or --min-jaccard to override."
   f.writeLine ""
@@ -578,84 +562,30 @@ proc mergeUsage(code: int = 1) =
 
 proc runMergeCli(rawArgs: seq[string]) =
   if rawArgs.len == 0: mergeUsage(0)
-  var cfg = MergeConfig(
-    nThreads:     1,
-    bndSlop:      50,
-    insSlop:      50,
-    insMinSim:    0.75,
-    metric:       mJaccard,
-    threshold:    0.75,
-    linkage:      lmAverage,
-    priority:     @[pcPass, pcCentre, pcOrder],
-    formatFields: @["GT"],
-  )
+  var cfg = MergeConfig()
+  var s = initSharedOpts()
+  var c = initClusterOpts()
   var positionals: seq[string]
-  var overlapSet, jaccardSet: bool
   var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
   while true:
     p.next()
     case p.kind
     of cmdEnd: break
     of cmdShortOption, cmdLongOption:
+      if parseSharedOpt(s, p, p.key): continue
+      if parseClusterOpt(c, p, p.key): continue
       case p.key
-      of "min-overlap":
-        cfg.threshold = parseFloatOpt(nextVal(p, "min-overlap"), "min-overlap")
-        if cfg.threshold <= 0 or cfg.threshold > 1:
-          logError("--min-overlap must be in (0, 1]"); quit(1)
-        cfg.metric = mOverlap; overlapSet = true
-      of "min-jaccard":
-        cfg.threshold = parseFloatOpt(nextVal(p, "min-jaccard"), "min-jaccard")
-        if cfg.threshold <= 0 or cfg.threshold > 1:
-          logError("--min-jaccard must be in (0, 1]"); quit(1)
-        cfg.metric = mJaccard; jaccardSet = true
-      of "bnd-slop":
-        cfg.bndSlop = parseIntOpt(nextVal(p, "bnd-slop"), "bnd-slop")
-        if cfg.bndSlop <= 0:
-          logError("--bnd-slop must be > 0"); quit(1)
-      of "ins-slop":
-        cfg.insSlop = parseIntOpt(nextVal(p, "ins-slop"), "ins-slop")
-        if cfg.insSlop <= 0:
-          logError("--ins-slop must be > 0"); quit(1)
-      of "min-ins-sim":
-        cfg.insMinSim = parseFloatOpt(nextVal(p, "min-ins-sim"), "min-ins-sim")
-        if cfg.insMinSim <= 0 or cfg.insMinSim > 1:
-          logError("--min-ins-sim must be in (0, 1]"); quit(1)
-      of "linkage":
-        let v = nextVal(p, "linkage").toLowerAscii
-        case v
-        of "average":  cfg.linkage = lmAverage
-        of "single":   cfg.linkage = lmSingle
-        of "complete": cfg.linkage = lmComplete
-        else:
-          logError("--linkage must be average, single, or complete")
-          quit(1)
-      of "priority":
-        cfg.priority = parsePriority(nextVal(p, "priority"))
-      of "format":
-        cfg.formatFields = nextVal(p, "format").split(',').mapIt(it.strip)
-      of "info":
-        cfg.infoFields = nextVal(p, "info").split(',').mapIt(it.strip)
-      of "o", "output":
-        cfg.outputPath = nextVal(p, "o")
-      of "threads":
-        cfg.nThreads = parseIntOpt(nextVal(p, "threads"), "threads")
-        if cfg.nThreads < 1:
-          logError("--threads must be >= 1"); quit(1)
-      of "tmp-dir":
-        cfg.tmpDir = nextVal(p, "tmp-dir")
-      of "chrs":
-        cfg.keptChrs = parseChrsArg(nextVal(p, "chrs"))
       of "missing-to-ref":
         cfg.missingToRef = true
-      of "v", "verbose": setVerbose(true)
-      of "h", "help":    mergeUsage(0)
+      of "h", "help":
+        mergeUsage(0)
       else:
         logError("unknown option: --" & p.key)
         mergeUsage()
     of cmdArgument:
       positionals.add(p.key)
 
-  if overlapSet and jaccardSet:
+  if s.overlapSet and s.jaccardSet:
     logError("--min-overlap and --min-jaccard are mutually exclusive")
     mergeUsage()
   if positionals.len < 2:
@@ -674,10 +604,8 @@ proc runMergeCli(rawArgs: seq[string]) =
       logError("input file not found: " & caller.path)
       quit(1)
 
-  if cfg.tmpDir == "":
-    cfg.tmpDir = getTempDir()
-  cfg.tmpDir = makeRunTmpDir(cfg.tmpDir)
-
+  applySharedOpts(s, cfg)
+  applyClusterOpts(c, cfg)
   let cmdLine = "matcha merge " & rawArgs.join(" ")
   runMerge(cfg, cmdLine)
 
