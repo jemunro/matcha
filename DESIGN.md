@@ -46,7 +46,7 @@ Temp BCFs live inside a per-invocation subdirectory created via `makeRunTmpDir` 
 | **INS length** | Fallback chain: `INFO/INSLEN` → `INFO/SVLEN` → `len(ALT) − len(REF)` (plain-sequence ALTs only, not symbolic/BND) → `len(LEFT_SVINSSEQ) + len(RIGHT_SVINSSEQ)`. Written as `INFO/SVLEN` in the slim record. `endPos = POS + 1` (point event). INS records land in `(svINS, 0)`. | No resolvable length → `skUnresolvableInsLen`, warn+skip. |
 | **ID** | Synthesize `CHROM_POS_SVTYPE_LINENUMBER` when absent or `.`. | Always succeeds. |
 | **SRC_INDEX** | Sequential int32 counter, incremented per record read (before skip checks). Written to slim BCF INFO as `Number=1 Integer`. | Always succeeds. |
-| **Size bin** | `binIndexFor(svlen)`: log2 scale from 1024 bp. BND always lands in bin 0. | Clamped to 0 for non-positive SVLEN. |
+| **Size bin** | `binIndexFor(svlen)`: log2 scale from 512 bp. BND always lands in bin 0. | Clamped to 0 for non-positive SVLEN. |
 | **Chrom filter** | When `--chrs` is supplied, records on non-listed chromosomes are rejected before any other field resolution. BND records whose mate `CHR2` is on an excluded chromosome are also rejected (after BND resolution). Counted as `skChromFiltered`. | Silent skip; reflected in per-callset summary. |
 
 Warnings go to stderr with prefix `[matcha preproc WARN]`, throttled at 5 per reason per callset (override: `MATCHA_WARN_CAP`). After preprocessing completes, a single warning is emitted listing any `--chrs` entries that were not found in any input header (indicating a possible typo).
@@ -66,7 +66,7 @@ Jobs are sorted **largest A BCF first** (`getFileSize(job.pathA)` descending) as
 
 ## Size bins
 
-Log2 scale: bin 0 = `[0, 1024)` bp; bin N (N ≥ 1) = `[2^(N+9), 2^(N+10))` bp. See [src/matcha/bins.nim](src/matcha/bins.nim) for `binIndexFor`, `adjacentBins`, and derivations.
+Log2 scale: bin 0 = `[0, 512)` bp; bin N (N ≥ 1) = `[2^(N+8), 2^(N+9))` bp. See [src/matcha/bins.nim](src/matcha/bins.nim) for `binIndexFor`, `adjacentBins`, and derivations.
 
 ---
 

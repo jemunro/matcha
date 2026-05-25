@@ -10,24 +10,24 @@ import matcha/bins
 # Bin assignment / range
 # ---------------------------------------------------------------------------
 
-# B01 — bin 0 catches everything < 1024
-timed("B01", "binIndexFor: SVLEN < 1024 → bin 0"):
+# B01 — bin 0 catches everything < 512
+timed("B01", "binIndexFor: SVLEN < 512 → bin 0"):
   doAssert binIndexFor(1) == 0
-  doAssert binIndexFor(1023) == 0
+  doAssert binIndexFor(511) == 0
 
-# B02 — bin 1 starts at 1024
-timed("B02", "binIndexFor: SVLEN 1024 → bin 1"):
-  doAssert binIndexFor(1024) == 1
-  doAssert binIndexFor(2047) == 1
+# B02 — bin 1 starts at 512
+timed("B02", "binIndexFor: SVLEN 512 → bin 1, 1023 → bin 1"):
+  doAssert binIndexFor(512) == 1
+  doAssert binIndexFor(1023) == 1
 
-# B03 — bin 2 starts at 2048
-timed("B03", "binIndexFor: SVLEN 2048 → bin 2, 4095 → bin 2"):
-  doAssert binIndexFor(2048) == 2
-  doAssert binIndexFor(4095) == 2
+# B03 — bin 2 starts at 1024
+timed("B03", "binIndexFor: SVLEN 1024 → bin 2, 2047 → bin 2"):
+  doAssert binIndexFor(1024) == 2
+  doAssert binIndexFor(2047) == 2
 
 # B04 — large SV
-timed("B04", "binIndexFor: SVLEN 100000 → bin 7 ([2^16=65536, 2^17=131072))"):
-  doAssert binIndexFor(100000) == 7
+timed("B04", "binIndexFor: SVLEN 100000 → bin 8 ([2^16=65536, 2^17=131072))"):
+  doAssert binIndexFor(100000) == 8
 
 # B05 — degenerate values clamp to bin 0
 timed("B05", "binIndexFor: 0 and negative clamp to bin 0"):
@@ -45,12 +45,12 @@ timed("B06", "binRange round-trip for i=0,1,5,10"):
 
 # B07 — adjacent bins for binA=2 at threshold 0.5
 timed("B07", "adjacentBins(2, 0.5, populated={0..5}) → {1,2,3}"):
-  # bin 2 spans [2048, 4096); allowed B sizes (1024, 8192) → bins 1,2,3.
-  # Bin 0 [0,1024): hi=1024, qmin=2048*0.5=1024. bHi > qmin? 1024 > 1024 false → out.
-  # Bin 1 [1024,2048): bLo=1024 < qmax=8192, bHi=2048 > qmin=1024 → in.
-  # Bin 2 [2048,4096): in.
-  # Bin 3 [4096,8192): bLo=4096 < 8192, bHi=8192 > 1024 → in.
-  # Bin 4 [8192,16384): bLo=8192 < 8192? false → out.
+  # bin 2 spans [1024, 2048); allowed B sizes (512, 4096) → bins 1,2,3.
+  # Bin 0 [0,512): hi=512, qmin=1024*0.5=512. bHi > qmin? 512 > 512 false → out.
+  # Bin 1 [512,1024): bLo=512 < qmax=4096, bHi=1024 > qmin=512 → in.
+  # Bin 2 [1024,2048): in.
+  # Bin 3 [2048,4096): bLo=2048 < 4096, bHi=4096 > 512 → in.
+  # Bin 4 [4096,8192): bLo=4096 < 4096? false → out.
   let pop: set[uint8] = {0'u8, 1'u8, 2'u8, 3'u8, 4'u8, 5'u8}
   let adj = adjacentBins(2, 0.5, pop)
   let adjSet = adj.toHashSet
@@ -59,16 +59,16 @@ timed("B07", "adjacentBins(2, 0.5, populated={0..5}) → {1,2,3}"):
 
 # B08 — adjacent bins exclude populated bins outside the range
 timed("B08", "adjacentBins skips populated bins outside [L_lo*t, L_hi/t)"):
-  # binA=2 at t=0.5: window (1024, 8192). Populated={0,5} → {} (both outside).
+  # binA=2 at t=0.5: window (512, 4096). Populated={0,5} → {} (both outside).
   let adj = adjacentBins(2, 0.5, {0'u8, 5'u8})
   doAssert adj.len == 0, "expected empty, got " & $adj
 
 # B09 — t=0.9: only the same bin and immediate neighbours
-timed("B09", "adjacentBins(2, 0.9): tight window picks only bin 2"):
-  # binA=2 [2048,4096); window (2048*0.9=1843.2, 4096/0.9≈4551).
-  # Bin 1 [1024,2048): bLo=1024<4551 ✓, bHi=2048>1843.2 ✓ → in.
-  # Bin 2 [2048,4096): in.
-  # Bin 3 [4096,8192): bLo=4096<4551 ✓, bHi=8192>1843.2 ✓ → in.
+timed("B09", "adjacentBins(2, 0.9): tight window picks bins 1,2,3"):
+  # binA=2 [1024,2048); window (1024*0.9=921.6, 2048/0.9≈2275.6).
+  # Bin 1 [512,1024): bLo=512<2275.6 ✓, bHi=1024>921.6 ✓ → in.
+  # Bin 2 [1024,2048): in.
+  # Bin 3 [2048,4096): bLo=2048<2275.6 ✓, bHi=4096>921.6 ✓ → in.
   let adj = adjacentBins(2, 0.9, {0'u8, 1'u8, 2'u8, 3'u8, 4'u8})
   let adjSet = adj.toHashSet
   doAssert adjSet == [1, 2, 3].toHashSet, "got " & $adj

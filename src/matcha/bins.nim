@@ -1,7 +1,7 @@
 ## bins.nim — log2 size-bin assignment and tiled B-record buffer.
 ##
-## Size bins partition SV lengths on a log2 scale starting at 1024bp.
-## Bin 0 catches everything < 1024bp; bin N (N >= 1) spans [2^(N+9), 2^(N+10)).
+## Size bins partition SV lengths on a log2 scale starting at 512bp.
+## Bin 0 catches everything < 512bp; bin N (N >= 1) spans [2^(N+8), 2^(N+9)).
 ##
 ## Adjacent-bin pruning: for canonical reciprocal overlap (overlap/max) >= t,
 ## a B record of length L_b can only match an A record of length L_a if
@@ -16,20 +16,20 @@
 
 import std/[bitops, sets, tables]
 
-const BinZeroUpper = 1024'i64
+const BinZeroUpper = 512'i64
 
 proc binIndexFor*(svlen: int64): int =
   ## Assign a bin index to a normalised (positive) SVLEN.
-  ## Bin 0 = [0, 1024). Bin N = [2^(N+9), 2^(N+10)) for N >= 1.
+  ## Bin 0 = [0, 512). Bin N = [2^(N+8), 2^(N+9)) for N >= 1.
   if svlen <= 0 or svlen < BinZeroUpper:
     return 0
-  int(fastLog2(uint64(svlen))) - 9
+  int(fastLog2(uint64(svlen))) - 8
 
 proc binRange*(idx: int): tuple[lo, hi: int64] =
   ## Return the half-open [lo, hi) size range for a bin index.
   if idx <= 0:
     return (0'i64, BinZeroUpper)
-  (1'i64 shl (idx + 9), 1'i64 shl (idx + 10))
+  (1'i64 shl (idx + 8), 1'i64 shl (idx + 9))
 
 proc adjacentBins*(binA: int, threshold: float64,
                    populatedB: set[uint8]): seq[int] =

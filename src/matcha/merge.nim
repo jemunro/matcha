@@ -868,7 +868,8 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
   )
   let cpr = selfMatchAndCluster(mergedPreproc, matchCfg,
                                  cfgMut.linkage, cfgMut.threshold,
-                                 cfgMut.priority, "merge self-match")
+                                 cfgMut.priority, "merge self-match",
+                                 warnCallerStats = false)
 
   # SID → output sample index table.
   var sampleIdxBySID: Table[string, int]
