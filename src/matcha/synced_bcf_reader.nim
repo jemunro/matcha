@@ -30,6 +30,9 @@ const
 proc bcf_sr_set_opt*(sr: ptr bcf_srs_t; opt: cint): cint
     {.varargs, cdecl, importc: "bcf_sr_set_opt", dynlib: libname.}
 
+proc bcf_sr_set_regions*(sr: ptr bcf_srs_t; regions: cstring; is_file: cint): cint
+    {.cdecl, importc: "bcf_sr_set_regions", dynlib: libname.}
+
 # ---- Thin wrappers from synced_bcf_wrap.c (pure struct-field access) --------
 
 proc srs_has_line*(sr: ptr bcf_srs_t; i: cint): cint
@@ -55,7 +58,12 @@ proc bcf_translate*(dst_hdr, src_hdr: ptr bcf_hdr_t; line: ptr bcf1_t): cint
 # ---- htsThreadPool (shared BGZF decompression across readers/writers) -------
 
 type htsThreadPool* {.bycopy.} = object
+  ## Mirror of htslib's htsThreadPool. The qsize field MUST be present even
+  ## if we leave it at 0 — hts_set_opt(HTS_OPT_THREAD_POOL) dereferences
+  ## `arg->qsize` after `arg->pool`; if the struct is short, htslib reads
+  ## adjacent stack garbage and may allocate an absurd queue size or segfault.
   pool*:  pointer
+  qsize*: cint
 
 proc hts_tpool_init*(n: cint): pointer
     {.cdecl, importc: "hts_tpool_init", dynlib: libname.}

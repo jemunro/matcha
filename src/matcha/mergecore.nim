@@ -10,7 +10,7 @@
 ##   agglomerateComponent  — Lance-Williams agglomerative clustering
 ##   selectRepresentative  — priority-cascade representative selection
 
-import std/[heapqueue, os, sequtils, sets, strutils, tables]
+import std/[algorithm, atomics, heapqueue, os, sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
 import utils, preproc, match, log, synced_bcf_reader
@@ -952,43 +952,97 @@ type IntegratedMergeResult* = object
   paths*:     Table[SvtypeBin, string]
   populated*: Table[SvtypeBin, HashSet[string]]
 
-proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
-                      finalHdr: ptr bcf_hdr_t;
-                      cfg: MergeStreamConfig;
-                      chromOrder: seq[string]): IntegratedMergeResult =
-  ## Stream all N caller VCFs via one synced_bcf_reader, normalize each
-  ## record, filter INFO/FORMAT to the user-selected fields, write per-
-  ## (svtype, bin) merged slim BCFs. finalHdr is pre-built by the caller
-  ## (collapse builds it with buildFinalHdr; merge will supply its own).
+# ---------------------------------------------------------------------------
+# Caller bucketing — greedy LPT bin-packing for caller-level parallelism in
+# the parallel path of integratedMerge. Each caller belongs to exactly one
+# bucket, so total reader setups across all buckets equals N (no
+# amplification, unlike a chrom-shard partition).
+# ---------------------------------------------------------------------------
 
-  # 1. Init synced_bcf_reader + thread pool.
+type CallerBucketEntry* = tuple[globalCi: int; caller: CallerInput]
+
+proc bucketCallers*(callers: seq[CallerInput]; nBuckets: int):
+                    seq[seq[CallerBucketEntry]] =
+  ## Greedy LPT (longest-processing-time) bin-packing of callers across at most
+  ## `nBuckets` workers, balancing total input-file size per bucket. Within
+  ## each bucket, entries are re-sorted by global caller index (CLI order) so
+  ## the per-bucket synced reader's `add_reader` order matches CLI order
+  ## locally — preserves CALLER_IDX tie-break at same (rid, pos).
+  ##
+  ## Returns ≤ `min(nBuckets, len(callers))` non-empty buckets.
+  let n = min(max(nBuckets, 1), callers.len)
+  if n == 0: return
+  result = newSeq[seq[CallerBucketEntry]](n)
+  var loads = newSeq[int64](n)
+
+  type Triple = tuple[globalCi: int; caller: CallerInput; size: int64]
+  var sized: seq[Triple]
+  for ci, c in callers.pairs:
+    let sz =
+      try: getFileSize(c.path)
+      except: 0'i64
+    sized.add((globalCi: ci, caller: c, size: sz))
+
+  # Sort by size desc, tie-break by globalCi asc for determinism.
+  sized.sort(proc(a, b: Triple): int =
+    let d = cmp(b.size, a.size)
+    if d != 0: d else: cmp(a.globalCi, b.globalCi))
+
+  for t in sized:
+    var bestIdx = 0
+    for i in 1 ..< n:
+      if loads[i] < loads[bestIdx]: bestIdx = i
+    result[bestIdx].add((globalCi: t.globalCi, caller: t.caller))
+    loads[bestIdx] += t.size
+
+  # Restore CLI order within each bucket.
+  for i in 0 ..< n:
+    result[i].sort(proc(a, b: CallerBucketEntry): int =
+      cmp(a.globalCi, b.globalCi))
+
+# ---------------------------------------------------------------------------
+# runShardPass — one synced-reader pass over a caller bucket. Writes per-
+# (svtype, bin) BCFs under `outDir` named
+# `matcha_<pid>_<namePrefix>_<svtype>_b<bin>.bcf`. CSI is built only when
+# `buildCsi=true` (single-pass path); phase-1 shards skip CSI since phase 2
+# streams them sequentially.
+#
+# The bucket carries each caller's global CLI index so CALLER_IDX is stamped
+# with the global value (not the bucket-local reader position), preserving
+# downstream ORDER tie-break semantics.
+# ---------------------------------------------------------------------------
+
+type ShardPassResult = object
+  paths:     Table[SvtypeBin, string]
+  populated: Table[SvtypeBin, HashSet[string]]
+  counts:    Table[SvtypeBin, int32]
+  wsList:    seq[WarnState]          ## indexed by bucket-local reader position
+  globalCi:  seq[int]                ## bucket-local position → global caller index
+
+proc runShardPass(bucket: seq[CallerBucketEntry]; mh: MergedHeader;
+                  finalHdr: ptr bcf_hdr_t; cfg: MergeStreamConfig;
+                  outDir: string;
+                  namePrefix: string;
+                  buildCsi: bool;
+                  srcIndexStart: int32 = 0): ShardPassResult =
+  ## Per-record loop body shared by the single-pass and per-bucket phase-1
+  ## paths of integratedMerge.
+
   let sr = bcf_sr_init()
   if sr == nil:
     raise newException(IOError, "bcf_sr_init failed")
   discard bcf_sr_set_opt(sr, BCF_SR_REQUIRE_IDX)
 
-  let nThr = max(1, cfg.nThreads)
-  var tpool = htsThreadPool(pool: nil)
-  if nThr >= 2:
-    tpool.pool = hts_tpool_init(nThr.cint)
-
-  for caller in callers:
-    if bcf_sr_add_reader(sr, caller.path.cstring) == 0:
+  for entry in bucket:
+    if bcf_sr_add_reader(sr, entry.caller.path.cstring) == 0:
       let msg = $bcf_sr_strerror(srs_errnum(sr))
       bcf_sr_destroy(sr)
-      if tpool.pool != nil: hts_tpool_destroy(tpool.pool)
-      raise newException(IOError, "cannot open: " & caller.path & " (" & msg & ")")
+      raise newException(IOError, "cannot open: " & entry.caller.path & " (" & msg & ")")
 
   let nreaders = srs_nreaders(sr).int
+  for entry in bucket:
+    result.globalCi.add(entry.globalCi)
 
-  # Attach thread pool to each reader's underlying file.
-  if tpool.pool != nil:
-    for i in 0 ..< nreaders:
-      discard hts_set_opt(srs_get_file(sr, i.cint),
-                          srs_hts_opt_thread_pool(), tpool.addr)
-
-  # Subset samples on each reader's header (one sample per caller for
-  # collapse, or none).
   for ci in 0 ..< nreaders:
     let srcHdr = srs_get_header(sr, ci.cint)
     if cfg.formatFields.len == 0:
@@ -1002,8 +1056,6 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
         discard bcf_hdr_set_samples(srcHdr, cstring(nil), 0.cint)
     augmentSrcHdrForRenames(srcHdr, ci, mh)
     if cfg.stampSID:
-      # SID FORMAT def must exist on srcHdr so bcf_update_format can resolve
-      # the key; also on finalHdr (which is the slimHdr in merge mode).
       var sidPresent = false
       for hi in collectHrecs(srcHdr, BCF_HEADER_TYPE.BCF_HL_FMT.cint):
         if hi.id == "SID": sidPresent = true; break
@@ -1013,23 +1065,17 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
            "Description=\"matcha-internal: source sample ID\">").cstring)
         discard bcf_hdr_sync(srcHdr)
 
-  # Per-caller WarnState + lineno counter (for synthetic ID generation).
-  # globalSrcIndex is a single counter across all callers for SRC_INDEX writes.
-  var wsList: seq[WarnState]
   var perCallerLineno = newSeq[int](nreaders)
-  var globalSrcIndex: int32 = 0
+  var srcIndexCounter: int32 = srcIndexStart
   for i in 0 ..< nreaders:
-    wsList.add(initWarnState(callers[i].name))
+    result.wsList.add(initWarnState(bucket[i].caller.name))
 
-  # Keep sets derived from finalHdr: post-filter records contain exactly the
-  # fields finalHdr defines → bcf_translate is clean.
   var infoKeepSet, fmtKeepSet: HashSet[string]
   for hi in collectHrecs(finalHdr, BCF_HEADER_TYPE.BCF_HL_INFO.cint):
     infoKeepSet.incl(hi.id)
   for hi in collectHrecs(finalHdr, BCF_HEADER_TYPE.BCF_HL_FMT.cint):
     fmtKeepSet.incl(hi.id)
 
-  # Reusable Variant view over the synced reader's records.
   let view = newVariantView()
   var svtypeBuf: string
   var endBuf, svlenBuf, inslenBuf: seq[int32]
@@ -1037,13 +1083,14 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
   var renameBuf: pointer = nil
   var renameN:   cint    = 0
 
-  # Lazy-opened writers + CSI indexes per (svtype, bin).
   var writers:    Table[SvtypeBin, VCF]
   var indexes:    Table[SvtypeBin, ptr hts_idx_t]
   var writerHdrs: Table[SvtypeBin, ptr bcf_hdr_t]
 
+  if not dirExists(outDir):
+    createDir(outDir)
+
   try:
-    # 2. Stream records.
     while bcf_sr_next_line(sr) > 0:
       for ci in 0 ..< nreaders:
         if srs_has_line(sr, ci.cint) == 0: continue
@@ -1052,44 +1099,40 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
 
         if cfg.keptChrs.len > 0 and
            getChromName(srcHdr, rawRec.rid) notin cfg.keptChrs:
-          inc wsList[ci].nRead
-          inc wsList[ci].skipped[skChromFiltered]
+          inc result.wsList[ci].nRead
+          inc result.wsList[ci].skipped[skChromFiltered]
           continue
 
         let rec = bcf_dup(rawRec)
         inc perCallerLineno[ci]
 
         let nr = normalizeRecord(srcHdr, rec, perCallerLineno[ci],
-                                 wsList[ci], view, svtypeBuf,
+                                 result.wsList[ci], view, svtypeBuf,
                                  endBuf, svlenBuf, inslenBuf,
                                  leftSeqBuf, rightSeqBuf,
-                                 callers[ci].path)
+                                 bucket[ci].caller.path)
         if not nr.ok:
           bcf_destroy(rec)
           continue
         if cfg.keptChrs.len > 0 and nr.svt == svBND and
            nr.bndChr2 notin cfg.keptChrs:
-          inc wsList[ci].skipped[skChromFiltered]
-          # normalizeRecord already incremented nKept; back it out.
-          dec wsList[ci].nKept
+          inc result.wsList[ci].skipped[skChromFiltered]
+          dec result.wsList[ci].nKept
           bcf_destroy(rec)
           continue
 
-        # 2a. Apply INFO renames.
         for origName, res in mh.infoRes.pairs:
           if res.kind != fcIncompatibleInfo: continue
           if ci notin res.renames: continue
           applyInfoRename(srcHdr, rec, origName, res.renames[ci],
                           renameBuf, renameN)
 
-        # 2b. Apply FORMAT renames.
         for origName, res in mh.fmtRes.pairs:
           if res.kind != fcIncompatibleFmt: continue
           if ci notin res.renames: continue
           applyFmtRename(srcHdr, rec, origName, res.renames[ci],
                          renameBuf, renameN)
 
-        # 2c+2d. Filter INFO and FORMAT fields.
         discard bcf_unpack(rec, BCF_UN_ALL.cint)
         let idPairs = cast[ptr UncheckedArray[bcf_idpair_t]](srcHdr.id[BCF_DT_ID])
         var infoToDel: seq[string]
@@ -1117,7 +1160,6 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
           discard bcf_update_format(srcHdr, rec, nm.cstring,
                                     nil, 0.cint, BCF_HT_INT.cint)
 
-        # 2e. Authoritative writes for END / CHR2 / POS2 / SVTYPE / SVLEN.
         var svtStr = $nr.svt
         discard bcf_update_info(srcHdr, rec, "SVTYPE".cstring,
                                 svtStr[0].addr, svtStr.len.cint, BCF_HT_STR.cint)
@@ -1137,49 +1179,41 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
           discard bcf_update_info(srcHdr, rec, "END".cstring,
                                   endVal.addr, 1.cint, BCF_HT_INT.cint)
 
-        # 2f. Write SRC_INDEX (global sequential) and CALLER_IDX (which caller).
-        var srcIdxVal = globalSrcIndex
-        inc globalSrcIndex
-        var callerIdxVal = ci.int32
+        var srcIdxVal = srcIndexCounter
+        inc srcIndexCounter
+        var callerIdxVal = bucket[ci].globalCi.int32
         discard bcf_update_info(srcHdr, rec, "SRC_INDEX".cstring,
                                 srcIdxVal.addr, 1.cint, BCF_HT_INT.cint)
         discard bcf_update_info(srcHdr, rec, "CALLER_IDX".cstring,
                                 callerIdxVal.addr, 1.cint, BCF_HT_INT.cint)
 
-        # 2g. Write FORMAT/SID (merge mode only) — source sample identity for
-        # the dummy single-sample slim record.
-        if cfg.stampSID and ci < cfg.sampleIdByCaller.len:
+        let globalCi = bucket[ci].globalCi
+        if cfg.stampSID and globalCi < cfg.sampleIdByCaller.len:
           var sidArr: array[1, cstring]
-          sidArr[0] = cfg.sampleIdByCaller[ci].cstring
+          sidArr[0] = cfg.sampleIdByCaller[globalCi].cstring
           discard bcf_update_format_string(srcHdr, rec, "SID".cstring,
                                            cast[cstringArray](sidArr[0].addr),
                                            1.cint)
 
-        # 2h. REF/ALT trim to keep records small. For BND in merge mode we
-        # preserve the source ALT verbatim (strand orientation lives in the
-        # bracket form and is not derivable from CHR2/POS2 at output time).
         if (cfg.preserveBndAlt and nr.svt == svBND) or
            (cfg.preserveInsAlt and nr.svt == svINS):
-          discard  # leave REF/ALT as the source had them
+          discard
         else:
           discard bcf_update_alleles_str(srcHdr, rec, "N,.".cstring)
 
-        # 2i. Track metadata + lazy-open writer.
-        let mKey: SvtypeBin = (nr.svt, nr.binIdx)
-        result.populated.mgetOrPut(mKey, initHashSet[string]()).incl(
-          getChromName(srcHdr, rec.rid))
-
         let key: SvtypeBin = (nr.svt, nr.binIdx)
+        result.populated.mgetOrPut(key, initHashSet[string]()).incl(
+          getChromName(srcHdr, rec.rid))
+        result.counts[key] = result.counts.getOrDefault(key, 0'i32) + 1'i32
+
         if key notin writers:
-          let outPath = cfg.tmpDir / "matcha_" & $getCurrentProcessId() &
-                        "_M_" & $nr.svt & "_b" & $nr.binIdx & ".bcf"
+          let outPath = outDir / "matcha_" & $getCurrentProcessId() &
+                        "_" & namePrefix & "_" & $nr.svt & "_b" & $nr.binIdx & ".bcf"
           var wtr: VCF
           if not open(wtr, outPath, mode = "wb"):
             raise newException(IOError, "cannot create merged BCF: " & outPath)
-          # Init wtr.header via a dummy source, then replace with dup of finalHdr
-          # (each writer owns its dup; finalHdr remains valid for writeOutput).
           var dummy: VCF
-          discard open(dummy, callers[0].path)
+          discard open(dummy, bucket[0].caller.path)
           wtr.copy_header(dummy.header)
           dummy.close()
           bcf_hdr_destroy(wtr.header.hdr)
@@ -1189,37 +1223,320 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
           discard wtr.write_header()
           writers[key] = wtr
           result.paths[key] = outPath
-          let headerOff = uint64(bgzf_tell(bgzfHandle(wtr)))
-          let idx = hts_idx_init(0.cint, HTS_FMT_CSI.cint, headerOff,
-                                 14.cint, 5.cint)
-          if idx == nil:
-            raise newException(IOError, "cannot create CSI index: " & outPath)
-          indexes[key] = idx
+          if buildCsi:
+            let headerOff = uint64(bgzf_tell(bgzfHandle(wtr)))
+            let idx = hts_idx_init(0.cint, HTS_FMT_CSI.cint, headerOff,
+                                   14.cint, 5.cint)
+            if idx == nil:
+              raise newException(IOError, "cannot create CSI index: " & outPath)
+            indexes[key] = idx
 
-        # 2j. Translate field IDs to finalHdr space, write record, push to index.
         discard bcf_translate(writerHdrs[key], srcHdr, rec)
         discard bcf_write(vcfHtsFile(writers[key]), writerHdrs[key], rec)
-        let woff = uint64(bgzf_tell(bgzfHandle(writers[key])))
-        discard hts_idx_push(indexes[key], rec.rid, int64(rec.pos),
-                             int64(rec.pos) + int64(rec.rlen), woff, 1.cint)
+        if buildCsi:
+          let woff = uint64(bgzf_tell(bgzfHandle(writers[key])))
+          discard hts_idx_push(indexes[key], rec.rid, int64(rec.pos),
+                               int64(rec.pos) + int64(rec.rlen), woff, 1.cint)
 
         bcf_destroy(rec)
 
   finally:
-    # Teardown order: destroy synced reader first (it owns reader file handles),
-    # then close writers (each holds its own dup of finalHdr), then destroy
-    # the shared thread pool last (after every htsFile* that referenced it).
     bcf_sr_destroy(sr)
     for key, wtr in writers.mpairs:
-      let finalOff = uint64(bgzf_tell(bgzfHandle(wtr)))
-      hts_idx_finish(indexes[key], finalOff)
-      wtr.close()  # bcf_hdr_destroy on wtr.header.hdr (the dup) — finalHdr is safe
-      let path = result.paths[key]
-      hts_idx_save(indexes[key], path.cstring, HTS_FMT_CSI.cint)
-      hts_idx_destroy(indexes[key])
-    if tpool.pool != nil: hts_tpool_destroy(tpool.pool)
-
+      if buildCsi:
+        let finalOff = uint64(bgzf_tell(bgzfHandle(wtr)))
+        hts_idx_finish(indexes[key], finalOff)
+      wtr.close()
+      if buildCsi:
+        let path = result.paths[key]
+        hts_idx_save(indexes[key], path.cstring, HTS_FMT_CSI.cint)
+        hts_idx_destroy(indexes[key])
     if renameBuf != nil: c_free(renameBuf)
 
-  # Emit per-caller summaries.
-  for ws in wsList: emitSummary(ws)
+# ---------------------------------------------------------------------------
+# phase2MergeBin — N-way coord-sorted merge of phase-1 shard BCFs for one
+# (svtype, bin) key into a final CSI-indexed BCF. Rewrites INFO/SRC_INDEX to a
+# globally unique value using the per-bin offset.
+# ---------------------------------------------------------------------------
+
+proc phase2MergeBin(key: SvtypeBin; shardPaths: seq[string];
+                    binOffset: int32; finalHdr: ptr bcf_hdr_t;
+                    cfg: MergeStreamConfig): string =
+  let (svt, binIdx) = key
+  let outPath = cfg.tmpDir / "matcha_" & $getCurrentProcessId() &
+                "_M_" & $svt & "_b" & $binIdx & ".bcf"
+
+  var wtr: VCF
+  if not open(wtr, outPath, mode = "wb"):
+    raise newException(IOError, "cannot create merged BCF: " & outPath)
+  var dummy: VCF
+  discard open(dummy, shardPaths[0])
+  wtr.copy_header(dummy.header)
+  dummy.close()
+  bcf_hdr_destroy(wtr.header.hdr)
+  let wHdr = bcf_hdr_dup(finalHdr)
+  wtr.header.hdr = wHdr
+  discard wtr.write_header()
+  let headerOff = uint64(bgzf_tell(bgzfHandle(wtr)))
+  let idx = hts_idx_init(0.cint, HTS_FMT_CSI.cint, headerOff, 14.cint, 5.cint)
+  if idx == nil:
+    raise newException(IOError, "cannot create CSI index: " & outPath)
+
+  type ShardState = object
+    vcf: VCF
+    rec: ptr bcf1_t
+    valid: bool
+    callerIdx: int32
+    rid: int32
+    pos: int64
+    shardIdx: int32
+    # Reusable scratch for bcf_get_info_values — htslib reallocs in place when
+    # the supplied buffer is too small, so allocate once per shard, free at
+    # teardown. Avoids per-record malloc/free thrashing.
+    callerIdxBuf: pointer
+    callerIdxBufN: cint
+
+  var shards = newSeq[ShardState](shardPaths.len)
+
+  proc advance(s: var ShardState) =
+    if not s.valid: return
+    let rc = bcf_read(vcfHtsFile(s.vcf), s.vcf.header.hdr, s.rec)
+    if rc < 0:
+      s.valid = false
+      return
+    s.rid = s.rec.rid
+    s.pos = s.rec.pos
+    discard bcf_unpack(s.rec, BCF_UN_INFO.cint)
+    let n = bcf_get_info_values(s.vcf.header.hdr, s.rec, "CALLER_IDX".cstring,
+                                s.callerIdxBuf.addr, s.callerIdxBufN.addr,
+                                BCF_HT_INT.cint)
+    if n >= 1 and s.callerIdxBuf != nil:
+      s.callerIdx = cast[ptr UncheckedArray[int32]](s.callerIdxBuf)[0]
+    else:
+      s.callerIdx = 0
+
+  for i, p in shardPaths.pairs:
+    if not open(shards[i].vcf, p):
+      raise newException(IOError, "cannot open shard: " & p)
+    shards[i].rec = bcf_init()
+    shards[i].valid = true
+    shards[i].shardIdx = i.int32
+    advance(shards[i])
+
+  type HeapKey = tuple[rid: int32; pos: int64; callerIdx: int32; shardIdx: int32]
+  var heap: HeapQueue[HeapKey]
+  for i in 0 ..< shards.len:
+    if shards[i].valid:
+      heap.push((shards[i].rid, shards[i].pos, shards[i].callerIdx, i.int32))
+
+  var outCounter: int32 = 0
+
+  try:
+    while heap.len > 0:
+      let top = heap.pop()
+      var s = addr shards[top.shardIdx]
+      let rec = s.rec
+      var newSrcIdx = binOffset + outCounter
+      inc outCounter
+      discard bcf_update_info(wHdr, rec, "SRC_INDEX".cstring,
+                              newSrcIdx.addr, 1.cint, BCF_HT_INT.cint)
+      discard bcf_write(vcfHtsFile(wtr), wHdr, rec)
+      let woff = uint64(bgzf_tell(bgzfHandle(wtr)))
+      discard hts_idx_push(idx, rec.rid, int64(rec.pos),
+                           int64(rec.pos) + int64(rec.rlen), woff, 1.cint)
+      advance(s[])
+      if s[].valid:
+        heap.push((s[].rid, s[].pos, s[].callerIdx, top.shardIdx))
+  finally:
+    let finalOff = uint64(bgzf_tell(bgzfHandle(wtr)))
+    hts_idx_finish(idx, finalOff)
+    wtr.close()
+    hts_idx_save(idx, outPath.cstring, HTS_FMT_CSI.cint)
+    hts_idx_destroy(idx)
+    for i in 0 ..< shards.len:
+      if shards[i].rec != nil: bcf_destroy(shards[i].rec)
+      if shards[i].callerIdxBuf != nil: c_free(shards[i].callerIdxBuf)
+      shards[i].vcf.close()
+      removeFile(shardPaths[i])
+  result = outPath
+
+# ---------------------------------------------------------------------------
+# Worker pool state for phase 1 (bucket shards) and phase 2 (per-bin merges)
+# ---------------------------------------------------------------------------
+
+type
+  Phase1State = object
+    buckets:  seq[seq[CallerBucketEntry]]
+    mh:       MergedHeader
+    finalHdr: ptr bcf_hdr_t
+    cfg:      MergeStreamConfig
+    next:     Atomic[int]
+    results:  seq[ShardPassResult]
+
+  Phase2State = object
+    keys:        seq[SvtypeBin]
+    shardPaths:  Table[SvtypeBin, seq[string]]
+    binOffsets:  Table[SvtypeBin, int32]
+    finalHdr:    ptr bcf_hdr_t
+    cfg:         MergeStreamConfig
+    next:        Atomic[int]
+    paths:       seq[string]
+
+proc phase1Worker(state: ptr Phase1State) {.thread.} =
+  {.cast(gcsafe).}:
+    while true:
+      let idx = state.next.fetchAdd(1, moRelaxed)
+      if idx >= state.buckets.len: break
+      let outDir = state.cfg.tmpDir / "perworker" / $idx
+      state.results[idx] = runShardPass(
+        state.buckets[idx], state.mh, state.finalHdr, state.cfg,
+        outDir = outDir,
+        namePrefix = "M_w" & $idx, buildCsi = false)
+
+proc phase2Worker(state: ptr Phase2State) {.thread.} =
+  {.cast(gcsafe).}:
+    while true:
+      let idx = state.next.fetchAdd(1, moRelaxed)
+      if idx >= state.keys.len: break
+      let key = state.keys[idx]
+      state.paths[idx] = phase2MergeBin(
+        key, state.shardPaths[key], state.binOffsets[key],
+        state.finalHdr, state.cfg)
+
+# ---------------------------------------------------------------------------
+# integratedMerge — top-level dispatcher
+# ---------------------------------------------------------------------------
+
+proc allCallersBucket(callers: seq[CallerInput]): seq[CallerBucketEntry] =
+  ## "Bucket" containing every caller in CLI order — fed to runShardPass on
+  ## the single-pass code path so the proc's API only takes a bucket.
+  for ci, c in callers.pairs:
+    result.add((globalCi: ci, caller: c))
+
+proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
+                      finalHdr: ptr bcf_hdr_t;
+                      cfg: MergeStreamConfig;
+                      chromOrder: seq[string]): IntegratedMergeResult =
+  ## Stream all N caller VCFs, normalize each record, filter INFO/FORMAT to
+  ## the user-selected fields, write per-(svtype, bin) merged slim BCFs.
+  ##
+  ## Fast path (nThreads <= 1 or only one caller): one synced-reader pass,
+  ## CSI built inline, SRC_INDEX assigned by a single global counter
+  ## (bit-identical to the historical single-pass behaviour).
+  ##
+  ## Parallel path (nThreads >= 2 and ≥ 2 callers): caller-bucket sharded.
+  ## Greedy-LPT partition of callers across `nThreads` buckets by file size;
+  ## each bucket runs an independent synced-reader pass over **just its
+  ## subset** of callers (so total reader setups = N, no amplification, no
+  ## per-region CSI seeks). Phase 2 per-(svtype, bin) does an N-way
+  ## coord-sorted merge of bucket shards, rewriting SRC_INDEX to a unique
+  ## per-bin range, building the CSI, and deleting shards as it drains them.
+
+  let nThr = max(1, cfg.nThreads)
+
+  if nThr <= 1 or callers.len <= 1:
+    let r = runShardPass(allCallersBucket(callers), mh, finalHdr, cfg,
+                         outDir = cfg.tmpDir,
+                         namePrefix = "M", buildCsi = true)
+    result.paths = r.paths
+    result.populated = r.populated
+    for ws in r.wsList: emitSummary(ws)
+    return
+
+  # ----- Parallel path -----
+  let buckets = bucketCallers(callers, nThr)
+  let nBuckets = buckets.len
+
+  if nBuckets <= 1:
+    let r = runShardPass(allCallersBucket(callers), mh, finalHdr, cfg,
+                         outDir = cfg.tmpDir,
+                         namePrefix = "M", buildCsi = true)
+    result.paths = r.paths
+    result.populated = r.populated
+    for ws in r.wsList: emitSummary(ws)
+    return
+
+  logInfo("integratedMerge: " & $nBuckets & " caller-bucket(s); callers=" &
+          $callers.len)
+
+  # Phase 1: per-bucket synced-reader passes (each over N/T callers).
+  createDir(cfg.tmpDir / "perworker")
+  var state1 = Phase1State(
+    buckets: buckets, mh: mh, finalHdr: finalHdr,
+    cfg: cfg, results: newSeq[ShardPassResult](nBuckets))
+  state1.next.store(0, moRelaxed)
+  var threads1 = newSeq[Thread[ptr Phase1State]](nBuckets)
+  for i in 0 ..< nBuckets:
+    createThread(threads1[i], phase1Worker, addr state1)
+  for i in 0 ..< nBuckets:
+    joinThread(threads1[i])
+
+  # Aggregate phase-1 results into per-key shard paths + populated chroms +
+  # per-key total counts (drives the per-bin SRC_INDEX offsets).
+  var shardPaths: Table[SvtypeBin, seq[string]]
+  var totalCounts: Table[SvtypeBin, int32]
+  for r in state1.results:
+    for key, path in r.paths.pairs:
+      shardPaths.mgetOrPut(key, @[]).add(path)
+    for key, pop in r.populated.pairs:
+      var dst = result.populated.mgetOrPut(key, initHashSet[string]())
+      for c in pop: dst.incl(c)
+      result.populated[key] = dst
+    for key, n in r.counts.pairs:
+      totalCounts[key] = totalCounts.getOrDefault(key, 0'i32) + n
+
+  # Compute non-overlapping SRC_INDEX ranges per (svtype, bin) in deterministic
+  # key order. Single int32 throughout; sanity-check we don't overflow.
+  var keys = toSeq(totalCounts.keys)
+  keys.sort(proc(a, b: SvtypeBin): int =
+    let s = cmp($a[0], $b[0])
+    if s != 0: s else: cmp(a[1], b[1]))
+  var binOffsets: Table[SvtypeBin, int32]
+  var running: int64 = 0
+  for key in keys:
+    if running > int64(int32.high) - int64(totalCounts[key]):
+      raise newException(ValueError,
+        "integratedMerge: total record count exceeds int32 SRC_INDEX range")
+    binOffsets[key] = int32(running)
+    running += int64(totalCounts[key])
+
+  # Phase 2: per-bin N-way merges with SRC_INDEX rewrite.
+  let phase2Pool = min(nThr, keys.len)
+  if phase2Pool <= 1 or keys.len <= 1:
+    for key in keys:
+      let path = phase2MergeBin(key, shardPaths[key], binOffsets[key],
+                                finalHdr, cfg)
+      result.paths[key] = path
+  else:
+    var state2 = Phase2State(
+      keys: keys, shardPaths: shardPaths, binOffsets: binOffsets,
+      finalHdr: finalHdr, cfg: cfg, paths: newSeq[string](keys.len))
+    state2.next.store(0, moRelaxed)
+    var threads2 = newSeq[Thread[ptr Phase2State]](phase2Pool)
+    for i in 0 ..< phase2Pool:
+      createThread(threads2[i], phase2Worker, addr state2)
+    for i in 0 ..< phase2Pool:
+      joinThread(threads2[i])
+    for i, key in keys.pairs:
+      result.paths[key] = state2.paths[i]
+
+  # Clean up empty per-worker subdirs (shard files already deleted by phase 2).
+  for i in 0 ..< nBuckets:
+    let d = cfg.tmpDir / "perworker" / $i
+    if dirExists(d):
+      try: removeDir(d) except: discard
+  let outer = cfg.tmpDir / "perworker"
+  if dirExists(outer):
+    try: removeDir(outer) except: discard
+
+  # Reassemble WarnState per caller in CLI order — each caller appears in
+  # exactly one bucket (disjoint partition), so no summing is needed.
+  var perCaller = newSeq[WarnState](callers.len)
+  var seen = newSeq[bool](callers.len)
+  for r in state1.results:
+    for bi in 0 ..< r.wsList.len:
+      let gci = r.globalCi[bi]
+      perCaller[gci] = r.wsList[bi]
+      seen[gci] = true
+  for gci in 0 ..< callers.len:
+    if seen[gci]: emitSummary(perCaller[gci])

@@ -14,6 +14,8 @@ nimble test           # run test suite
 python3 tests/generate_fixtures.py   # regenerate fixtures (needs bcftools + bgzip)
 ```
 
+Run `nimble test` **once** per change; capture the full output and read it. Do not re-run to grep for PASS/FAIL — scan the captured output.
+
 ## Code layout
 
 `main.nim` parses CLI args and dispatches to one of four per-mode drivers (`match.nim`, `anno.nim`, `collapse.nim`, `merge.nim`). All four call into shared `preproc.nim` (normalize + slim each input into per-(svtype, bin) temp BCFs) and `matchcore.nim` (three streamers — interval / BND / INS — each returning `seq[MatchPair]`). `mergecore.nim` provides header merging and agglomerative clustering shared by `collapse` and `merge`. See [DESIGN.md](DESIGN.md) for the full module map and architecture notes.
