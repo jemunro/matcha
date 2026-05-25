@@ -51,6 +51,7 @@ type
     paths*:     Table[SvtypeBin, string]              ## (svtype, bin) → BCF path
     populated*: Table[SvtypeBin, HashSet[string]]     ## (svtype, bin) → chroms with ≥1 record
     chromOrder*: seq[string]                          ## chroms in input header order
+    chromLens*: Table[string, int64]                  ## chrom name → length from input header
     chrsSeen*:  HashSet[string]                       ## contig IDs from input header (for --chrs validation)
 
   BinBEntry* = tuple[path: string; fileIdx: int16]
@@ -550,6 +551,8 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
 
   result.chromOrder = captureChromOrder(vcf.header)
   for c in result.chromOrder: result.chrsSeen.incl(c)
+  for ctg in vcf.contigs:
+    result.chromLens[ctg.name] = ctg.length
 
   for v in vcf:
     var curSrcIndex = srcIndex
@@ -698,7 +701,7 @@ proc buildWorkQueue*(a, b: PreprocOutput,
   ## Also returns fileList: a deduplicated ordered list of all slim-BCF paths.
   ## FILE_IDX values in MatchJob fields are indices into this list.
   ##
-  ## Job order: chrom in input header order, then svtype string, then binA.
+  ## Job order: svtype string, then binA.
 
   let threshold = cfg.threshold
 
@@ -760,11 +763,16 @@ proc buildWorkQueue*(a, b: PreprocOutput,
         pathA:    pathA, fileIdxA: pathToIdx[pathA], binsB: binsB,
       ))
 
-  # Stable sort: chrom (header order), then svtype string, then binA.
+  # Sort: largest A BCF first (LPT heuristic), then longer chrom first, then
+  # (svtype, binA) for determinism. Collect sizes once to avoid repeated stat().
+  var jobSize: Table[string, int64]
+  for j in jobs: jobSize[j.pathA] = getFileSize(j.pathA)
   proc cmpJobs(x, y: MatchJob): int =
-    let xi = chromIdx.getOrDefault(x.chrom, high(int))
-    let yi = chromIdx.getOrDefault(y.chrom, high(int))
-    if xi != yi: return cmp(xi, yi)
+    let d = cmp(jobSize[y.pathA], jobSize[x.pathA])  # descending bin size
+    if d != 0: return d
+    let lx = a.chromLens.getOrDefault(x.chrom, 0)
+    let ly = a.chromLens.getOrDefault(y.chrom, 0)
+    if lx != ly: return cmp(ly, lx)                  # descending chrom length
     let s = cmp($x.svtype, $y.svtype)
     if s != 0: return s
     cmp(x.binA, y.binA)

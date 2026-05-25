@@ -13,7 +13,7 @@
 ##   8. writeOutput — stream merged BCFs, buffer representative records,
 ##      apply output-time INFO filter, sort by coordinate, write final VCF/BCF.
 
-import std/[algorithm, os, sets, strutils, tables]
+import std/[algorithm, os, sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
 import utils, preproc, matchcore, mergecore, log, synced_bcf_reader
@@ -356,10 +356,17 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
     warnMissingChrs(cfg.keptChrs, seen)
 
   # Build a PreprocOutput describing the merged slim BCFs for buildWorkQueue.
+  var mergedChromLens: Table[string, int64]
+  if im.paths.len > 0:
+    var v: VCF
+    if open(v, im.paths.values.toSeq[0]):
+      for ctg in v.contigs: mergedChromLens[ctg.name] = ctg.length
+      v.close()
   let mergedPreproc = PreprocOutput(
     paths:      im.paths,
     populated:  im.populated,
     chromOrder: chromOrder,
+    chromLens:  mergedChromLens,
   )
 
   # Phase 3: self-match + cluster + representative selection (shared pipeline).

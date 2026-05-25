@@ -840,10 +840,17 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
     warnMissingChrs(cfgMut.keptChrs, seen)
 
   # Build a PreprocOutput describing the merged slim BCFs.
+  var mergedChromLens: Table[string, int64]
+  if im.paths.len > 0:
+    var v: VCF
+    if open(v, im.paths.values.toSeq[0]):
+      for ctg in v.contigs: mergedChromLens[ctg.name] = ctg.length
+      v.close()
   let mergedPreproc = PreprocOutput(
     paths:      im.paths,
     populated:  im.populated,
     chromOrder: chromOrder,
+    chromLens:  mergedChromLens,
   )
 
   # Self-match + cluster + representative selection (shared pipeline).

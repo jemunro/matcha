@@ -127,23 +127,20 @@ timed("P06", "buildWorkQueue: every job (chrom, svtype, binA) is reachable in bo
       doAssert (job.svtype, binB) in ppB.paths,
         "job binB references missing B path"
 
-# P06 — chrom order in jobs respects A's input header order
-timed("P07", "buildWorkQueue: jobs ordered by VCF header chrom order"):
+# P06 — jobs sorted largest-A-BCF-first (LPT heuristic); verify descending file size
+timed("P07", "buildWorkQueue: jobs sorted largest A BCF first (LPT)"):
   let tmpDir = createTempDir("matcha_test_", "")
   defer: removeDir(tmpDir)
   let ppA = preprocessVcf(FixtureA, tmpDir, "A")
   let ppB = preprocessVcf(FixtureB, tmpDir, "B")
   let (jobs, _) = buildWorkQueue(ppA, ppB, baseCfg())
-  # Map chrom → index in A's header order; jobs' chroms must be monotonic.
-  var idx: Table[string, int]
-  for i, c in ppA.chromOrder: idx[c] = i
-  var prev = -1
+  var prevSize = int64.high
   for job in jobs:
-    let cur = idx.getOrDefault(job.chrom, high(int))
-    doAssert cur >= prev,
-      "chrom order regressed at job " & job.chrom &
-      " (prev=" & $prev & " cur=" & $cur & ")"
-    prev = cur
+    let sz = getFileSize(job.pathA)
+    doAssert sz <= prevSize,
+      "LPT order regressed at job " & $job.svtype & "/bin" & $job.binA &
+      " size=" & $sz & " prev=" & $prevSize
+    prevSize = sz
 
 # P07 — preprocessVcf works on .bcf inputs
 timed("P08", "preprocessVcf: accepts .bcf input"):
