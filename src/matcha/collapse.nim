@@ -9,7 +9,7 @@
 ##   4. runMatchPairJobsWithPool (self-mode, emitSingletons=true) — Pass 1.
 ##   5. Build allOffsets from MatchPairs (singletons included).
 ##   6. Scan merged BCFs for cluster members → passQualMap (replaces exploreMerged).
-##   7. clusterAll → selectRepresentative — cluster and pick representatives.
+##   7. selfMatchAndCluster → selectRepresentative — cluster and pick representatives.
 ##   8. writeOutput — stream merged BCFs, buffer representative records,
 ##      apply output-time INFO filter, sort by coordinate, write final VCF/BCF.
 

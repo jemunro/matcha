@@ -119,7 +119,7 @@ Threading: preproc+merge runs in one integrated streaming pass (`integratedMerge
 
 ## Agglomerative clustering
 
-Used by both collapse and merge (step 5 of each pipeline). Entry point: `clusterAll(byComp, simMap, linkage, threshold)` → `seq[seq[int32]]`.
+Used by both collapse and merge. `agglomerateComponent(offsets, simMap, linkage, threshold)` handles each connected component; `selfMatchAndCluster` orchestrates the full pipeline.
 
 ### Connected components
 
@@ -201,7 +201,7 @@ callsets (typically `matcha collapse` outputs). Steps (see
    - INS records keep their source REF/ALT verbatim when present (preserves sequence-resolved insertions). Non-BND/INS records blank REF/ALT to `N,.`.
 7. **Self-match → cluster** — identical pipeline to collapse: pair
    matchcore (selfMode + emitSingletons), `buildSimilarityMap`,
-   `clusterAll`, `passQualMap` from MatchPair fields (no second
+   `selfMatchAndCluster`, `passQualMap` from MatchPair fields (no second
    slim-BCF pass), `selectRepresentative`.
 8. **`writeMergeOutput`** — per cluster:
    - Retrieve each cluster member's slim record via CSI; read

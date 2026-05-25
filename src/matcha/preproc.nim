@@ -790,12 +790,6 @@ proc warnMissingChrs*(keptChrs: seq[string]; seen: HashSet[string]) =
   if missing.len > 0:
     logWarn("--chrs: not found in any input header: " & missing.join(","))
 
-proc removeTempBcfs*(paths: Table[SvtypeBin, string]) =
-  ## Delete per-(svtype, bin) BCF temp files and their CSI indexes.
-  for path in paths.values:
-    if fileExists(path):          removeFile(path)
-    if fileExists(path & ".csi"): removeFile(path & ".csi")
-
 # ---------------------------------------------------------------------------
 # Parallel preprocessing helper (shared by match and anno)
 # ---------------------------------------------------------------------------

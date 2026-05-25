@@ -8,7 +8,6 @@
 ##   buildSimilarityMap    — MatchPair seq → (canonicalPair → similarity) table
 ##   buildComponents       — union-find over pairs → offset→componentId table
 ##   agglomerateComponent  — Lance-Williams agglomerative clustering
-##   clusterAll            — agglomerate every connected component
 ##   selectRepresentative  — priority-cascade representative selection
 
 import std/[heapqueue, os, sequtils, sets, strutils, tables]
@@ -377,12 +376,6 @@ proc buildComponents*(simMap: Table[(int32, int32), float64];
 # Agglomerative clustering (Lance-Williams on similarity)
 # ---------------------------------------------------------------------------
 
-type
-  ClusterState = object
-    ## During agglomeration: each cluster is a set of member SRC_INDEX values.
-    members: seq[int32]
-    size:    int
-
 const AggDenseThreshold* = 256
   ## Components at or below this size use the dense O(N³) reference impl.
   ## Above this, switch to the heap-based sparse impl which is O((N+E) log N).
@@ -651,16 +644,6 @@ const LargeComponentWarn* = 500
   ## Components at or above this size trigger a logWarn flagging the chrom,
   ## svtype, and dominant caller. Surface for caller pathology like delly's
   ## known chr2 LowQual SV flood on some samples.
-
-proc clusterAll*(byComp: Table[int, seq[int32]];
-                 simMap: Table[(int32, int32), float64];
-                 linkage: LinkageMethod;
-                 threshold: float64): seq[seq[int32]] =
-  ## Agglomerate each connected component independently.
-  ## Missing pairs within a component are treated as similarity 0.
-  for offsets in byComp.values:
-    for cl in agglomerateComponent(offsets, simMap, linkage, threshold):
-      result.add(cl)
 
 # ---------------------------------------------------------------------------
 # selfMatchAndCluster — full post-integratedMerge pipeline.

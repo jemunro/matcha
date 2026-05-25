@@ -5,7 +5,6 @@
 {.compile: "csrc/synced_bcf_wrap.c".}
 
 import hts/private/hts_concat
-from hts/private/hts_concat import libname
 
 # Opaque handle — all interaction is via API functions / thin wrappers.
 type bcf_srs_t* {.bycopy.} = object
