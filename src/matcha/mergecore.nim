@@ -612,20 +612,14 @@ const LargeComponentWarn* = 500
   ## known chr2 LowQual SV flood on some samples.
 
 # ---------------------------------------------------------------------------
-# selfMatchAndCluster — full post-integratedMerge pipeline.
+# selfMatchAndClusterChrom — single-chromosome post-integratedMerge pipeline.
 #
-# Both `matcha collapse` and `matcha merge` share this body: self-match the
-# merged slim BCFs with singleton emission, build the similarity map and
-# location lookup, cluster, fetch PASS/QUAL/CALLER_IDX per cluster member
-# via grouped CSI queries, and select representatives.
+# Both `matcha collapse` and `matcha merge` share this body: self-match a
+# chromosome's slim BCF slice with singleton emission, build the similarity
+# map and location lookup, cluster, and pick representatives. The driver
+# loops chroms and emits each chrom's output before invoking the next call,
+# bounding peak intermediate memory to the largest single chromosome.
 # ---------------------------------------------------------------------------
-
-type
-  ClusterPipelineResult* = object
-    finalClusters*: seq[seq[int32]]  ## each cluster: representative first
-    locByIdx*:      Table[int32, tuple[chromIdx: int16; pos: int32; fileIdx: int16]]
-    passQualMap*:   Table[int32, tuple[hasPASS: bool; qual: uint16; callerIdx: int32]]
-    fileList*:      seq[string]      ## file index → slim BCF path
 
 # ---------------------------------------------------------------------------
 # Cluster thread pool (mirror of match.nim's lock-free PoolState pattern)
@@ -692,17 +686,17 @@ proc runClusterJobsWithPool(jobs: seq[ClusterJob]; nThreads: int): seq[seq[seq[i
     result = state.results
     logVerbose("cluster workers complete")
 
-proc selfMatchAndClusterChrom(mergedPreproc: PreprocOutput;
-                              matchCfg: MatchConfig;
-                              jobs: seq[MatchJob];
-                              linkage: LinkageMethod;
-                              threshold: float64;
-                              priority: seq[PriorityCriterion];
-                              modeTag: string;
-                              warnCallerStats: bool;
-                              outLocByIdx: var Table[int32, tuple[chromIdx: int16; pos: int32; fileIdx: int16]];
-                              outPassQualMap: var Table[int32, tuple[hasPASS: bool; qual: uint16; callerIdx: int32]];
-                              outFinalClusters: var seq[seq[int32]]) =
+proc selfMatchAndClusterChrom*(mergedPreproc: PreprocOutput;
+                               matchCfg: MatchConfig;
+                               jobs: seq[MatchJob];
+                               linkage: LinkageMethod;
+                               threshold: float64;
+                               priority: seq[PriorityCriterion];
+                               modeTag: string;
+                               warnCallerStats: bool;
+                               outLocByIdx: var Table[int32, tuple[chromIdx: int16; pos: int32; fileIdx: int16]];
+                               outPassQualMap: var Table[int32, tuple[hasPASS: bool; qual: uint16; callerIdx: int32]];
+                               outFinalClusters: var seq[seq[int32]]) =
   ## Run pair-finding + clustering for one chromosome's worth of jobs and
   ## append results into the caller's accumulators. simMap, components, meta,
   ## etc. are local to this proc, so they die at function exit — bounding the
@@ -830,34 +824,6 @@ proc selfMatchAndClusterChrom(mergedPreproc: PreprocOutput;
   logInfo(modeTag & "/" & chromName & ": " & $n & " record(s) -> " &
           $outFinalClusters.len & " cluster(s) (cumulative)")
 
-proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
-                          matchCfg: MatchConfig;
-                          linkage: LinkageMethod;
-                          threshold: float64;
-                          priority: seq[PriorityCriterion];
-                          modeTag = "self-match";
-                          warnCallerStats: bool = true): ClusterPipelineResult =
-  ## Dispatch matching + clustering chromosome-by-chromosome. Each chrom's
-  ## simMap / components live only for the duration of `selfMatchAndClusterChrom`,
-  ## so peak intermediate memory tracks the largest single chrom rather than
-  ## the whole cohort.
-  let (jobs, fileList) = buildWorkQueue(mergedPreproc, mergedPreproc, matchCfg)
-  result.fileList = fileList
-  logVerbose(modeTag & ": " & $jobs.len & " job(s) across " &
-             $mergedPreproc.chromOrder.len & " chrom(s)")
-
-  # Group jobs by chrom in chromOrder order so output is naturally sorted.
-  var jobsByChrom: Table[int16, seq[MatchJob]]
-  for j in jobs:
-    jobsByChrom.mgetOrPut(j.chromIdx, @[]).add(j)
-
-  for chromIdx in 0'i16 ..< mergedPreproc.chromOrder.len.int16:
-    let cjobs = jobsByChrom.getOrDefault(chromIdx, @[])
-    if cjobs.len == 0: continue
-    selfMatchAndClusterChrom(
-      mergedPreproc, matchCfg, cjobs, linkage, threshold, priority,
-      modeTag, warnCallerStats,
-      result.locByIdx, result.passQualMap, result.finalClusters)
 
 # ---------------------------------------------------------------------------
 # integratedMerge — fused preproc + merge in one synced_bcf_reader pass
@@ -1134,6 +1100,7 @@ type ShardPassResult = object
 
 proc runShardPass(bucket: seq[CallerBucketEntry]; mh: MergedHeader;
                   finalHdr: ptr bcf_hdr_t; cfg: MergeStreamConfig;
+                  chromOrder: seq[string];
                   outDir: string;
                   namePrefix: string;
                   buildCsi: bool;
@@ -1149,8 +1116,16 @@ proc runShardPass(bucket: seq[CallerBucketEntry]; mh: MergedHeader;
   # Restrict the synced scan to the active set when --chrs is given. Each
   # reader requires an index (BCF_SR_REQUIRE_IDX above), so the region jump
   # skips records on non-active chroms instead of reading them.
+  #
+  # The regions list MUST be in chromOrder: bcf_sr_set_regions iterates
+  # regions in the supplied order, and downstream phase 2 heap-merges shards
+  # assuming monotonic (rid, pos). HashSet.toSeq has no order guarantee, so
+  # iterate chromOrder and filter by membership.
   if cfg.keptChrs.len > 0:
-    let regions = toSeq(cfg.keptChrs).join(",")
+    var regionsList: seq[string]
+    for c in chromOrder:
+      if c in cfg.keptChrs: regionsList.add(c)
+    let regions = regionsList.join(",")
     if bcf_sr_set_regions(sr, regions.cstring, 0.cint) != 0:
       bcf_sr_destroy(sr)
       raise newException(IOError, "bcf_sr_set_regions failed for: " & regions)
@@ -1483,12 +1458,13 @@ proc phase2MergeBin(key: SvtypeBin; shardPaths: seq[string];
 
 type
   Phase1State = object
-    buckets:  seq[seq[CallerBucketEntry]]
-    mh:       MergedHeader
-    finalHdr: ptr bcf_hdr_t
-    cfg:      MergeStreamConfig
-    next:     Atomic[int]
-    results:  seq[ShardPassResult]
+    buckets:    seq[seq[CallerBucketEntry]]
+    mh:         MergedHeader
+    finalHdr:   ptr bcf_hdr_t
+    cfg:        MergeStreamConfig
+    chromOrder: seq[string]
+    next:       Atomic[int]
+    results:    seq[ShardPassResult]
 
   Phase2State = object
     keys:        seq[SvtypeBin]
@@ -1507,6 +1483,7 @@ proc phase1Worker(state: ptr Phase1State) {.thread.} =
       let outDir = state.cfg.tmpDir / "perworker" / $idx
       state.results[idx] = runShardPass(
         state.buckets[idx], state.mh, state.finalHdr, state.cfg,
+        chromOrder = state.chromOrder,
         outDir = outDir,
         namePrefix = "M_w" & $idx, buildCsi = false)
 
@@ -1553,6 +1530,7 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
 
   if nThr <= 1 or callers.len <= 1:
     let r = runShardPass(allCallersBucket(callers), mh, finalHdr, cfg,
+                         chromOrder = chromOrder,
                          outDir = cfg.tmpDir,
                          namePrefix = "M", buildCsi = true)
     result.paths = r.paths
@@ -1566,6 +1544,7 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
 
   if nBuckets <= 1:
     let r = runShardPass(allCallersBucket(callers), mh, finalHdr, cfg,
+                         chromOrder = chromOrder,
                          outDir = cfg.tmpDir,
                          namePrefix = "M", buildCsi = true)
     result.paths = r.paths
@@ -1580,7 +1559,8 @@ proc integratedMerge*(callers: seq[CallerInput]; mh: MergedHeader;
   createDir(cfg.tmpDir / "perworker")
   var state1 = Phase1State(
     buckets: buckets, mh: mh, finalHdr: finalHdr,
-    cfg: cfg, results: newSeq[ShardPassResult](nBuckets))
+    cfg: cfg, chromOrder: chromOrder,
+    results: newSeq[ShardPassResult](nBuckets))
   state1.next.store(0, moRelaxed)
   var threads1 = newSeq[Thread[ptr Phase1State]](nBuckets)
   for i in 0 ..< nBuckets:

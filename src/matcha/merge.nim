@@ -225,9 +225,8 @@ type
     qual:       uint16
 
   BufferedRow = object
-    chromOrderIdx: int
-    pos:           int64
-    rec:           ptr bcf1_t
+    pos: int64
+    rec: ptr bcf1_t
 
 # Pick the highest-priority member when multiple records share a SID
 # (rare same-sample cluster collision).
@@ -282,55 +281,105 @@ proc copyInfoField(dstHdr, srcHdr: ptr bcf_hdr_t; dst, src: ptr bcf1_t;
 # writeMergeOutput
 # ---------------------------------------------------------------------------
 
-proc writeMergeOutput(cfg: MergeConfig;
+type
+  MergeWriterState = object
+    outVcf:       VCF
+    outIdx:       ptr hts_idx_t
+    totalWritten: int
+
+proc openMergeWriter(cfg: MergeConfig;
+                     outputHdr: ptr bcf_hdr_t): MergeWriterState =
+  let outPath = if isStdoutPath(cfg.outputPath): "/dev/stdout" else: cfg.outputPath
+  let mode =
+    if cfg.outputPath.endsWith(".bcf"):       "wb"
+    elif cfg.outputPath.endsWith(".vcf.gz"):  "wz"
+    else:                                     "w"
+
+  if not open(result.outVcf, outPath, mode = mode):
+    raise newException(IOError, "cannot open output: " & outPath)
+  block:
+    var dummy: VCF
+    discard open(dummy, cfg.callers[0].path)
+    result.outVcf.copy_header(dummy.header)
+    dummy.close()
+  bcf_hdr_destroy(result.outVcf.header.hdr)
+  result.outVcf.header.hdr = outputHdr  # SHARED — clear before close to avoid double-free
+  discard result.outVcf.write_header()
+
+  # bgzf_mt is intentionally skipped when building an inline CSI index: in MT
+  # mode bgzf_tell returns a stale block_address (not updated until the worker
+  # thread flushes the block), corrupting all virtual offsets beyond the first
+  # BGZF block.  Revisit using bcf_idx_init/bcf_idx_save for MT-safe indexing.
+  let isBgzf = not isStdoutPath(cfg.outputPath) and
+               (cfg.outputPath.endsWith(".bcf") or cfg.outputPath.endsWith(".vcf.gz"))
+  if isBgzf:
+    let headerOff = uint64(bgzf_tell(bgzfHandle(result.outVcf)))
+    result.outIdx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
+    if result.outIdx == nil:
+      raise newException(IOError, "cannot create CSI index for: " & outPath)
+
+proc closeMergeWriter(state: var MergeWriterState; cfg: MergeConfig) =
+  if state.outIdx != nil:
+    let finalOff = uint64(bgzf_tell(bgzfHandle(state.outVcf)))
+    hts_idx_finish(state.outIdx, finalOff)
+  state.outVcf.header.hdr = nil   # shared outputHdr; caller owns it
+  state.outVcf.close()
+  logInfo("merge: wrote " & $state.totalWritten & " record(s) to " &
+       (if isStdoutPath(cfg.outputPath): "stdout" else: cfg.outputPath))
+  if state.outIdx != nil:
+    hts_idx_save(state.outIdx, cfg.outputPath.cstring, HTS_FMT_CSI.cint)
+    hts_idx_destroy(state.outIdx)
+    logInfo("indexed " & cfg.outputPath)
+
+proc writeMergeChrom(state: var MergeWriterState;
+                     cfg: MergeConfig;
                      outputHdr, slimHdrShared: ptr bcf_hdr_t;
                      sampleIds: seq[string];
                      sampleIdxBySID: Table[string, int];
-                     chromOrder: seq[string];
-                     mergedPaths: Table[SvtypeBin, string];
-                     fileList: seq[string];
+                     mergedBcfs: var seq[VCF];   ## indexed by fileIdx
+                     chromName: string;
                      locByIdx: Table[int32, tuple[chromIdx: int16; pos: int32; fileIdx: int16]];
                      passQualMap: Table[int32, tuple[hasPASS: bool; qual: uint16; callerIdx: int32]];
                      finalClusters: seq[seq[int32]];
                      emitCallers: bool) =
+  ## Assemble this chrom's per-cluster N-sample output records and stream them
+  ## to the already-open writer. Per-cluster intermediates (allRecs, bufRows)
+  ## are local — peak output-side memory is bounded by one chrom.
+  if finalClusters.len == 0: return
 
   let nSamples = sampleIds.len
   let formatFields = cfg.formatFields
 
-  # Pre-resolve INFO field types from outputHdr for copying.
   proc keepInfoOut(name: string): bool =
     keepInfoForMergeOut(name, cfg.infoFields)
 
-  # Group cluster members by fileIdx so we open each slim BCF once.
+  # Group cluster members by fileIdx so we sweep each slim BCF once per chrom.
   var membersByFile: Table[int16, seq[int32]]
   for cl in finalClusters:
     for idx in cl:
       let loc = locByIdx[idx]
       membersByFile.mgetOrPut(loc.fileIdx, @[]).add(idx)
-  # Build a per-cluster member list of MemberRec, fetching records via CSI.
+
   var clusterMembers = newSeq[seq[int]](finalClusters.len)
   var allRecs: seq[MemberRec]
-  # Build idx → clusterIdx lookup
   var idxToCluster: Table[int32, int]
   for ci, cl in finalClusters.pairs:
     for idx in cl:
       idxToCluster[idx] = ci
 
-  # Per-fileIdx CSI sweep.
+  # Per-fileIdx CSI sweep (queries scoped to this chrom).
   var idxBuf, ciBuf: seq[int32]
   var sidBuf: pointer = nil
   var sidBufN: cint = 0
   for fileIdx, idxs in membersByFile.pairs:
-    var vcf: VCF
-    if not open(vcf, fileList[fileIdx]):
-      raise newException(IOError, "cannot open merged BCF: " & fileList[fileIdx])
+    var vcf = mergedBcfs[fileIdx]
     # Sort idxs by pos to allow forward CSI streaming.
     var sorted = idxs
     sorted.sort(proc(a, b: int32): int =
       cmp(locByIdx[a].pos, locByIdx[b].pos))
     for idx in sorted:
       let loc = locByIdx[idx]
-      let region = chromOrder[loc.chromIdx] & ":" & $loc.pos & "-" & $loc.pos
+      let region = chromName & ":" & $loc.pos & "-" & $loc.pos
       var found = false
       for v in vcf.query(region):
         if readSrcIndex(v, idxBuf) != idx: continue
@@ -362,14 +411,9 @@ proc writeMergeOutput(cfg: MergeConfig;
         break
       if not found:
         logWarn("merge: could not retrieve slim record for SRC_INDEX " & $idx)
-    vcf.close()
   if sidBuf != nil: c_free(sidBuf)
 
-  # chrom name → output-order index for sorting.
-  var chromIdx: Table[string, int]
-  for i, c in chromOrder.pairs: chromIdx[c] = i
-
-  # Buffer output records, then sort+write.
+  # Buffer output records (this chrom only), then sort by pos and write.
   var bufRows: seq[BufferedRow]
 
   # Scratch buffers reused across clusters.
@@ -698,9 +742,7 @@ proc writeMergeOutput(cfg: MergeConfig;
         discard bcf_update_info(outputHdr, outRec, "N_CALLERS".cstring,
                                 nc.addr, 1.cint, BCF_HT_INT.cint)
 
-    let chromName = $hdrInt2Id(outputHdr, BCF_DT_CTG.cint, outRec.rid)
-    let coi = chromIdx.getOrDefault(chromName, high(int))
-    bufRows.add(BufferedRow(chromOrderIdx: coi, pos: outRec.pos, rec: outRec))
+    bufRows.add(BufferedRow(pos: outRec.pos, rec: outRec))
 
   if infoCopyBuf != nil: c_free(infoCopyBuf)
 
@@ -708,61 +750,17 @@ proc writeMergeOutput(cfg: MergeConfig;
   for mr in allRecs:
     if mr.rec != nil: bcf_destroy(mr.rec)
 
-  # Sort + write.
-  bufRows.sort(proc(a, b: BufferedRow): int =
-    let c = cmp(a.chromOrderIdx, b.chromOrderIdx)
-    if c != 0: c else: cmp(a.pos, b.pos))
-
-  let outPath = if isStdoutPath(cfg.outputPath): "/dev/stdout" else: cfg.outputPath
-  let mode =
-    if cfg.outputPath.endsWith(".bcf"):       "wb"
-    elif cfg.outputPath.endsWith(".vcf.gz"):  "wz"
-    else:                                     "w"
-
-  var outVcf: VCF
-  if not open(outVcf, outPath, mode = mode):
-    raise newException(IOError, "cannot open output: " & outPath)
-  block:
-    var dummy: VCF
-    discard open(dummy, cfg.callers[0].path)
-    outVcf.copy_header(dummy.header)
-    dummy.close()
-  bcf_hdr_destroy(outVcf.header.hdr)
-  outVcf.header.hdr = outputHdr  # SHARED — clear before close to avoid double-free
-  discard outVcf.write_header()
-
-  # bgzf_mt is intentionally skipped when building an inline CSI index: in MT
-  # mode bgzf_tell returns a stale block_address (not updated until the worker
-  # thread flushes the block), corrupting all virtual offsets beyond the first
-  # BGZF block.  Revisit using bcf_idx_init/bcf_idx_save for MT-safe indexing.
-  let isBgzf = not isStdoutPath(cfg.outputPath) and
-               (cfg.outputPath.endsWith(".bcf") or cfg.outputPath.endsWith(".vcf.gz"))
-  var outIdx: ptr hts_idx_t = nil
-  if isBgzf:
-    let headerOff = uint64(bgzf_tell(bgzfHandle(outVcf)))
-    outIdx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
-    if outIdx == nil:
-      raise newException(IOError, "cannot create CSI index for: " & outPath)
+  # Sort by pos (single chrom), write to the already-open writer.
+  bufRows.sort(proc(a, b: BufferedRow): int = cmp(a.pos, b.pos))
 
   for br in bufRows:
-    discard bcf_write(vcfHtsFile(outVcf), outputHdr, br.rec)
-    if outIdx != nil:
-      let woff = uint64(bgzf_tell(bgzfHandle(outVcf)))
-      discard hts_idx_push(outIdx, br.rec.rid, int64(br.rec.pos),
+    discard bcf_write(vcfHtsFile(state.outVcf), outputHdr, br.rec)
+    if state.outIdx != nil:
+      let woff = uint64(bgzf_tell(bgzfHandle(state.outVcf)))
+      discard hts_idx_push(state.outIdx, br.rec.rid, int64(br.rec.pos),
                            int64(br.rec.pos) + int64(br.rec.rlen), woff, 1)
     bcf_destroy(br.rec)
-
-  if outIdx != nil:
-    let finalOff = uint64(bgzf_tell(bgzfHandle(outVcf)))
-    hts_idx_finish(outIdx, finalOff)
-  outVcf.header.hdr = nil
-  outVcf.close()
-  logInfo("merge: wrote " & $bufRows.len & " record(s) to " &
-       (if isStdoutPath(cfg.outputPath): "stdout" else: cfg.outputPath))
-  if outIdx != nil:
-    hts_idx_save(outIdx, cfg.outputPath.cstring, HTS_FMT_CSI.cint)
-    hts_idx_destroy(outIdx)
-    logInfo("indexed " & cfg.outputPath)
+  state.totalWritten += bufRows.len
 
 # ---------------------------------------------------------------------------
 # runMerge — top-level entry point
@@ -855,7 +853,7 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
     chromLens:  mergedChromLens,
   )
 
-  # Self-match + cluster + representative selection (shared pipeline).
+  # Per-chrom self-match + cluster + emit (shared pipeline).
   logInfo("self-matching merged slim BCFs")
   let matchCfg = MatchConfig(
     metric:         cfgMut.metric,
@@ -868,20 +866,43 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
     selfMode:       true,
     emitSingletons: true,
   )
-  let cpr = selfMatchAndCluster(mergedPreproc, matchCfg,
-                                 cfgMut.linkage, cfgMut.threshold,
-                                 cfgMut.priority, "merge self-match",
-                                 warnCallerStats = false)
 
   # SID → output sample index table.
   var sampleIdxBySID: Table[string, int]
   for i, s in sampleIds.pairs: sampleIdxBySID[s] = i
 
-  # Output.
-  writeMergeOutput(cfgMut, outputHdr, slimHdr, sampleIds, sampleIdxBySID,
-                  chromOrder, im.paths, cpr.fileList, cpr.locByIdx,
-                  cpr.passQualMap, cpr.finalClusters,
-                  inputsHadCallers)
+  let (allJobs, fileList) = buildWorkQueue(mergedPreproc, mergedPreproc, matchCfg)
+  var jobsByChrom: Table[int16, seq[MatchJob]]
+  for j in allJobs:
+    jobsByChrom.mgetOrPut(j.chromIdx, @[]).add(j)
+
+  var writerState = openMergeWriter(cfgMut, outputHdr)
+
+  # Open merged slim BCFs once, indexed by fileIdx so writeMergeChrom can
+  # look up the right handle via locByIdx[idx].fileIdx.
+  var mergedBcfs = newSeq[VCF](fileList.len)
+  for fi, path in fileList.pairs:
+    if not open(mergedBcfs[fi], path):
+      raise newException(IOError, "cannot open merged BCF: " & path)
+
+  for chromIdx in 0'i16 ..< chromOrder.len.int16:
+    let cjobs = jobsByChrom.getOrDefault(chromIdx, @[])
+    if cjobs.len == 0: continue
+    var locByIdx: Table[int32, tuple[chromIdx: int16; pos: int32; fileIdx: int16]]
+    var passQualMap: Table[int32, tuple[hasPASS: bool; qual: uint16; callerIdx: int32]]
+    var finalClusters: seq[seq[int32]]
+    selfMatchAndClusterChrom(
+      mergedPreproc, matchCfg, cjobs,
+      cfgMut.linkage, cfgMut.threshold, cfgMut.priority,
+      "merge self-match", warnCallerStats = false,
+      locByIdx, passQualMap, finalClusters)
+    writeMergeChrom(writerState, cfgMut, outputHdr, slimHdr,
+                    sampleIds, sampleIdxBySID, mergedBcfs,
+                    chromOrder[chromIdx], locByIdx, passQualMap,
+                    finalClusters, inputsHadCallers)
+
+  for v in mergedBcfs.mitems: v.close()
+  closeMergeWriter(writerState, cfgMut)
 
   # Teardown.
   removeDir(cfgMut.tmpDir)
