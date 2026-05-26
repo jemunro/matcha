@@ -827,7 +827,7 @@ proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
   # Per-chrom parallel: each worker walks its slices and builds simMap +
   # components plus the per-chrom locByIdx/passQualMap/meta. Each ChromResult
   # carries its chromIdx so we can re-map after the LPT sort permutes order.
-  let chromResults = runChromJobsWithPool(chromJobs, matchCfg.nThreads)
+  var chromResults = runChromJobsWithPool(chromJobs, matchCfg.nThreads)
 
   # Serial merge: union per-chrom locByIdx/passQualMap/meta into global maps.
   # Keys are disjoint across chroms (matching is within-chrom), so straight
@@ -842,6 +842,11 @@ proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
     for k, v in cr.meta:        meta[k]               = v
     totalOffsets += cr.locByIdx.len
   logVerbose(modeTag & ": " & $totalOffsets & " unique record(s)")
+
+  # locByIdx and meta are now fully merged into global maps; release per-chrom copies.
+  for cr in chromResults.mitems:
+    reset(cr.locByIdx)
+    reset(cr.meta)
 
   # Warning pass: collect components at or above LargeComponentWarn, sort by
   # size descending, then emit up to MaxLargeComponentWarns with a suppression
@@ -880,6 +885,7 @@ proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
   if largeComps.len > MaxLargeComponentWarns:
     logWarn(modeTag & ": " & $(largeComps.len - MaxLargeComponentWarns) &
             " more large cluster component(s) not shown")
+  reset(meta)
 
   # Singletons need no agglomerative work nor representative selection — emit
   # them directly to result.finalClusters. Non-singletons become ClusterTasks
@@ -901,6 +907,9 @@ proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
       else:
         tasks.add(ClusterTask(offsets: offsets, simMap: simMapPtr,
                               passQualMap: passQualPtr))
+  # components are now in ClusterTask.offsets or singletons; release per-chrom copies.
+  for cr in chromResults.mitems:
+    reset(cr.components)
 
   # LPT bucketing: largest-cost task first, assign to least-loaded bucket.
   # Cost weight ∝ N² is an upper bound on both dense O(N³) and sparse
@@ -925,6 +934,8 @@ proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
   # Pool returns finalized ordered clusters → flat-add into finalClusters.
   for jobOut in runClusterJobsWithPool(clusterJobs, matchCfg.nThreads):
     for cl in jobOut: result.finalClusters.add(cl)
+  # ClusterTask pointers are dead; release remaining per-chrom tables (simMap, passQualMap).
+  chromResults.setLen(0)
 
   logInfo(modeTag & ": " & $totalOffsets & " record(s) -> " &
           $result.finalClusters.len & " cluster(s)")
