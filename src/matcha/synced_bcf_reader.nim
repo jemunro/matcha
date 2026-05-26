@@ -56,9 +56,13 @@ proc bcf_translate*(dst_hdr, src_hdr: ptr bcf_hdr_t; line: ptr bcf1_t): cint
     {.cdecl, importc: "bcf_translate", dynlib: libname.}
 
 # ---- htsThreadPool (shared BGZF decompression across readers/writers) -------
+# Layout must match htslib's `struct htsThreadPool` exactly: hts_set_opt reads
+# both fields out of the caller-provided struct. Missing `qsize` results in
+# garbage being interpreted as the BGZF I/O queue size — intermittent hangs.
 
 type htsThreadPool* {.bycopy.} = object
   pool*:  pointer
+  qsize*: cint    ## I/O queue size for this fp; 0 = htslib default
 
 proc hts_tpool_init*(n: cint): pointer
     {.cdecl, importc: "hts_tpool_init", dynlib: libname.}

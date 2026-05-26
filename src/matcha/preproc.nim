@@ -54,6 +54,7 @@ proc newWriterPool*(nThreads: int): htsThreadPool =
   ## non-empty pool with `destroyWriterPool`.
   if nThreads <= 1: return
   result.pool = hts_tpool_init(nThreads.cint)
+  result.qsize = 0   # htslib default I/O queue size
   if result.pool == nil:
     raise newException(IOError, "hts_tpool_init failed (n=" & $nThreads & ")")
 
