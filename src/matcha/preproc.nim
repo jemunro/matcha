@@ -156,7 +156,7 @@ const InsInfoDefs = [
 # the field's type via the (reader's) header. Applied to the INPUT VCF only.
 const SvInfoDefs = [
   ("SVTYPE",    "1", "String",  "Type of structural variant"),
-  ("SVLEN",     "1", "Integer", "Length of the SV (absolute value, positive)"),
+  ("SVLEN",     "1", "Integer", "Difference in length between REF and ALT alleles; negative for DEL"),
   ("END",       "1", "Integer", "End position of the SV (1-based, inclusive)"),
   ("CHR2",      "1", "String",  "Chromosome of mate breakend (BND/TRA)"),
   ("POS2",      "1", "Integer", "Position of mate breakend (BND/TRA)"),

@@ -95,6 +95,14 @@ proc parseSvType*(s: string): SvType =
   of "TRA": svTRA
   else: svUNKNOWN
 
+proc signedSvlen*(svt: SvType; absLen: int64): int32 {.inline.} =
+  ## Apply VCF-spec sign convention to a positive magnitude.
+  ## DEL is negative; DUP/INS/INV are positive; BND/other are 0.
+  case svt
+  of svDEL:               -absLen.int32
+  of svDUP, svINS, svINV:  absLen.int32
+  else:                    0'i32
+
 const QualQScale* = 4'f32  ## Q14.2: 0.25 precision, range [0, 16383.75]
 
 proc quantizeQual*(q: float32): uint16 {.inline.} =

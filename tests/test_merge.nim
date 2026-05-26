@@ -292,3 +292,40 @@ timed("M16", "--missing-to-ref: absent samples become 0/0 and count toward AN"):
     else: discard
   doAssert sawDel1000 and sawDel3000 and sawDup9000 and sawInv28000,
            "expected to see DEL_1000, DEL_3000, DUP_9000 and INV_28000 rows"
+
+# M17 — output SVLEN sign matches VCF spec: DEL is negative, DUP/INS/INV
+# positive. Confirms `signedSvlen` is applied at merge write time regardless
+# of input sign.
+timed("M17", "output SVLEN sign matches SVTYPE (DEL<0, DUP/INS/INV>0)"):
+  let outPath = tmpOut(".vcf")
+  let (_, code) = run("merge --min-jaccard 0.75 " &
+                      FixS1 & " " & FixS2 & " " & FixS3 & " -o " & outPath)
+  doAssert code == 0, "merge exited " & $code
+  let text = readFile(outPath)
+  discard tryRemoveFile(outPath)
+  var checkedDel, checkedDup, checkedIns, checkedInv: bool
+  for line in text.splitLines:
+    if line.len == 0 or line[0] == '#': continue
+    let cols = line.split('\t')
+    if cols.len < 8: continue
+    let info = parseInfoKV(cols[7])
+    if "SVTYPE" notin info or "SVLEN" notin info: continue
+    let svlen = parseInt(info["SVLEN"])
+    case info["SVTYPE"]
+    of "DEL":
+      doAssert svlen < 0, "DEL has non-negative SVLEN=" & $svlen & ": " & line
+      checkedDel = true
+    of "DUP":
+      doAssert svlen > 0, "DUP has non-positive SVLEN=" & $svlen & ": " & line
+      checkedDup = true
+    of "INS":
+      doAssert svlen > 0, "INS has non-positive SVLEN=" & $svlen & ": " & line
+      checkedIns = true
+    of "INV":
+      doAssert svlen > 0, "INV has non-positive SVLEN=" & $svlen & ": " & line
+      checkedInv = true
+    else: discard
+  doAssert checkedDel, "no DEL output records found — coverage gap"
+  doAssert checkedDup, "no DUP output records found — coverage gap"
+  doAssert checkedIns, "no INS output records found — coverage gap"
+  doAssert checkedInv, "no INV output records found — coverage gap"

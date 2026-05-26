@@ -228,6 +228,43 @@ timed("C13", "BND cluster: bracket-form ALT (N[chr1:32000[) preserved through co
       found = true
   doAssert found, "no BND row at pos 31000"
 
+# C14 — output SVLEN sign matches VCF spec: DEL is negative, DUP/INS/INV positive.
+# Input fixtures deliberately mix +ve/-ve SVLEN for DEL (TC13/TC14) to confirm
+# the spec-correct sign is applied at output write time regardless of input sign.
+timed("C14", "output SVLEN sign matches SVTYPE (DEL<0, DUP/INS/INV>0)"):
+  let outBcf = tmpBcf()
+  let (_, code) = run("collapse --min-jaccard 0.5 Caller1:" & FixCaller1 &
+                      " Caller2:" & FixCaller2 & " -o " & outBcf)
+  doAssert code == 0
+  let view = viewBcf(outBcf)
+  discard tryRemoveFile(outBcf)
+  var checkedDel, checkedPos: bool
+  for line in view.splitLines:
+    if line.len == 0 or line[0] == '#': continue
+    let cols = line.split('\t')
+    if cols.len < 8: continue
+    var svtype, svlenStr: string
+    for field in cols[7].split(';'):
+      let kv = field.split('=', 1)
+      if kv.len != 2: continue
+      case kv[0]
+      of "SVTYPE": svtype = kv[1]
+      of "SVLEN":  svlenStr = kv[1]
+    if svlenStr.len == 0: continue
+    let svlen = parseInt(svlenStr)
+    case svtype
+    of "DEL":
+      doAssert svlen < 0, "DEL record has non-negative SVLEN=" & svlenStr &
+                          " at line: " & line
+      checkedDel = true
+    of "DUP", "INS", "INV":
+      doAssert svlen > 0, svtype & " record has non-positive SVLEN=" & svlenStr &
+                          " at line: " & line
+      checkedPos = true
+    else: discard
+  doAssert checkedDel, "no DEL output records found — coverage gap"
+  doAssert checkedPos, "no DUP/INS/INV output records found — coverage gap"
+
 # CT03 — --format "" → output has zero sample columns
 timed("CT01", "--format '' produces zero-sample output"):
   let outBcf = tmpBcf()

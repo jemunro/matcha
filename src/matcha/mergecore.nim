@@ -919,7 +919,7 @@ proc addStandardSvInfoDefs*(hdr: ptr bcf_hdr_t) =
       "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">".cstring)
   if "SVLEN" notin have:
     discard bcf_hdr_append(hdr,
-      "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length of the SV (absolute value)\">".cstring)
+      "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Difference in length between REF and ALT alleles; negative for DEL\">".cstring)
   if "END" notin have:
     discard bcf_hdr_append(hdr,
       "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the SV (1-based, inclusive)\">".cstring)
@@ -1029,7 +1029,7 @@ proc augmentSrcHdrForRenames*(srcHdr: ptr bcf_hdr_t; ci: int;
   ensureInfo(srcHdr, "SRC_INDEX",  "1", "Integer", "matcha-internal: sequential record index")
   ensureInfo(srcHdr, "CALLER_IDX", "1", "Integer", "matcha-internal: caller index (0-based)")
   ensureInfo(srcHdr, "SVTYPE",      "1", "String",  "Type of structural variant")
-  ensureInfo(srcHdr, "SVLEN",       "1", "Integer", "Length of the SV")
+  ensureInfo(srcHdr, "SVLEN",       "1", "Integer", "Difference in length between REF and ALT alleles; negative for DEL")
   ensureInfo(srcHdr, "END",         "1", "Integer", "End position of the SV")
   ensureInfo(srcHdr, "CHR2",        "1", "String",  "Chromosome of mate breakend")
   ensureInfo(srcHdr, "POS2",        "1", "Integer", "Position of mate breakend")
@@ -1263,7 +1263,7 @@ proc runShardPass(bucket: seq[CallerBucketEntry]; mh: MergedHeader;
         var svtStr = $nr.svt
         discard bcf_update_info(srcHdr, rec, "SVTYPE".cstring,
                                 svtStr[0].addr, svtStr.len.cint, BCF_HT_STR.cint)
-        var svlenVal = nr.svlen.int32
+        var svlenVal = signedSvlen(nr.svt, nr.svlen)
         discard bcf_update_info(srcHdr, rec, "SVLEN".cstring,
                                 svlenVal.addr, 1.cint, BCF_HT_INT.cint)
         if nr.svt == svBND:

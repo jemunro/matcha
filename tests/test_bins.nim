@@ -5,6 +5,7 @@ echo "--------------- Test Bins ---------------"
 import std/sets
 import test_utils
 import matcha/bins
+import matcha/utils
 
 # ---------------------------------------------------------------------------
 # Bin assignment / range
@@ -142,3 +143,30 @@ timed("T05", "TiledBuffer: evict preserves current and previous tile"):
   doAssert 5 in buf.fetched, "tile 5 should still be present"
   doAssert 3 notin buf.fetched, "tile 3 should be evicted"
   doAssert 0 notin buf.fetched, "tile 0 should be evicted"
+
+# ---------------------------------------------------------------------------
+# signedSvlen — VCF-spec sign convention applied at output write time
+# ---------------------------------------------------------------------------
+
+# S01 — DEL emits negative SVLEN
+timed("S01", "signedSvlen: DEL → negative"):
+  doAssert signedSvlen(svDEL, 100) == -100'i32
+  doAssert signedSvlen(svDEL, 1)   ==   -1'i32
+
+# S02 — DUP/INS/INV emit positive SVLEN
+timed("S02", "signedSvlen: DUP/INS/INV → positive"):
+  doAssert signedSvlen(svDUP, 100) == 100'i32
+  doAssert signedSvlen(svINS, 100) == 100'i32
+  doAssert signedSvlen(svINV, 100) == 100'i32
+
+# S03 — BND and unknown types emit 0
+timed("S03", "signedSvlen: BND/TRA/UNKNOWN → 0"):
+  doAssert signedSvlen(svBND, 100)     == 0'i32
+  doAssert signedSvlen(svTRA, 100)     == 0'i32
+  doAssert signedSvlen(svUNKNOWN, 100) == 0'i32
+
+# S04 — magnitude 0 stays 0 regardless of type
+timed("S04", "signedSvlen: 0 magnitude → 0 for any svtype"):
+  doAssert signedSvlen(svDEL, 0) == 0'i32
+  doAssert signedSvlen(svDUP, 0) == 0'i32
+  doAssert signedSvlen(svINS, 0) == 0'i32
