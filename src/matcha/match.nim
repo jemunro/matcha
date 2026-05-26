@@ -66,7 +66,8 @@ proc poolWorker[R](state: ptr PoolState[R]) {.thread.} =
                ": " & $state.results[idx].len & " " & state.label)
 
 proc runJobsWithPool[R](jobs: seq[MatchJob]; cfg: MatchConfig;
-                        runner: JobRunner[R]; label: string): seq[seq[R]] =
+                        runner: JobRunner[R]; label: string;
+                        tag = ""): seq[seq[R]] =
   result = newSeq[seq[R]](jobs.len)
   if jobs.len == 0: return
   if cfg.nThreads == 1:
@@ -75,8 +76,9 @@ proc runJobsWithPool[R](jobs: seq[MatchJob]; cfg: MatchConfig;
       logVerbose("job " & job.chrom & "/" & $job.svtype & "/bin" & $job.binA &
                ": " & $result[i].len & " " & label)
   else:
+    let suffix = if tag.len > 0: " (" & tag & ")" else: ""
     logInfo("starting " & $cfg.nThreads & " worker thread(s) for " &
-            $jobs.len & " job(s)")
+            $jobs.len & " job(s)" & suffix)
     var state = PoolState[R](jobs: jobs, cfg: cfg,
                              results: newSeq[seq[R]](jobs.len),
                              runner: runner, label: label)
@@ -95,8 +97,9 @@ proc dispatchPairJob*(job: MatchJob, cfg: MatchConfig): seq[MatchPair] =
   elif job.svtype == svINS: streamInsJobPairs(job, cfg)
   else:                     streamJobPairs(job, cfg)
 
-proc runMatchPairJobsWithPool*(jobs: seq[MatchJob]; cfg: MatchConfig): seq[seq[MatchPair]] =
-  runJobsWithPool[MatchPair](jobs, cfg, dispatchPairJob, "pairs")
+proc runMatchPairJobsWithPool*(jobs: seq[MatchJob]; cfg: MatchConfig;
+                               tag = ""): seq[seq[MatchPair]] =
+  runJobsWithPool[MatchPair](jobs, cfg, dispatchPairJob, "pairs", tag)
 
 # ---------------------------------------------------------------------------
 # Top-level entry point

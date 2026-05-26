@@ -39,6 +39,7 @@ type
     callers*:      seq[CallerInput]
     keptChrs*:     seq[string]    ## --chrs: active set; empty = all input contigs.
     chrSet*:       seq[string]    ## --chr-set: universe; empty = all input contigs.
+    chunkSize*:    int64          ## --chunk-size: A-side POS range per job.
 
 # ---------------------------------------------------------------------------
 # buildFinalHdr — collapse-specific shared output header
@@ -381,6 +382,7 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
     tmpDir:         cfg.tmpDir,
     selfMode:       true,
     emitSingletons: true,
+    chunkSize:      cfg.chunkSize,
   )
 
   let (allJobs, _) = buildWorkQueue(mergedPreproc, mergedPreproc, matchCfg)

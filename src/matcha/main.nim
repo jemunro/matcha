@@ -33,6 +33,21 @@ proc parseIntOpt(v, flag: string): int =
   except ValueError:
     logError("--" & flag & " must be an integer, got: " & v); quit(1)
 
+proc parseChunkSizeArg*(raw: string): int64 =
+  if raw.len == 0:
+    logError("--chunk-size requires a value"); quit(1)
+  let suffix = raw[^1]
+  let digits = raw[0 ..< raw.len - 1]
+  if suffix != 'K' and suffix != 'M':
+    logError("--chunk-size suffix must be K or M (e.g. 100K, 50M), got: " & raw); quit(1)
+  var n: int64
+  try: n = parseInt(digits)
+  except ValueError:
+    logError("--chunk-size prefix must be a positive integer, got: " & raw); quit(1)
+  if n <= 0:
+    logError("--chunk-size must be > 0, got: " & raw); quit(1)
+  result = if suffix == 'K': n * 1_000 else: n * 1_000_000
+
 # Shared CLI state for the flags that are identical across all subcommands.
 type SharedOpts = object
   metric:    Metric
@@ -43,11 +58,13 @@ type SharedOpts = object
   keptChrs:  seq[string]   ## --chrs: active set; empty = all input contigs.
   chrSet:    seq[string]   ## --chr-set: universe for BND mates + header contigs;
                            ## empty = all input contigs (no BND-mate filter).
+  chunkSize: int64         ## --chunk-size: A-side POS range per job.
   overlapSet, jaccardSet, useShm: bool
 
 proc initSharedOpts(): SharedOpts =
   SharedOpts(metric: mJaccard, threshold: 0.75,
-             bndSlop: 50, insSlop: 50, insMinSim: 0.75, nThreads: 1)
+             bndSlop: 50, insSlop: 50, insMinSim: 0.75, nThreads: 1,
+             chunkSize: 50_000_000)
 
 proc parseSharedOpt(s: var SharedOpts, p: var OptParser, key: string): bool =
   result = true
@@ -86,6 +103,8 @@ proc parseSharedOpt(s: var SharedOpts, p: var OptParser, key: string): bool =
     s.keptChrs = parseChrsArg(nextVal(p, "chrs"))
   of "chr-set":
     s.chrSet = parseChrsArg(nextVal(p, "chr-set"))
+  of "chunk-size":
+    s.chunkSize = parseChunkSizeArg(nextVal(p, "chunk-size"))
   of "v", "verbose":
     setVerbose(true)
   else:
@@ -109,6 +128,7 @@ template applySharedOpts(s: SharedOpts, cfg: typed) =
   cfg.nThreads  = s.nThreads
   cfg.keptChrs  = s.keptChrs
   cfg.chrSet    = s.chrSet
+  cfg.chunkSize = s.chunkSize
   # --chr-set given without --chrs: default the active set to chr-set so
   # output records and header contigs stay consistent.
   if cfg.chrSet.len > 0 and cfg.keptChrs.len == 0:
@@ -190,6 +210,8 @@ proc writePreprocUsageLines(f: File) =
   f.writeLine "  --chrs CHR[,CHR...]             restrict output to listed chromosomes (active set)"
   f.writeLine "  --chr-set CHR[,CHR...]          universe: BND-mate filter + header contigs"
   f.writeLine "                                  (default: all input contigs; no BND drop)"
+  f.writeLine "  --chunk-size INT[K|M]           A-side POS window per parallel job (default: 50M)"
+  f.writeLine "                                  suffix K=×1,000 or M=×1,000,000 required"
   f.writeLine "  --threads INT                   number of worker threads (default: 1)"
   f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
   f.writeLine "  --use-shm                       write temp BCFs to /dev/shm (RAM); faster if $TMPDIR"

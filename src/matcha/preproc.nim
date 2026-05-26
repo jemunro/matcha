@@ -64,6 +64,8 @@ type
     pathA*:    string
     fileIdxA*: int16                                   ## Index into the run's slim-BCF file list.
     binsB*:    Table[int, BinBEntry]                   ## binB → (B's path, B's file index)
+    posStart*: int32                                   ## 1-based inclusive start of A-side position range.
+    posEnd*:   int32                                   ## 1-based inclusive end of A-side position range.
 
   SkipReason* = enum
     skUnsupportedSvtype
@@ -770,11 +772,25 @@ proc buildWorkQueue*(a, b: PreprocOutput,
         chromsB.incl(c)
     for chrom in chromsA:
       if chrom notin chromsB: continue
-      jobs.add(MatchJob(
-        chrom:    chrom, chromIdx: int16(chromIdx.getOrDefault(chrom, 0)),
-        svtype:   svt, binA: binA,
-        pathA:    pathA, fileIdxA: pathToIdx[pathA], binsB: binsB,
-      ))
+      let chromLen = a.chromLens.getOrDefault(chrom, 0)
+      if cfg.chunkSize > 0 and chromLen > 0:
+        let nChunks = (chromLen + cfg.chunkSize - 1) div cfg.chunkSize
+        for k in 0 ..< nChunks:
+          let ps = int32(k * cfg.chunkSize + 1)
+          let pe = int32(min((k + 1) * cfg.chunkSize, chromLen))
+          jobs.add(MatchJob(
+            chrom:    chrom, chromIdx: int16(chromIdx.getOrDefault(chrom, 0)),
+            svtype:   svt, binA: binA,
+            pathA:    pathA, fileIdxA: pathToIdx[pathA], binsB: binsB,
+            posStart: ps, posEnd: pe,
+          ))
+      else:
+        jobs.add(MatchJob(
+          chrom:    chrom, chromIdx: int16(chromIdx.getOrDefault(chrom, 0)),
+          svtype:   svt, binA: binA,
+          pathA:    pathA, fileIdxA: pathToIdx[pathA], binsB: binsB,
+          posStart: 1'i32, posEnd: high(int32),
+        ))
 
   # Sort: largest A BCF first (LPT heuristic), then longer chrom first, then
   # (svtype, binA) for determinism. Collect sizes once to avoid repeated stat().

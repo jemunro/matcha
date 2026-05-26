@@ -40,6 +40,7 @@ type
     keptChrs*:     seq[string]    ## --chrs: active set; empty = all input contigs.
     chrSet*:       seq[string]    ## --chr-set: universe; empty = all input contigs.
     missingToRef*: bool           ## --missing-to-ref: absent samples → 0/0.
+    chunkSize*:    int64          ## --chunk-size: A-side POS range per job.
 
 # ---------------------------------------------------------------------------
 # Sample-ID validation
@@ -865,6 +866,7 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
     tmpDir:         cfgMut.tmpDir,
     selfMode:       true,
     emitSingletons: true,
+    chunkSize:      cfgMut.chunkSize,
   )
 
   # SID → output sample index table.

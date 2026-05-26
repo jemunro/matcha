@@ -664,7 +664,8 @@ proc clusterPoolWorker(state: ptr ClusterPoolState) {.thread.} =
       logVerbose("cluster batch tasks=" & $job.tasks.len &
                  ": " & $state.results[idx].len & " cluster(s)")
 
-proc runClusterJobsWithPool(jobs: seq[ClusterJob]; nThreads: int): seq[seq[seq[int32]]] =
+proc runClusterJobsWithPool(jobs: seq[ClusterJob]; nThreads: int;
+                            tag = ""): seq[seq[seq[int32]]] =
   result = newSeq[seq[seq[int32]]](jobs.len)
   if jobs.len == 0: return
   if nThreads == 1:
@@ -673,8 +674,9 @@ proc runClusterJobsWithPool(jobs: seq[ClusterJob]; nThreads: int): seq[seq[seq[i
       logVerbose("cluster batch tasks=" & $job.tasks.len &
                  ": " & $result[i].len & " cluster(s)")
   else:
+    let suffix = if tag.len > 0: " (" & tag & ")" else: ""
     logInfo("starting " & $nThreads & " cluster worker thread(s) for " &
-            $jobs.len & " job(s)")
+            $jobs.len & " job(s)" & suffix)
     var state = ClusterPoolState(jobs: jobs,
                                  results: newSeq[seq[seq[int32]]](jobs.len))
     state.next.store(0, moRelaxed)
@@ -707,7 +709,7 @@ proc selfMatchAndClusterChrom*(mergedPreproc: PreprocOutput;
                     mergedPreproc.chromOrder[jobs[0].chromIdx.int]
                   else: "?"
 
-  let perJob = runMatchPairJobsWithPool(jobs, matchCfg)
+  let perJob = runMatchPairJobsWithPool(jobs, matchCfg, tag = chromName)
   var pairCount = 0
   for jrs in perJob: pairCount += jrs.len
   logVerbose(modeTag & "/" & chromName & ": " & $pairCount & " pair(s)")
@@ -818,7 +820,8 @@ proc selfMatchAndClusterChrom*(mergedPreproc: PreprocOutput;
     clusterJobs[minIdx].tasks.add(t)
     loads[minIdx] += w
 
-  for jobOut in runClusterJobsWithPool(clusterJobs, matchCfg.nThreads):
+  for jobOut in runClusterJobsWithPool(clusterJobs, matchCfg.nThreads,
+                                       tag = chromName):
     for cl in jobOut: outFinalClusters.add(cl)
 
   logInfo(modeTag & "/" & chromName & ": " & $n & " record(s) -> " &

@@ -62,6 +62,7 @@ type
     dbFields*:      seq[string]  ## deduped DB SRCFIELDs (excluding MATCHA_*)
     keptChrs*:      seq[string]  ## --chrs: active set (output); empty = all input contigs.
     chrSet*:        seq[string]  ## --chr-set: universe; empty = all input contigs.
+    chunkSize*:     int64        ## --chunk-size: A-side POS range per job.
 
   AnnoMatch* = object
     aIndex*:     int32   ## SRC_INDEX of the A record (for grouping in phase 3)
@@ -507,6 +508,7 @@ proc runAnno*(cfg: var AnnoConfig) =
     metric: cfg.metric, threshold: cfg.threshold,
     bndSlop: cfg.bndSlop, insSlop: cfg.insSlop, insMinSim: cfg.insMinSim,
     nThreads: cfg.nThreads, tmpDir: cfg.tmpDir, selfMode: false,
+    chunkSize: cfg.chunkSize,
   )
   let (jobs, _) = buildWorkQueue(filesA, filesB, matchCfg)
   logInfo("anno work queue: " & $jobs.len & " (chrom, svtype, binA) job(s)")

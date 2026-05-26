@@ -176,7 +176,7 @@ proc streamJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
         fileIdx:  job.binsB[binB].fileIdx,
       ))
 
-  for va in vcfA.query(job.chrom):
+  for va in vcfA.query(job.chrom & ":" & $job.posStart & "-" & $job.posEnd):
     var endA: int64
     if not extractEnd(va, endData, svlenData, endA): continue
     let posA       = va.POS
@@ -263,7 +263,7 @@ proc streamBndJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
       fileIdx:  bFileIdx,
       chr2:     c2B.chr2))
 
-  for va in vcfA.query(job.chrom):
+  for va in vcfA.query(job.chrom & ":" & $job.posStart & "-" & $job.posEnd):
     let posA       = va.POS
     let srcIndexA  = readSrcIndex(va, idxData)
     let p2A = readPos2(va, pos2Data)
@@ -349,7 +349,7 @@ proc streamInsJobPairs*(job: MatchJob; cfg: MatchConfig): seq[MatchPair] =
       srcIndex: readSrcIndex(vb, idxData),
       fileIdx:  bFileIdx))
 
-  for va in vcfA.query(job.chrom):
+  for va in vcfA.query(job.chrom & ":" & $job.posStart & "-" & $job.posEnd):
     let posA       = va.POS
     let srcIndexA  = readSrcIndex(va, idxData)
     let svA = readSvlen(va, svlenData)

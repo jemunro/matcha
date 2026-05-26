@@ -74,6 +74,7 @@ type
     keptChrs*:        seq[string]  ## --chrs: active set (output); empty = all input contigs.
     chrSet*:          seq[string]  ## --chr-set: universe (BND mates + header contigs);
                                    ## empty = all input contigs (no BND-mate drop).
+    chunkSize*:       int64        ## --chunk-size: A-side POS range per job (default 50_000_000).
 
 const SupportedSvTypes* = {svDEL, svDUP, svINV, svBND, svINS}
 
