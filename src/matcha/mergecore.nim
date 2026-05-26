@@ -628,107 +628,6 @@ type
     fileList*:      seq[string]      ## file index → slim BCF path
 
 # ---------------------------------------------------------------------------
-# Per-chrom thread pool: builds simMap + union-find components in one edge pass
-# ---------------------------------------------------------------------------
-
-type
-  ChromJob = object
-    chromIdx:   int16
-    pairSlices: seq[seq[MatchPair]]            ## one slice per source MatchJob
-
-  ChromResult* = object
-    chromIdx*:    int16                        ## passes through unchanged from job
-    simMap*:      Table[(int32, int32), float64]
-    components*:  seq[seq[int32]]
-    locByIdx*:    Table[int32, tuple[chromIdx: int16; pos: int32; fileIdx: int16]]
-    passQualMap*: Table[int32, tuple[hasPASS: bool; qual: uint16; callerIdx: int32]]
-    meta*:        Table[int32, tuple[chromIdx: int16; svtype: int8; callerIdx: int16]]
-
-  ChromPoolState = object
-    jobs:    seq[ChromJob]
-    next:    Atomic[int]
-    results: seq[ChromResult]
-
-proc pairSliceTotal(job: ChromJob): int =
-  for s in job.pairSlices: result += s.len
-
-proc processChrom(job: ChromJob): ChromResult =
-  ## Per-chrom: walks pair slices once, building locByIdx / passQualMap / meta
-  ## (per-chrom Tables, merged into globals by the caller), plus simMap and
-  ## union-find components for the chrom. Subsumes the old serial partition.
-  result.chromIdx = job.chromIdx
-  var seenSet: HashSet[int32]
-  var offsets: seq[int32]
-  var edges:   seq[(int32, int32, float32)]
-  for slice in job.pairSlices:
-    for p in slice:
-      if p.srcIndexA notin seenSet:
-        seenSet.incl(p.srcIndexA)
-        offsets.add(p.srcIndexA)
-        result.locByIdx[p.srcIndexA] = (p.chromIdx, p.posA, p.fileIdxA)
-      if p.srcIndexB != NO_MATCH and p.srcIndexB notin seenSet:
-        seenSet.incl(p.srcIndexB)
-        offsets.add(p.srcIndexB)
-        result.locByIdx[p.srcIndexB] = (p.chromIdx, p.posB, p.fileIdxB)
-      # A-side metadata: first srcA occurrence (independent of seenSet, since
-      # an offset may first appear as srcB but still need its A-side fields).
-      if p.srcIndexA notin result.passQualMap:
-        result.passQualMap[p.srcIndexA] =
-          (hasPASS: p.passA, qual: p.qualQ, callerIdx: int32(p.callerIdxA))
-        result.meta[p.srcIndexA] = (p.chromIdx, p.svtype, p.callerIdxA)
-      if p.srcIndexB != NO_MATCH:
-        edges.add((p.srcIndexA, p.srcIndexB, p.sim))
-  let n = offsets.len
-  if n == 0: return
-  var offIdx: Table[int32, int]
-  for i, off in offsets.pairs: offIdx[off] = i
-  var uf = initUnionFind(n)
-  for (a, b, sim) in edges:
-    let k = pairKey(a, b)
-    let cur = result.simMap.getOrDefault(k, 0.0)
-    if float64(sim) > cur: result.simMap[k] = float64(sim)
-    let ia = offIdx.getOrDefault(a, -1)
-    let ib = offIdx.getOrDefault(b, -1)
-    if ia >= 0 and ib >= 0: union(uf, ia, ib)
-  var byRoot: Table[int, seq[int32]]
-  for i, off in offsets.pairs:
-    byRoot.mgetOrPut(find(uf, i), @[]).add(off)
-  for v in byRoot.values: result.components.add(v)
-
-proc chromPoolWorker(state: ptr ChromPoolState) {.thread.} =
-  {.cast(gcsafe).}:
-    while true:
-      let idx = state.next.fetchAdd(1, moRelaxed)
-      if idx >= state.jobs.len: break
-      state.results[idx] = processChrom(state.jobs[idx])
-      logVerbose("chrom job pairs=" & $pairSliceTotal(state.jobs[idx]) &
-                 " offsets=" & $state.results[idx].locByIdx.len &
-                 ": " & $state.results[idx].components.len & " component(s)")
-
-proc runChromJobsWithPool(jobs: seq[ChromJob]; nThreads: int): seq[ChromResult] =
-  result = newSeq[ChromResult](jobs.len)
-  if jobs.len == 0: return
-  if nThreads == 1:
-    for i, job in jobs.pairs:
-      result[i] = processChrom(job)
-      logVerbose("chrom job pairs=" & $pairSliceTotal(job) &
-                 " offsets=" & $result[i].locByIdx.len &
-                 ": " & $result[i].components.len & " component(s)")
-  else:
-    logInfo("starting " & $nThreads & " chrom worker thread(s) for " &
-            $jobs.len & " job(s)")
-    var state = ChromPoolState(jobs: jobs,
-                               results: newSeq[ChromResult](jobs.len))
-    state.next.store(0, moRelaxed)
-    var threads = newSeq[Thread[ptr ChromPoolState]](nThreads)
-    for i in 0 ..< nThreads:
-      createThread(threads[i], chromPoolWorker, addr state)
-    for i in 0 ..< nThreads:
-      joinThread(threads[i])
-    result = state.results
-    logVerbose("chrom workers complete")
-
-# ---------------------------------------------------------------------------
 # Cluster thread pool (mirror of match.nim's lock-free PoolState pattern)
 # ---------------------------------------------------------------------------
 
@@ -793,128 +692,122 @@ proc runClusterJobsWithPool(jobs: seq[ClusterJob]; nThreads: int): seq[seq[seq[i
     result = state.results
     logVerbose("cluster workers complete")
 
-proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
-                          matchCfg: MatchConfig;
-                          linkage: LinkageMethod;
-                          threshold: float64;
-                          priority: seq[PriorityCriterion];
-                          modeTag = "self-match";
-                          warnCallerStats: bool = true): ClusterPipelineResult =
-  let (jobs, fileList) = buildWorkQueue(mergedPreproc, mergedPreproc, matchCfg)
-  logVerbose(modeTag & ": " & $jobs.len & " job(s)")
+proc selfMatchAndClusterChrom(mergedPreproc: PreprocOutput;
+                              matchCfg: MatchConfig;
+                              jobs: seq[MatchJob];
+                              linkage: LinkageMethod;
+                              threshold: float64;
+                              priority: seq[PriorityCriterion];
+                              modeTag: string;
+                              warnCallerStats: bool;
+                              outLocByIdx: var Table[int32, tuple[chromIdx: int16; pos: int32; fileIdx: int16]];
+                              outPassQualMap: var Table[int32, tuple[hasPASS: bool; qual: uint16; callerIdx: int32]];
+                              outFinalClusters: var seq[seq[int32]]) =
+  ## Run pair-finding + clustering for one chromosome's worth of jobs and
+  ## append results into the caller's accumulators. simMap, components, meta,
+  ## etc. are local to this proc, so they die at function exit — bounding the
+  ## peak intermediate memory to the largest single chromosome.
+  if jobs.len == 0: return
 
-  # Dispatch per-job MatchPair outputs into per-chrom ChromJob buckets without
-  # ever materializing a flat allPairs. Each MatchJob has a single chromIdx so
-  # we can route its entire output slice as-is (move semantics — no copy).
-  var perJob = runMatchPairJobsWithPool(jobs, matchCfg)
+  let chromName = if jobs[0].chromIdx.int < mergedPreproc.chromOrder.len:
+                    mergedPreproc.chromOrder[jobs[0].chromIdx.int]
+                  else: "?"
+
+  let perJob = runMatchPairJobsWithPool(jobs, matchCfg)
   var pairCount = 0
   for jrs in perJob: pairCount += jrs.len
-  logVerbose(modeTag & ": " & $pairCount & " pair(s)")
+  logVerbose(modeTag & "/" & chromName & ": " & $pairCount & " pair(s)")
 
+  # Single pass over pair slices: build offsets, edges, locByIdx, passQualMap,
+  # meta. Tables/locByIdx/passQualMap entries are appended to the caller's
+  # accumulators directly; meta stays local for the warning pass below.
   type Meta = tuple[chromIdx: int16; svtype: int8; callerIdx: int16]
-  var chromKey:  Table[int16, int]
-  var chromJobs: seq[ChromJob]
-  for i in 0 ..< perJob.len:
-    let ci = jobs[i].chromIdx
-    if ci notin chromKey:
-      chromKey[ci] = chromJobs.len
-      chromJobs.add(ChromJob(chromIdx: ci))
-    chromJobs[chromKey[ci]].pairSlices.add(move(perJob[i]))
+  var seenSet: HashSet[int32]
+  var offsets: seq[int32]
+  var edges:   seq[(int32, int32, float32)]
+  var meta:    Table[int32, Meta]
+  for slice in perJob:
+    for p in slice:
+      if p.srcIndexA notin seenSet:
+        seenSet.incl(p.srcIndexA)
+        offsets.add(p.srcIndexA)
+        outLocByIdx[p.srcIndexA] = (p.chromIdx, p.posA, p.fileIdxA)
+      if p.srcIndexB != NO_MATCH and p.srcIndexB notin seenSet:
+        seenSet.incl(p.srcIndexB)
+        offsets.add(p.srcIndexB)
+        outLocByIdx[p.srcIndexB] = (p.chromIdx, p.posB, p.fileIdxB)
+      # A-side metadata: first srcA occurrence (independent of seenSet, since
+      # an offset may first appear as srcB but still need its A-side fields).
+      if p.srcIndexA notin outPassQualMap:
+        outPassQualMap[p.srcIndexA] =
+          (hasPASS: p.passA, qual: p.qualQ, callerIdx: int32(p.callerIdxA))
+        meta[p.srcIndexA] = (p.chromIdx, p.svtype, p.callerIdxA)
+      if p.srcIndexB != NO_MATCH:
+        edges.add((p.srcIndexA, p.srcIndexB, p.sim))
 
-  # LPT sort: largest chrom first so it doesn't trail a fast-finishing thread.
-  chromJobs.sort(proc(a, b: ChromJob): int = pairSliceTotal(b) - pairSliceTotal(a))
+  let n = offsets.len
+  if n == 0: return
 
-  # Per-chrom parallel: each worker walks its slices and builds simMap +
-  # components plus the per-chrom locByIdx/passQualMap/meta. Each ChromResult
-  # carries its chromIdx so we can re-map after the LPT sort permutes order.
-  var chromResults = runChromJobsWithPool(chromJobs, matchCfg.nThreads)
+  # Union-find over edges → connected components.
+  var simMap: Table[(int32, int32), float64]
+  var offIdx: Table[int32, int]
+  for i, off in offsets.pairs: offIdx[off] = i
+  var uf = initUnionFind(n)
+  for (a, b, sim) in edges:
+    let k = pairKey(a, b)
+    let cur = simMap.getOrDefault(k, 0.0)
+    if float64(sim) > cur: simMap[k] = float64(sim)
+    let ia = offIdx.getOrDefault(a, -1)
+    let ib = offIdx.getOrDefault(b, -1)
+    if ia >= 0 and ib >= 0: union(uf, ia, ib)
+  var byRoot: Table[int, seq[int32]]
+  for i, off in offsets.pairs:
+    byRoot.mgetOrPut(find(uf, i), @[]).add(off)
+  var components: seq[seq[int32]]
+  for v in byRoot.values: components.add(v)
+  reset(edges); reset(offIdx); reset(byRoot); reset(seenSet); reset(offsets)
 
-  # Serial merge: union per-chrom locByIdx/passQualMap/meta into global maps.
-  # Keys are disjoint across chroms (matching is within-chrom), so straight
-  # assignment is safe and there's no conflict resolution.
-  result.locByIdx = initTable[int32,
-                              tuple[chromIdx: int16; pos: int32; fileIdx: int16]]()
-  var meta: Table[int32, Meta]
-  var totalOffsets = 0
-  for cr in chromResults:
-    for k, v in cr.locByIdx:    result.locByIdx[k]    = v
-    for k, v in cr.passQualMap: result.passQualMap[k] = v
-    for k, v in cr.meta:        meta[k]               = v
-    totalOffsets += cr.locByIdx.len
-  logVerbose(modeTag & ": " & $totalOffsets & " unique record(s)")
-
-  # locByIdx and meta are now fully merged into global maps; release per-chrom copies.
-  for cr in chromResults.mitems:
-    reset(cr.locByIdx)
-    reset(cr.meta)
-
-  # Warning pass: collect components at or above LargeComponentWarn, sort by
-  # size descending, then emit up to MaxLargeComponentWarns with a suppression
-  # note if there are more.
-  var largeComps: seq[tuple[n: int, chromName: string,
-                             svtypeStr: string, callerSuffix: string]]
-  for key in 0 ..< chromResults.len:
-    for offsets in chromResults[key].components:
-      if offsets.len < LargeComponentWarn: continue
-      let repMeta = meta.getOrDefault(offsets[0])
-      let chromName = if repMeta.chromIdx.int < mergedPreproc.chromOrder.len:
-                        mergedPreproc.chromOrder[repMeta.chromIdx.int]
-                      else: "?"
-      var callerSuffix = ""
-      if warnCallerStats:
-        var callerCounts: Table[int16, int]
-        for srcIdx in offsets:
-          let ci = meta.getOrDefault(srcIdx).callerIdx
-          callerCounts[ci] = callerCounts.getOrDefault(ci, 0) + 1
-        var callerK: int16 = 0
-        var callerBest = -1
-        for k, c in callerCounts.pairs:
-          if c > callerBest: callerBest = c; callerK = k
-        callerSuffix = " dominant=caller" & $callerK & ":" &
-                       formatFloat(100.0 * float(callerBest) / float(offsets.len),
-                                   ffDecimal, 2) & "% — possible caller artifact"
-      largeComps.add((n: offsets.len, chromName: chromName,
-                      svtypeStr: $SvType(repMeta.svtype),
-                      callerSuffix: callerSuffix))
-  largeComps.sort(proc(a, b: auto): int = b.n - a.n)
-  const MaxLargeComponentWarns = 10
-  for i in 0 ..< min(largeComps.len, MaxLargeComponentWarns):
-    let lc = largeComps[i]
-    logWarn(modeTag & ": large cluster component: " & lc.chromName & "/" &
-            lc.svtypeStr & " N=" & $lc.n & lc.callerSuffix)
-  if largeComps.len > MaxLargeComponentWarns:
-    logWarn(modeTag & ": " & $(largeComps.len - MaxLargeComponentWarns) &
-            " more large cluster component(s) not shown")
+  # Large-component warning (per-chrom, no global top-N cap).
+  for comp in components:
+    if comp.len < LargeComponentWarn: continue
+    let repMeta = meta.getOrDefault(comp[0])
+    var callerSuffix = ""
+    if warnCallerStats:
+      var callerCounts: Table[int16, int]
+      for srcIdx in comp:
+        let ci = meta.getOrDefault(srcIdx).callerIdx
+        callerCounts[ci] = callerCounts.getOrDefault(ci, 0) + 1
+      var callerK: int16 = 0
+      var callerBest = -1
+      for k, c in callerCounts.pairs:
+        if c > callerBest: callerBest = c; callerK = k
+      callerSuffix = " dominant=caller" & $callerK & ":" &
+                     formatFloat(100.0 * float(callerBest) / float(comp.len),
+                                 ffDecimal, 2) & "% — possible caller artifact"
+    logWarn(modeTag & ": large cluster component: " & chromName & "/" &
+            $SvType(repMeta.svtype) & " N=" & $comp.len & callerSuffix)
   reset(meta)
 
-  # Singletons need no agglomerative work nor representative selection — emit
-  # them directly to result.finalClusters. Non-singletons become ClusterTasks
-  # carrying per-chrom simMap + passQualMap pointers; the worker pool runs
-  # agglomerateComponent + selectRepresentative and returns finalized ordered
-  # (representative-first) clusters. chromResults is fixed-size from here on,
-  # so the addresses stay stable.
-  var totalComponents = 0
-  for cr in chromResults: totalComponents += cr.components.len
-  result.finalClusters = newSeqOfCap[seq[int32]](totalComponents)
-
+  # Singletons emit directly. Non-singletons become ClusterTasks carrying ptrs
+  # to this chrom's simMap + the caller's passQualMap (stable for the duration
+  # of the cluster pool call).
   var tasks: seq[ClusterTask]
-  for key in 0 ..< chromResults.len:
-    let simMapPtr   = addr chromResults[key].simMap
-    let passQualPtr = addr chromResults[key].passQualMap
-    for offsets in chromResults[key].components:
-      if offsets.len == 1:
-        result.finalClusters.add(offsets)
-      else:
-        tasks.add(ClusterTask(offsets: offsets, simMap: simMapPtr,
-                              passQualMap: passQualPtr))
-  # components are now in ClusterTask.offsets or singletons; release per-chrom copies.
-  for cr in chromResults.mitems:
-    reset(cr.components)
+  let simMapPtr   = addr simMap
+  let passQualPtr = addr outPassQualMap
+  for comp in components:
+    if comp.len == 1:
+      outFinalClusters.add(comp)
+    else:
+      tasks.add(ClusterTask(offsets: comp, simMap: simMapPtr,
+                            passQualMap: passQualPtr))
+  reset(components)
+
+  if tasks.len == 0:
+    logInfo(modeTag & "/" & chromName & ": " & $n & " record(s) -> " &
+            $outFinalClusters.len & " cluster(s) (cumulative)")
+    return
 
   # LPT bucketing: largest-cost task first, assign to least-loaded bucket.
-  # Cost weight ∝ N² is an upper bound on both dense O(N³) and sparse
-  # O((N+E) log N) per-component costs, biasing the largest components into
-  # isolated buckets which is exactly the LPT goal.
   tasks.sort(proc(a, b: ClusterTask): int = b.offsets.len - a.offsets.len)
   let nBuckets = max(1, matchCfg.nThreads)
   var clusterJobs = newSeq[ClusterJob](nBuckets)
@@ -931,15 +824,40 @@ proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
     clusterJobs[minIdx].tasks.add(t)
     loads[minIdx] += w
 
-  # Pool returns finalized ordered clusters → flat-add into finalClusters.
   for jobOut in runClusterJobsWithPool(clusterJobs, matchCfg.nThreads):
-    for cl in jobOut: result.finalClusters.add(cl)
-  # ClusterTask pointers are dead; release remaining per-chrom tables (simMap, passQualMap).
-  chromResults.setLen(0)
+    for cl in jobOut: outFinalClusters.add(cl)
 
-  logInfo(modeTag & ": " & $totalOffsets & " record(s) -> " &
-          $result.finalClusters.len & " cluster(s)")
+  logInfo(modeTag & "/" & chromName & ": " & $n & " record(s) -> " &
+          $outFinalClusters.len & " cluster(s) (cumulative)")
+
+proc selfMatchAndCluster*(mergedPreproc: PreprocOutput;
+                          matchCfg: MatchConfig;
+                          linkage: LinkageMethod;
+                          threshold: float64;
+                          priority: seq[PriorityCriterion];
+                          modeTag = "self-match";
+                          warnCallerStats: bool = true): ClusterPipelineResult =
+  ## Dispatch matching + clustering chromosome-by-chromosome. Each chrom's
+  ## simMap / components live only for the duration of `selfMatchAndClusterChrom`,
+  ## so peak intermediate memory tracks the largest single chrom rather than
+  ## the whole cohort.
+  let (jobs, fileList) = buildWorkQueue(mergedPreproc, mergedPreproc, matchCfg)
   result.fileList = fileList
+  logVerbose(modeTag & ": " & $jobs.len & " job(s) across " &
+             $mergedPreproc.chromOrder.len & " chrom(s)")
+
+  # Group jobs by chrom in chromOrder order so output is naturally sorted.
+  var jobsByChrom: Table[int16, seq[MatchJob]]
+  for j in jobs:
+    jobsByChrom.mgetOrPut(j.chromIdx, @[]).add(j)
+
+  for chromIdx in 0'i16 ..< mergedPreproc.chromOrder.len.int16:
+    let cjobs = jobsByChrom.getOrDefault(chromIdx, @[])
+    if cjobs.len == 0: continue
+    selfMatchAndClusterChrom(
+      mergedPreproc, matchCfg, cjobs, linkage, threshold, priority,
+      modeTag, warnCallerStats,
+      result.locByIdx, result.passQualMap, result.finalClusters)
 
 # ---------------------------------------------------------------------------
 # integratedMerge — fused preproc + merge in one synced_bcf_reader pass
