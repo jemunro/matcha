@@ -44,6 +44,31 @@ proc bgzfHandle*(v: VCF): ptr BGZF {.inline.} =
 proc vcfHtsFile*(v: VCF): ptr htsFile {.inline.} =
   cast[VcfPriv](v).hts
 
+# ---------------------------------------------------------------------------
+# Writer-side BGZF threadpool
+# ---------------------------------------------------------------------------
+
+proc newWriterPool*(nThreads: int): htsThreadPool =
+  ## Allocate a shared BGZF threadpool, or a zeroed struct when nThreads <= 1
+  ## (which `attachWriterPool` treats as "no pool"). Caller must pair a
+  ## non-empty pool with `destroyWriterPool`.
+  if nThreads <= 1: return
+  result.pool = hts_tpool_init(nThreads.cint)
+  if result.pool == nil:
+    raise newException(IOError, "hts_tpool_init failed (n=" & $nThreads & ")")
+
+proc destroyWriterPool*(pool: var htsThreadPool) =
+  if pool.pool != nil:
+    hts_tpool_destroy(pool.pool)
+    pool.pool = nil
+
+proc attachWriterPool*(v: VCF; pool: var htsThreadPool) =
+  ## Attach a BGZF compression threadpool to an opened writer.
+  ## Call AFTER `open(...)` succeeds and BEFORE `write_header()`.
+  if pool.pool == nil: return
+  if hts_set_opt(vcfHtsFile(v), srs_hts_opt_thread_pool(), pool.addr) != 0:
+    raise newException(IOError, "hts_set_opt(HTS_OPT_THREAD_POOL) failed")
+
 type
   SvtypeBin* = tuple[svtype: SvType, bin: int]
 

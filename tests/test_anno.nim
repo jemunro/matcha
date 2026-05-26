@@ -247,16 +247,21 @@ timed("A20", "end-to-end: -o file output matches stdout output"):
   doAssert fileExists(tmpVcf)
   doAssert readFile(tmpVcf) == stdoutText
 
-timed("A21", "end-to-end: .bcf output written and indexed"):
+timed("A21", "end-to-end: .bcf output written; --write-index produces .csi"):
   let tmpBcf = getTempDir() / "matcha_anno_test.bcf"
   defer:
     if fileExists(tmpBcf): removeFile(tmpBcf)
     if fileExists(tmpBcf & ".csi"): removeFile(tmpBcf & ".csi")
-  let (_, code) = run("anno --min-overlap 0.5 -a X=max\\(AF\\) -o " &
+  let (_, code1) = run("anno --min-overlap 0.5 -a X=max\\(AF\\) -o " &
     tmpBcf & " " & FixtureA & " " & FixtureDB)
-  doAssert code == 0
+  doAssert code1 == 0
   doAssert fileExists(tmpBcf), "bcf not written"
-  doAssert fileExists(tmpBcf & ".csi"), "csi not written"
+  doAssert not fileExists(tmpBcf & ".csi"),
+    "csi should NOT be written by default (--write-index opt-in)"
+  let (_, code2) = run("anno --min-overlap 0.5 --write-index -a X=max\\(AF\\) -o " &
+    tmpBcf & " " & FixtureA & " " & FixtureDB)
+  doAssert code2 == 0
+  doAssert fileExists(tmpBcf & ".csi"), "csi not written with --write-index"
 
 timed("A23", "end-to-end: best() ranks by similarity, tie-breaks by posB"):
   # On DEL_A_06 both matches have the same overlap (0.95) → tied; the

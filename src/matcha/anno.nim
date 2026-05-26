@@ -63,6 +63,7 @@ type
     keptChrs*:      seq[string]  ## --chrs: active set (output); empty = all input contigs.
     chrSet*:        seq[string]  ## --chr-set: universe; empty = all input contigs.
     chunkSize*:     int64        ## --chunk-size: A-side POS range per job.
+    writeIndex*:    bool         ## --write-index: emit CSI alongside output.
 
   AnnoMatch* = object
     aIndex*:     int32   ## SRC_INDEX of the A record (for grouping in phase 3)
@@ -581,22 +582,11 @@ proc runAnno*(cfg: var AnnoConfig) =
   let outPath = if isStdoutPath(cfg.outputPath): "/dev/stdout" else: cfg.outputPath
   if not open(outWriter, outPath, mode = "w"):
     raise newException(IOError, "cannot open output: " & outPath)
+  var writerPool = newWriterPool(cfg.nThreads)
+  attachWriterPool(outWriter, writerPool)
   outWriter.copy_header(vcfA.header)
   if not outWriter.write_header():
     raise newException(IOError, "failed to write output header")
-
-  # bgzf_mt is intentionally skipped when building an inline CSI index: in MT
-  # mode bgzf_tell returns a stale block_address (not updated until the worker
-  # thread flushes the block), corrupting all virtual offsets beyond the first
-  # BGZF block.  Revisit using bcf_idx_init/bcf_idx_save for MT-safe indexing.
-  let isBgzf = not isStdoutPath(cfg.outputPath) and
-               (outPath.endsWith(".bcf") or outPath.endsWith(".vcf.gz"))
-  var outIdx: ptr hts_idx_t = nil
-  if isBgzf:
-    let headerOff = uint64(bgzf_tell(bgzfHandle(outWriter)))
-    outIdx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
-    if outIdx == nil:
-      raise newException(IOError, "cannot create CSI index for: " & outPath)
 
   # Stream original A per-chrom (matching preproc's CSI iteration), joining
   # on SRC_INDEX (same sequential counter preproc assigned).
@@ -625,21 +615,17 @@ proc runAnno*(cfg: var AnnoConfig) =
       if not outWriter.write_variant(v):
         raise newException(IOError, "failed to write variant at " &
           $v.CHROM & ":" & $v.POS)
-      if outIdx != nil:
-        let woff = uint64(bgzf_tell(bgzfHandle(outWriter)))
-        discard hts_idx_push(outIdx, v.c.rid, v.c.pos, int64(v.c.pos + v.c.rlen), woff, 1)
 
   vcfA.close()
-  if outIdx != nil:
-    let finalOff = uint64(bgzf_tell(bgzfHandle(outWriter)))
-    hts_idx_finish(outIdx, finalOff)
   outWriter.close()
+  destroyWriterPool(writerPool)
   logInfo("anno: wrote " & $nInput & " record(s) (" &
           $nAnnotated & " annotated) to " &
           (if isStdoutPath(cfg.outputPath): "stdout" else: cfg.outputPath))
-  if outIdx != nil:
-    hts_idx_save(outIdx, cfg.outputPath.cstring, HTS_FMT_CSI.cint)
-    hts_idx_destroy(outIdx)
+  if cfg.writeIndex and not isStdoutPath(cfg.outputPath) and
+     (cfg.outputPath.endsWith(".bcf") or cfg.outputPath.endsWith(".vcf.gz")):
+    bcfBuildIndex(cfg.outputPath, cfg.outputPath & ".csi",
+                  csi = true, threads = max(cfg.nThreads, 1))
     logInfo("indexed " & cfg.outputPath)
 
   # Clean up: per-invocation temp dir (holds A and B preproc artifacts).

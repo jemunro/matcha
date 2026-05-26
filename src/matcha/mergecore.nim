@@ -10,7 +10,7 @@
 ##   agglomerateComponent  — Lance-Williams agglomerative clustering
 ##   selectRepresentative  — priority-cascade representative selection
 
-import std/[algorithm, atomics, heapqueue, os, sequtils, sets, strutils, tables]
+import std/[algorithm, atomics, bitops, heapqueue, os, sequtils, sets, strutils, tables]
 import hts
 import hts/private/hts_concat
 import utils, preproc, match, log, synced_bcf_reader
@@ -709,7 +709,7 @@ proc selfMatchAndClusterChrom*(mergedPreproc: PreprocOutput;
                     mergedPreproc.chromOrder[jobs[0].chromIdx.int]
                   else: "?"
 
-  let perJob = runMatchPairJobsWithPool(jobs, matchCfg, tag = chromName)
+  var perJob = runMatchPairJobsWithPool(jobs, matchCfg, tag = chromName)
   var pairCount = 0
   for jrs in perJob: pairCount += jrs.len
   logVerbose(modeTag & "/" & chromName & ": " & $pairCount & " pair(s)")
@@ -740,6 +740,8 @@ proc selfMatchAndClusterChrom*(mergedPreproc: PreprocOutput;
         meta[p.srcIndexA] = (p.chromIdx, p.svtype, p.callerIdxA)
       if p.srcIndexB != NO_MATCH:
         edges.add((p.srcIndexA, p.srcIndexB, p.sim))
+
+  reset(perJob)   # free pair memory before union-find; pairs are now in edges
 
   let n = offsets.len
   if n == 0: return
@@ -816,13 +818,16 @@ proc selfMatchAndClusterChrom*(mergedPreproc: PreprocOutput;
     var minIdx = 0
     for j in 1 ..< nBuckets:
       if loads[j] < loads[minIdx]: minIdx = j
-    let w = int64(t.offsets.len) * int64(t.offsets.len)
+    let nLen = t.offsets.len
+    let logN = int64(fastLog2(nLen) + 1)   # +1 so N=1 contributes nonzero weight
+    let w = int64(nLen) * int64(nLen) * logN
     clusterJobs[minIdx].tasks.add(t)
     loads[minIdx] += w
 
   for jobOut in runClusterJobsWithPool(clusterJobs, matchCfg.nThreads,
                                        tag = chromName):
     for cl in jobOut: outFinalClusters.add(cl)
+  reset(simMap)
 
   logInfo(modeTag & "/" & chromName & ": " & $n & " record(s) -> " &
           $outFinalClusters.len & " cluster(s) (cumulative)")

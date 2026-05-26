@@ -41,6 +41,7 @@ type
     chrSet*:       seq[string]    ## --chr-set: universe; empty = all input contigs.
     missingToRef*: bool           ## --missing-to-ref: absent samples → 0/0.
     chunkSize*:    int64          ## --chunk-size: A-side POS range per job.
+    writeIndex*:   bool           ## --write-index: emit CSI alongside output.
 
 # ---------------------------------------------------------------------------
 # Sample-ID validation
@@ -285,11 +286,11 @@ proc copyInfoField(dstHdr, srcHdr: ptr bcf_hdr_t; dst, src: ptr bcf1_t;
 type
   MergeWriterState = object
     outVcf:       VCF
-    outIdx:       ptr hts_idx_t
     totalWritten: int
 
 proc openMergeWriter(cfg: MergeConfig;
-                     outputHdr: ptr bcf_hdr_t): MergeWriterState =
+                     outputHdr: ptr bcf_hdr_t;
+                     pool: var htsThreadPool): MergeWriterState =
   let outPath = if isStdoutPath(cfg.outputPath): "/dev/stdout" else: cfg.outputPath
   let mode =
     if cfg.outputPath.endsWith(".bcf"):       "wb"
@@ -298,6 +299,7 @@ proc openMergeWriter(cfg: MergeConfig;
 
   if not open(result.outVcf, outPath, mode = mode):
     raise newException(IOError, "cannot open output: " & outPath)
+  attachWriterPool(result.outVcf, pool)
   block:
     var dummy: VCF
     discard open(dummy, cfg.callers[0].path)
@@ -307,29 +309,15 @@ proc openMergeWriter(cfg: MergeConfig;
   result.outVcf.header.hdr = outputHdr  # SHARED — clear before close to avoid double-free
   discard result.outVcf.write_header()
 
-  # bgzf_mt is intentionally skipped when building an inline CSI index: in MT
-  # mode bgzf_tell returns a stale block_address (not updated until the worker
-  # thread flushes the block), corrupting all virtual offsets beyond the first
-  # BGZF block.  Revisit using bcf_idx_init/bcf_idx_save for MT-safe indexing.
-  let isBgzf = not isStdoutPath(cfg.outputPath) and
-               (cfg.outputPath.endsWith(".bcf") or cfg.outputPath.endsWith(".vcf.gz"))
-  if isBgzf:
-    let headerOff = uint64(bgzf_tell(bgzfHandle(result.outVcf)))
-    result.outIdx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
-    if result.outIdx == nil:
-      raise newException(IOError, "cannot create CSI index for: " & outPath)
-
 proc closeMergeWriter(state: var MergeWriterState; cfg: MergeConfig) =
-  if state.outIdx != nil:
-    let finalOff = uint64(bgzf_tell(bgzfHandle(state.outVcf)))
-    hts_idx_finish(state.outIdx, finalOff)
   state.outVcf.header.hdr = nil   # shared outputHdr; caller owns it
   state.outVcf.close()
   logInfo("merge: wrote " & $state.totalWritten & " record(s) to " &
        (if isStdoutPath(cfg.outputPath): "stdout" else: cfg.outputPath))
-  if state.outIdx != nil:
-    hts_idx_save(state.outIdx, cfg.outputPath.cstring, HTS_FMT_CSI.cint)
-    hts_idx_destroy(state.outIdx)
+  if cfg.writeIndex and not isStdoutPath(cfg.outputPath) and
+     (cfg.outputPath.endsWith(".bcf") or cfg.outputPath.endsWith(".vcf.gz")):
+    bcfBuildIndex(cfg.outputPath, cfg.outputPath & ".csi",
+                  csi = true, threads = max(cfg.nThreads, 1))
     logInfo("indexed " & cfg.outputPath)
 
 proc writeMergeChrom(state: var MergeWriterState;
@@ -756,10 +744,6 @@ proc writeMergeChrom(state: var MergeWriterState;
 
   for br in bufRows:
     discard bcf_write(vcfHtsFile(state.outVcf), outputHdr, br.rec)
-    if state.outIdx != nil:
-      let woff = uint64(bgzf_tell(bgzfHandle(state.outVcf)))
-      discard hts_idx_push(state.outIdx, br.rec.rid, int64(br.rec.pos),
-                           int64(br.rec.pos) + int64(br.rec.rlen), woff, 1)
     bcf_destroy(br.rec)
   state.totalWritten += bufRows.len
 
@@ -878,7 +862,8 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
   for j in allJobs:
     jobsByChrom.mgetOrPut(j.chromIdx, @[]).add(j)
 
-  var writerState = openMergeWriter(cfgMut, outputHdr)
+  var writerPool = newWriterPool(cfgMut.nThreads)
+  var writerState = openMergeWriter(cfgMut, outputHdr, writerPool)
 
   # Open merged slim BCFs once, indexed by fileIdx so writeMergeChrom can
   # look up the right handle via locByIdx[idx].fileIdx.
@@ -905,6 +890,7 @@ proc runMerge*(cfg: MergeConfig; cmdLine: string = "") =
 
   for v in mergedBcfs.mitems: v.close()
   closeMergeWriter(writerState, cfgMut)
+  destroyWriterPool(writerPool)
 
   # Teardown.
   removeDir(cfgMut.tmpDir)

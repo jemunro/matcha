@@ -40,6 +40,7 @@ type
     keptChrs*:     seq[string]    ## --chrs: active set; empty = all input contigs.
     chrSet*:       seq[string]    ## --chr-set: universe; empty = all input contigs.
     chunkSize*:    int64          ## --chunk-size: A-side POS range per job.
+    writeIndex*:   bool           ## --write-index: emit CSI alongside output.
 
 # ---------------------------------------------------------------------------
 # buildFinalHdr — collapse-specific shared output header
@@ -132,7 +133,6 @@ type
 
   CollapseWriterState = object
     outVcf:       VCF
-    outIdx:       ptr hts_idx_t
     totalWritten: int
 
 proc keepInfoOut(name: string; infoFilter: seq[string]): bool =
@@ -146,9 +146,10 @@ proc keepInfoOut(name: string; infoFilter: seq[string]): bool =
   false
 
 proc openCollapseWriter(cfg: CollapseConfig;
-                        finalHdr: ptr bcf_hdr_t): CollapseWriterState =
-  ## Open the output VCF/BCF, install the shared finalHdr, write the header,
-  ## and (when applicable) initialize an inline CSI index.
+                        finalHdr: ptr bcf_hdr_t;
+                        pool: var htsThreadPool): CollapseWriterState =
+  ## Open the output VCF/BCF, attach the shared BGZF compression pool,
+  ## install the shared finalHdr, and write the header.
   let outPath = if isStdoutPath(cfg.outputPath): "/dev/stdout" else: cfg.outputPath
   let mode =
     if cfg.outputPath.endsWith(".bcf"):      "wb"
@@ -157,6 +158,7 @@ proc openCollapseWriter(cfg: CollapseConfig;
 
   if not open(result.outVcf, outPath, mode = mode):
     raise newException(IOError, "cannot open output: " & outPath)
+  attachWriterPool(result.outVcf, pool)
   block:
     var dummy: VCF
     discard open(dummy, cfg.callers[0].path)
@@ -165,18 +167,6 @@ proc openCollapseWriter(cfg: CollapseConfig;
   bcf_hdr_destroy(result.outVcf.header.hdr)
   result.outVcf.header.hdr = finalHdr  # SHARED — clear before close to avoid double-free
   discard result.outVcf.write_header()
-
-  # bgzf_mt is intentionally skipped when building an inline CSI index: in MT
-  # mode bgzf_tell returns a stale block_address (not updated until the worker
-  # thread flushes the block), corrupting all virtual offsets beyond the first
-  # BGZF block.  Revisit using bcf_idx_init/bcf_idx_save for MT-safe indexing.
-  let isBgzf = not isStdoutPath(cfg.outputPath) and
-               (cfg.outputPath.endsWith(".bcf") or cfg.outputPath.endsWith(".vcf.gz"))
-  if isBgzf:
-    let headerOff = uint64(bgzf_tell(bgzfHandle(result.outVcf)))
-    result.outIdx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
-    if result.outIdx == nil:
-      raise newException(IOError, "cannot create CSI index for: " & outPath)
 
 proc writeCollapseChrom(state: var CollapseWriterState;
                         cfg: CollapseConfig;
@@ -247,25 +237,19 @@ proc writeCollapseChrom(state: var CollapseWriterState;
 
   for br in buf:
     discard bcf_write(vcfHtsFile(state.outVcf), finalHdr, br.rec)
-    if state.outIdx != nil:
-      let woff = uint64(bgzf_tell(bgzfHandle(state.outVcf)))
-      discard hts_idx_push(state.outIdx, br.rec.rid, int64(br.rec.pos),
-                           int64(br.rec.pos) + int64(br.rec.rlen), woff, 1)
     bcf_destroy(br.rec)
   state.totalWritten += buf.len
 
 proc closeCollapseWriter(state: var CollapseWriterState; cfg: CollapseConfig) =
-  ## Finalize CSI (if any), close the writer, log.
-  if state.outIdx != nil:
-    let finalOff = uint64(bgzf_tell(bgzfHandle(state.outVcf)))
-    hts_idx_finish(state.outIdx, finalOff)
+  ## Close the writer, log, and (if --write-index) build a CSI index.
   state.outVcf.header.hdr = nil   # shared finalHdr; caller owns it
   state.outVcf.close()
   logInfo("collapse: wrote " & $state.totalWritten & " record(s) to " &
           (if isStdoutPath(cfg.outputPath): "stdout" else: cfg.outputPath))
-  if state.outIdx != nil:
-    hts_idx_save(state.outIdx, cfg.outputPath.cstring, HTS_FMT_CSI.cint)
-    hts_idx_destroy(state.outIdx)
+  if cfg.writeIndex and not isStdoutPath(cfg.outputPath) and
+     (cfg.outputPath.endsWith(".bcf") or cfg.outputPath.endsWith(".vcf.gz")):
+    bcfBuildIndex(cfg.outputPath, cfg.outputPath & ".csi",
+                  csi = true, threads = max(cfg.nThreads, 1))
     logInfo("indexed " & cfg.outputPath)
 
 # ---------------------------------------------------------------------------
@@ -390,7 +374,8 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
   for j in allJobs:
     jobsByChrom.mgetOrPut(j.chromIdx, @[]).add(j)
 
-  var writerState = openCollapseWriter(cfg, finalHdr)
+  var writerPool = newWriterPool(cfg.nThreads)
+  var writerState = openCollapseWriter(cfg, finalHdr, writerPool)
 
   # Open merged slim BCFs once; each is CSI-indexed by integratedMerge.
   var mergedBcfs: seq[VCF]
@@ -417,6 +402,7 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
 
   for v in mergedBcfs.mitems: v.close()
   closeCollapseWriter(writerState, cfg)
+  destroyWriterPool(writerPool)
 
   # Clean up: per-invocation temp dir (merged slim BCFs + CSI indexes), and finalHdr.
   removeDir(cfg.tmpDir)

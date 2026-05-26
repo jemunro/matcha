@@ -148,6 +148,7 @@ type ClusterOpts = object
   formatFields: seq[string]
   infoFields:   seq[string]
   outputPath:   string
+  writeIndex:   bool
 
 proc initClusterOpts(): ClusterOpts =
   ClusterOpts(linkage: lmAverage,
@@ -188,6 +189,8 @@ proc parseClusterOpt(c: var ClusterOpts, p: var OptParser, key: string): bool =
     c.infoFields = nextVal(p, "info").split(',').mapIt(it.strip)
   of "o", "output":
     c.outputPath = nextVal(p, "o")
+  of "write-index":
+    c.writeIndex = true
   else:
     result = false
 
@@ -197,6 +200,7 @@ template applyClusterOpts(c: ClusterOpts, cfg: typed) =
   cfg.formatFields = c.formatFields
   cfg.infoFields   = c.infoFields
   cfg.outputPath   = c.outputPath
+  cfg.writeIndex   = c.writeIndex
 
 # Column width 34: option text padded to 34 chars before the description.
 proc writeMetricUsageLines(f: File) =
@@ -239,6 +243,7 @@ proc writeClusterUsageLines(f: File,
   f.writeLine "                                  default: " & infoDefault
   f.writeLine "  -o, --output PATH               output file (.vcf | .vcf.gz | .bcf)"
   f.writeLine "                                  default: uncompressed VCF to stdout"
+  f.writeLine "  --write-index                   emit CSI index alongside .bcf / .vcf.gz output"
 
 proc usage(code: int = 1) =
   let f = if code == 0: stdout else: stderr
@@ -352,6 +357,7 @@ proc annoUsage(code: int = 1) =
   f.writeLine "  -o PATH                         output (.vcf | .vcf.gz | .bcf); default stdout VCF"
   writeMetricUsageLines(f)
   f.writeLine "  --overwrite                     replace OUTFIELDs already in input header"
+  f.writeLine "  --write-index                   emit CSI index alongside .bcf / .vcf.gz output"
   writePreprocUsageLines(f)
   writeVerboseHelpLines(f, "show full help (functions, MATCHA_* variables)")
   f.writeLine ""
@@ -382,11 +388,12 @@ proc annoHelp() =
   f.writeLine "  -a OUTFIELD=FUNC(SRCFIELD)      annotation expression (repeatable, >=1 required)"
   f.writeLine "  -o PATH                         output file; format from extension:"
   f.writeLine "                                    .vcf     → uncompressed VCF"
-  f.writeLine "                                    .vcf.gz  → bgzipped VCF (+ .csi index)"
-  f.writeLine "                                    .bcf     → BCF (+ .csi index)"
+  f.writeLine "                                    .vcf.gz  → bgzipped VCF"
+  f.writeLine "                                    .bcf     → BCF"
   f.writeLine "                                  Default: uncompressed VCF to stdout."
   writeMetricUsageLines(f)
   f.writeLine "  --overwrite                     replace OUTFIELDs that already exist in input header"
+  f.writeLine "  --write-index                   emit CSI index alongside .bcf / .vcf.gz output"
   writePreprocUsageLines(f)
   writeVerboseHelpLines(f)
   f.writeLine ""
@@ -463,6 +470,8 @@ proc runAnnoCli(rawArgs: seq[string]) =
         cfg.outputPath = nextVal(p, "o")
       of "overwrite":
         cfg.overwrite = true
+      of "write-index":
+        cfg.writeIndex = true
       of "h", "help":
         annoHelp()
       else:
