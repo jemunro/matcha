@@ -60,7 +60,8 @@ type
     callsetB*:      string     ## database
     exprs*:         seq[AnnoExpr]
     dbFields*:      seq[string]  ## deduped DB SRCFIELDs (excluding MATCHA_*)
-    keptChrs*:      seq[string]  ## --chrs filter; empty = no filter.
+    keptChrs*:      seq[string]  ## --chrs: active set (output); empty = all input contigs.
+    chrSet*:        seq[string]  ## --chr-set: universe; empty = all input contigs.
 
   AnnoMatch* = object
     aIndex*:     int32   ## SRC_INDEX of the A record (for grouping in phase 3)
@@ -479,6 +480,7 @@ proc runAnno*(cfg: var AnnoConfig) =
   validateAnnoExprs(cfg)
 
   let keptChrsSet = toHashSet(cfg.keptChrs)
+  let chrSetSet   = toHashSet(cfg.chrSet)
 
   # --- Phase 1: preproc -----------------------------------------------------
   var filesA, filesB: PreprocOutput
@@ -487,14 +489,15 @@ proc runAnno*(cfg: var AnnoConfig) =
             (if cfg.dbFields.len > 0: " (B extra: " & cfg.dbFields.join(",") & ")" else: ""))
     (filesA, filesB) = runParallelPreproc(
       PreprocInput(path: cfg.callsetA, tmpDir: cfg.tmpDir, prefix: "A",
-                   ioThreads: 2, keptChrs: keptChrsSet),
+                   ioThreads: 2, keptChrs: keptChrsSet, chrSet: chrSetSet),
       PreprocInput(path: cfg.callsetB, tmpDir: cfg.tmpDir, prefix: "B",
-                   extraKeep: cfg.dbFields, ioThreads: 2, keptChrs: keptChrsSet))
+                   extraKeep: cfg.dbFields, ioThreads: 2,
+                   keptChrs: keptChrsSet, chrSet: chrSetSet))
   else:
     filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A",
-                           keptChrs = keptChrsSet)
+                           keptChrs = keptChrsSet, chrSet = chrSetSet)
     filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B", cfg.dbFields,
-                           keptChrs = keptChrsSet)
+                           keptChrs = keptChrsSet, chrSet = chrSetSet)
   var chrsSeen = filesA.chrsSeen
   for c in filesB.chrsSeen: chrsSeen.incl(c)
   warnMissingChrs(cfg.keptChrs, chrsSeen)
@@ -553,16 +556,17 @@ proc runAnno*(cfg: var AnnoConfig) =
   # IDs via the variant's source-header pointer; the writer then copies the
   # already-augmented header so reader and writer share the same ID space.
   registerOutputHeader(vcfA.header, cfg)
-  if keptChrsSet.len > 0:
-    # Drop excluded contigs from the header so the copied output header carries
-    # only the kept contigs. Records on excluded chroms are filtered below.
+  if chrSetSet.len > 0:
+    # Drop contigs outside the universe (chr-set) from the header so the copied
+    # output header carries only the universe contigs. Records on chroms outside
+    # the active set (chrs) are filtered below.
     var n: cint = 0
     let names = bcf_hdr_seqnames(vcfA.header.hdr, n.addr)
     if names != nil:
       var toRemove: seq[string]
       for i in 0 ..< n.int:
         let c = $names[i]
-        if c notin keptChrsSet: toRemove.add(c)
+        if c notin chrSetSet: toRemove.add(c)
       free(names)
       for c in toRemove:
         bcf_hdr_remove(vcfA.header.hdr, BCF_HEADER_TYPE.BCF_HL_CTG.cint, c.cstring)
@@ -592,34 +596,36 @@ proc runAnno*(cfg: var AnnoConfig) =
     if outIdx == nil:
       raise newException(IOError, "cannot create CSI index for: " & outPath)
 
-  # Stream original A, joining on SRC_INDEX (same counter preproc assigned).
+  # Stream original A per-chrom (matching preproc's CSI iteration), joining
+  # on SRC_INDEX (same sequential counter preproc assigned).
   var srcIdx: int32 = 0
   var nInput = 0
   var nAnnotated = 0
-  for v in vcfA:
-    let curIdx = srcIdx
-    inc srcIdx
-    if keptChrsSet.len > 0 and $v.CHROM notin keptChrsSet: continue
-    inc nInput
-    if curIdx in byAindex:
-      let matches = byAindex[curIdx]
-      for e in cfg.exprs:
-        let vals = applyAggFunc(e, matches)
-        setInfoValues(v, e, vals)
-      inc nAnnotated
-    else:
-      # No matches: still emit MATCHA_COUNT=0 for any expression that
-      # wraps MATCHA_COUNT; other expressions stay absent.
-      for e in cfg.exprs:
-        if e.matchaVar == mvCount:
-          var zero: int32 = 0
-          discard v.info.set(e.outField, zero)
-    if not outWriter.write_variant(v):
-      raise newException(IOError, "failed to write variant at " &
-        $v.CHROM & ":" & $v.POS)
-    if outIdx != nil:
-      let woff = uint64(bgzf_tell(bgzfHandle(outWriter)))
-      discard hts_idx_push(outIdx, v.c.rid, v.c.pos, int64(v.c.pos + v.c.rlen), woff, 1)
+  for chrom in filesA.chromOrder:
+    if keptChrsSet.len > 0 and chrom notin keptChrsSet: continue
+    for v in vcfA.query(chrom):
+      let curIdx = srcIdx
+      inc srcIdx
+      inc nInput
+      if curIdx in byAindex:
+        let matches = byAindex[curIdx]
+        for e in cfg.exprs:
+          let vals = applyAggFunc(e, matches)
+          setInfoValues(v, e, vals)
+        inc nAnnotated
+      else:
+        # No matches: still emit MATCHA_COUNT=0 for any expression that
+        # wraps MATCHA_COUNT; other expressions stay absent.
+        for e in cfg.exprs:
+          if e.matchaVar == mvCount:
+            var zero: int32 = 0
+            discard v.info.set(e.outField, zero)
+      if not outWriter.write_variant(v):
+        raise newException(IOError, "failed to write variant at " &
+          $v.CHROM & ":" & $v.POS)
+      if outIdx != nil:
+        let woff = uint64(bgzf_tell(bgzfHandle(outWriter)))
+        discard hts_idx_push(outIdx, v.c.rid, v.c.pos, int64(v.c.pos + v.c.rlen), woff, 1)
 
   vcfA.close()
   if outIdx != nil:

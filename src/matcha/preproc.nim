@@ -493,6 +493,16 @@ proc buildSlimHdr(src: ptr bcf_hdr_t,
           break
   discard bcf_hdr_sync(result)
 
+proc requireVcfIndex*(vcfPath: string) =
+  ## Hard-fail if no CSI/TBI index exists alongside the input file. matcha
+  ## reads inputs by chrom via region queries and won't fall back to a
+  ## full-file scan.
+  if not (fileExists(vcfPath & ".csi") or fileExists(vcfPath & ".tbi")):
+    logError("matcha requires a CSI/TBI index for input: " & vcfPath &
+             " (expected " & vcfPath & ".csi or " & vcfPath & ".tbi). " &
+             "Build with `bcftools index` or `tabix -p vcf`.")
+    quit(1)
+
 proc captureChromOrder*(h: vcf.Header): seq[string] =
   ## Return contig IDs in the order they appear in the VCF header.
   var n: cint = 0
@@ -506,7 +516,8 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
                     extraKeepInfo: openArray[string] = [],
                     ioThreads:    int  = 0;
                     noIndex:      bool = false;
-                    keptChrs:     HashSet[string] = initHashSet[string]()): PreprocOutput =
+                    keptChrs:     HashSet[string] = initHashSet[string]();
+                    chrSet:       HashSet[string] = initHashSet[string]()): PreprocOutput =
   ## Stream vcfPath, normalize each record, and write per-SVTYPE BCFs.
   ## When noIndex=false (default), all temp BCFs are CSI-indexed on return.
   ## Inputs may be VCF.gz or BCF.
@@ -515,6 +526,7 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   ## Used by `matcha anno` to carry user-requested DB fields into the
   ## per-(svtype, bin) BCFs alongside the default keep-set.
   logVerbose("[" & prefix & "] reading " & vcfPath)
+  requireVcfIndex(vcfPath)
   var vcf: VCF
   if not open(vcf, vcfPath, threads = ioThreads):
     raise newException(IOError, "cannot open VCF/BCF: " & vcfPath)
@@ -554,117 +566,118 @@ proc preprocessVcf*(vcfPath, tmpDir, prefix: string,
   for ctg in vcf.contigs:
     result.chromLens[ctg.name] = ctg.length
 
-  for v in vcf:
-    var curSrcIndex = srcIndex
-    inc srcIndex
-    inc lineno
-    inc ws.nRead
+  # Always iterate per-chrom via CSI/TBI: skips records on non-kept chroms
+  # without reading them, and gives consumers (anno's phase 3) a fixed
+  # iteration model to mirror. Index is mandatory.
+  for chrom in result.chromOrder:
+    if keptChrs.len > 0 and chrom notin keptChrs: continue
+    for v in vcf.query(chrom):
+      var curSrcIndex = srcIndex
+      inc srcIndex
+      inc lineno
+      inc ws.nRead
 
-    block recordBody:
-      if v.c.errcode == BCF_ERR_CTG_UNDEF:
-        warnSkip(skUnknownContig, ws, $v.CHROM, v.POS, $v.ID,
-                 "BCF_ERR_CTG_UNDEF")
-        break recordBody
+      block recordBody:
+        if v.c.errcode == BCF_ERR_CTG_UNDEF:
+          warnSkip(skUnknownContig, ws, $v.CHROM, v.POS, $v.ID,
+                   "BCF_ERR_CTG_UNDEF")
+          break recordBody
 
-      if v.ALT.len > 1:
-        logError("multiallelic record at " & $v.CHROM & ":" &
-                 $v.POS & " in " & vcfPath &
-                 " — split multiallelics before running matcha")
-        quit(1)
+        if v.ALT.len > 1:
+          logError("multiallelic record at " & $v.CHROM & ":" &
+                   $v.POS & " in " & vcfPath &
+                   " — split multiallelics before running matcha")
+          quit(1)
 
-      let chrom = $v.CHROM
-      let pos1  = v.POS
-      let curId = $v.ID
-      if keptChrs.len > 0 and chrom notin keptChrs:
-        inc ws.skipped[skChromFiltered]
-        break recordBody
-      let r = resolveRecord(v, ws, chrom, pos1, curId,
-                            svtypeStr, endData, svlenData, inslenData,
-                            leftSeqBuf, rightSeqBuf)
-      if not r.ok: break recordBody
-      if keptChrs.len > 0 and r.svt == svBND and r.bndChr2 notin keptChrs:
-        inc ws.skipped[skChromFiltered]
-        break recordBody
-      let svt    = r.svt
-      let endPos = r.endPos
-      let svlen  = r.svlen
-      let binIdx = r.binIdx
-      let bndChr2 = r.bndChr2
-      let bndPos2 = r.bndPos2
+        let pos1  = v.POS
+        let curId = $v.ID
+        let r = resolveRecord(v, ws, chrom, pos1, curId,
+                              svtypeStr, endData, svlenData, inslenData,
+                              leftSeqBuf, rightSeqBuf)
+        if not r.ok: break recordBody
+        if r.svt == svBND and chrSet.len > 0 and r.bndChr2 notin chrSet:
+          inc ws.skipped[skChromFiltered]
+          break recordBody
+        let svt    = r.svt
+        let endPos = r.endPos
+        let svlen  = r.svlen
+        let binIdx = r.binIdx
+        let bndChr2 = r.bndChr2
+        let bndPos2 = r.bndPos2
 
-      # Synthesize ID if missing
-      if curId.len == 0 or curId == ".":
-        v.ID = synthesizeId(chrom, pos1, svt, lineno)
-        inc ws.syntheticId
+        # Synthesize ID if missing
+        if curId.len == 0 or curId == ".":
+          v.ID = synthesizeId(chrom, pos1, svt, lineno)
+          inc ws.syntheticId
 
-      # Slim INFO: drop everything outside the per-SVTYPE keep-set (two-phase
-      # to avoid iterator invalidation as we delete).
-      let activeKeepSet =
-        if svt == svBND:   keepSetBnd
-        elif svt == svINS: keepSetIns
-        else:              keepSetInterval
-      toDelete.setLen(0)
-      for fld in v.info.fields:
-        if fld.name notin activeKeepSet:
-          toDelete.add(fld.name)
-      for name in toDelete:
-        discard v.info.delete(name)
+        # Slim INFO: drop everything outside the per-SVTYPE keep-set (two-phase
+        # to avoid iterator invalidation as we delete).
+        let activeKeepSet =
+          if svt == svBND:   keepSetBnd
+          elif svt == svINS: keepSetIns
+          else:              keepSetInterval
+        toDelete.setLen(0)
+        for fld in v.info.fields:
+          if fld.name notin activeKeepSet:
+            toDelete.add(fld.name)
+        for name in toDelete:
+          discard v.info.delete(name)
 
-      # Authoritative writes — only the fields in the active keep-set.
-      if svt == svBND:
-        # ALT parse wins over any stale INFO/CHR2 or INFO/POS2 in the input.
-        # endPos (= POS+1) is used only for hts_idx_push below; not written.
-        var chr2Str = bndChr2
-        discard v.info.set("CHR2", chr2Str)
-        var pos2I32 = bndPos2.int32
-        discard v.info.set("POS2", pos2I32)
-      elif svt == svINS:
-        var svlenI32 = svlen.int32
-        discard v.info.set("SVLEN", svlenI32)
-      else:
-        var endI32 = endPos.int32
-        discard v.info.set("END", endI32)
+        # Authoritative writes — only the fields in the active keep-set.
+        if svt == svBND:
+          # ALT parse wins over any stale INFO/CHR2 or INFO/POS2 in the input.
+          # endPos (= POS+1) is used only for hts_idx_push below; not written.
+          var chr2Str = bndChr2
+          discard v.info.set("CHR2", chr2Str)
+          var pos2I32 = bndPos2.int32
+          discard v.info.set("POS2", pos2I32)
+        elif svt == svINS:
+          var svlenI32 = svlen.int32
+          discard v.info.set("SVLEN", svlenI32)
+        else:
+          var endI32 = endPos.int32
+          discard v.info.set("END", endI32)
 
-      # Lazily open per-(svtype, bin) writer.
-      let key: SvtypeBin = (svt, binIdx)
-      if key notin writers:
-        let path = tempBcfPath(tmpDir, prefix, $svt, binIdx)
-        var wtr: VCF
-        if not open(wtr, path, mode = "wb"):
-          raise newException(IOError, "cannot create temp BCF: " & path)
-        wtr.copy_header(vcf.header)   # initializes wtr.header (open leaves it nil)
-        let slimHdr =
-          if svt == svBND:   slimHdrBnd
-          elif svt == svINS: slimHdrIns
-          else:              slimHdrInterval
-        bcf_hdr_destroy(wtr.header.hdr)
-        wtr.header.hdr = bcf_hdr_dup(slimHdr)
-        wtr.set_samples(@["^"])   # temp BCFs carry no sample columns
-        discard wtr.write_header()
-        writers[key] = wtr
-        result.paths[key] = path
+        # Lazily open per-(svtype, bin) writer.
+        let key: SvtypeBin = (svt, binIdx)
+        if key notin writers:
+          let path = tempBcfPath(tmpDir, prefix, $svt, binIdx)
+          var wtr: VCF
+          if not open(wtr, path, mode = "wb"):
+            raise newException(IOError, "cannot create temp BCF: " & path)
+          wtr.copy_header(vcf.header)   # initializes wtr.header (open leaves it nil)
+          let slimHdr =
+            if svt == svBND:   slimHdrBnd
+            elif svt == svINS: slimHdrIns
+            else:              slimHdrInterval
+          bcf_hdr_destroy(wtr.header.hdr)
+          wtr.header.hdr = bcf_hdr_dup(slimHdr)
+          wtr.set_samples(@["^"])   # temp BCFs carry no sample columns
+          discard wtr.write_header()
+          writers[key] = wtr
+          result.paths[key] = path
+          if not noIndex:
+            let headerOff = uint64(bgzf_tell(bgzfHandle(wtr)))
+            let idx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
+            if idx == nil:
+              raise newException(IOError, "cannot create CSI index for: " & path)
+            indexes[key] = idx
+        result.populated.mgetOrPut(key, initHashSet[string]()).incl(chrom)
+
+        # REF/ALT and QUAL are unused by matchcore — blank them to shrink the
+        # record.
+        discard bcf_update_alleles_str(vcf.header.hdr, v.c, "N\t.")
+        v.c.qual = cast[cfloat](bcf_float_missing.uint32)
+
+        # Write the sequential record index. anno's phase-3 streamer mirrors
+        # our chrom iteration so SRC_INDEX values line up.
+        discard v.info.set("SRC_INDEX", curSrcIndex)
+
+        discard writers[key].write_variant(v)
         if not noIndex:
-          let headerOff = uint64(bgzf_tell(bgzfHandle(wtr)))
-          let idx = hts_idx_init(0, HTS_FMT_CSI.cint, headerOff, 14, 5)
-          if idx == nil:
-            raise newException(IOError, "cannot create CSI index for: " & path)
-          indexes[key] = idx
-      result.populated.mgetOrPut(key, initHashSet[string]()).incl($v.CHROM)
-
-      # REF/ALT and QUAL are unused by matchcore — blank them to shrink the
-      # record.
-      discard bcf_update_alleles_str(vcf.header.hdr, v.c, "N\t.")
-      v.c.qual = cast[cfloat](bcf_float_missing.uint32)
-
-      # Write the sequential record index (same value whether or not this record
-      # was skipped — curSrcIndex matches what anno's counter will see).
-      discard v.info.set("SRC_INDEX", curSrcIndex)
-
-      discard writers[key].write_variant(v)
-      if not noIndex:
-        let woff = uint64(bgzf_tell(bgzfHandle(writers[key])))
-        discard hts_idx_push(indexes[key], v.c.rid, int64(v.c.pos), int64(v.c.pos) + int64(v.c.rlen), woff, 1)
-      inc ws.nKept
+          let woff = uint64(bgzf_tell(bgzfHandle(writers[key])))
+          discard hts_idx_push(indexes[key], v.c.rid, int64(v.c.pos), int64(v.c.pos) + int64(v.c.rlen), woff, 1)
+        inc ws.nKept
 
   vcf.close()
 
@@ -801,6 +814,7 @@ type PreprocInput* = object
   extraKeep*: seq[string]
   ioThreads*: int
   keptChrs*:  HashSet[string]
+  chrSet*:    HashSet[string]
 
 var gPpIn:  array[2, PreprocInput]
 var gPpOut: array[2, PreprocOutput]
@@ -809,7 +823,8 @@ proc ppWorker(idx: int) {.thread.} =
   {.cast(gcsafe).}:
     let s = gPpIn[idx]
     gPpOut[idx] = preprocessVcf(s.path, s.tmpDir, s.prefix, s.extraKeep,
-                                s.ioThreads, keptChrs = s.keptChrs)
+                                s.ioThreads, keptChrs = s.keptChrs,
+                                chrSet = s.chrSet)
 
 proc runParallelPreproc*(a, b: PreprocInput): tuple[a, b: PreprocOutput] =
   gPpIn[0] = a; gPpIn[1] = b

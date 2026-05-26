@@ -37,7 +37,8 @@ type
     nThreads*:     int
     tmpDir*:       string
     callers*:      seq[CallerInput]
-    keptChrs*:     seq[string]    ## --chrs filter; empty = no filter.
+    keptChrs*:     seq[string]    ## --chrs: active set; empty = all input contigs.
+    chrSet*:       seq[string]    ## --chr-set: universe; empty = all input contigs.
 
 # ---------------------------------------------------------------------------
 # buildFinalHdr — collapse-specific shared output header
@@ -51,7 +52,7 @@ proc buildFinalHdr(callers: seq[CallerInput]; mh: MergedHeader;
   ## writeOutput. Eliminates `bcf_translate` at writeOutput time.
   result = bcf_hdr_init("w".cstring)
 
-  addContigsUnion(result, callers, toHashSet(cfg.keptChrs))
+  addContigsUnion(result, callers, toHashSet(cfg.chrSet))
   addFiltersUnion(result, callers)
 
   # INFO/FORMAT from mh.headerLines, filtered. INFO is kept only when
@@ -344,7 +345,8 @@ proc runCollapse*(cfg: CollapseConfig; cmdLine: string = "") =
                                tmpDir:         cfg.tmpDir,
                                preserveBndAlt: true,
                                preserveInsAlt: true,
-                               keptChrs:       toHashSet(cfg.keptChrs))
+                               keptChrs:       toHashSet(cfg.keptChrs),
+                               chrSet:         toHashSet(cfg.chrSet))
   let im = integratedMerge(cfg.callers, mh, finalHdr, msc, chromOrder)
   if cfg.keptChrs.len > 0:
     var seen: HashSet[string]

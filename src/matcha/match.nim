@@ -108,26 +108,29 @@ proc runMatch*(cfg: MatchConfig) =
 
   let extra = cfg.infoFields   # shorthand
   let keptChrsSet = toHashSet(cfg.keptChrs)
+  let chrSetSet   = toHashSet(cfg.chrSet)
 
   var filesA, filesB: PreprocOutput
   if cfg.selfMode:
     logInfo("self mode: preprocessing single input")
     filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A", extra,
                            ioThreads = if cfg.nThreads >= 2: 2 else: 0,
-                           keptChrs = keptChrsSet)
+                           keptChrs = keptChrsSet, chrSet = chrSetSet)
     filesB = filesA
   elif cfg.nThreads >= 2:
     logInfo("preprocessing A and B in parallel")
     (filesA, filesB) = runParallelPreproc(
       PreprocInput(path: cfg.callsetA, tmpDir: cfg.tmpDir, prefix: "A",
-                   extraKeep: extra, ioThreads: 2, keptChrs: keptChrsSet),
+                   extraKeep: extra, ioThreads: 2,
+                   keptChrs: keptChrsSet, chrSet: chrSetSet),
       PreprocInput(path: cfg.callsetB, tmpDir: cfg.tmpDir, prefix: "B",
-                   extraKeep: extra, ioThreads: 2, keptChrs: keptChrsSet))
+                   extraKeep: extra, ioThreads: 2,
+                   keptChrs: keptChrsSet, chrSet: chrSetSet))
   else:
     filesA = preprocessVcf(cfg.callsetA, cfg.tmpDir, "A", extra,
-                           keptChrs = keptChrsSet)
+                           keptChrs = keptChrsSet, chrSet = chrSetSet)
     filesB = preprocessVcf(cfg.callsetB, cfg.tmpDir, "B", extra,
-                           keptChrs = keptChrsSet)
+                           keptChrs = keptChrsSet, chrSet = chrSetSet)
   var chrsSeen = filesA.chrsSeen
   for c in filesB.chrsSeen: chrsSeen.incl(c)
   warnMissingChrs(cfg.keptChrs, chrsSeen)

@@ -1,7 +1,7 @@
 ## main.nim — CLI argument parsing and subcommand dispatch.
 ## Entry point is src/matcha.nim which includes this file.
 
-import std/[os, parseopt, sequtils, strutils]
+import std/[os, parseopt, sequtils, sets, strutils]
 import utils, match, anno, collapse, merge, mergecore, preproc, log
 
 const VERSION = MatchaVersion
@@ -40,7 +40,9 @@ type SharedOpts = object
   bndSlop, insSlop, nThreads: int
   insMinSim: float64
   tmpDir:    string
-  keptChrs:  seq[string]
+  keptChrs:  seq[string]   ## --chrs: active set; empty = all input contigs.
+  chrSet:    seq[string]   ## --chr-set: universe for BND mates + header contigs;
+                           ## empty = all input contigs (no BND-mate filter).
   overlapSet, jaccardSet, useShm: bool
 
 proc initSharedOpts(): SharedOpts =
@@ -82,6 +84,8 @@ proc parseSharedOpt(s: var SharedOpts, p: var OptParser, key: string): bool =
     s.useShm = true
   of "chrs":
     s.keptChrs = parseChrsArg(nextVal(p, "chrs"))
+  of "chr-set":
+    s.chrSet = parseChrsArg(nextVal(p, "chr-set"))
   of "v", "verbose":
     setVerbose(true)
   else:
@@ -104,6 +108,17 @@ template applySharedOpts(s: SharedOpts, cfg: typed) =
   cfg.insMinSim = s.insMinSim
   cfg.nThreads  = s.nThreads
   cfg.keptChrs  = s.keptChrs
+  cfg.chrSet    = s.chrSet
+  # --chr-set given without --chrs: default the active set to chr-set so
+  # output records and header contigs stay consistent.
+  if cfg.chrSet.len > 0 and cfg.keptChrs.len == 0:
+    cfg.keptChrs = cfg.chrSet
+  # --chrs must be ⊆ --chr-set when both are provided.
+  if cfg.chrSet.len > 0 and s.keptChrs.len > 0:
+    let chrSetH = toHashSet(cfg.chrSet)
+    for c in s.keptChrs:
+      if c notin chrSetH:
+        logError("--chrs entry '" & c & "' is not in --chr-set"); quit(1)
   cfg.tmpDir    = resolveTmpDir(s.tmpDir, s.useShm)
 
 # Cluster CLI state for the flags shared between collapse and merge.
@@ -172,7 +187,9 @@ proc writeMetricUsageLines(f: File) =
   f.writeLine "  --ins-slop INT                  max position offset for INS (default: 50)"
 
 proc writePreprocUsageLines(f: File) =
-  f.writeLine "  --chrs CHR[,CHR...]             restrict to listed chromosomes (filters records + headers)"
+  f.writeLine "  --chrs CHR[,CHR...]             restrict output to listed chromosomes (active set)"
+  f.writeLine "  --chr-set CHR[,CHR...]          universe: BND-mate filter + header contigs"
+  f.writeLine "                                  (default: all input contigs; no BND drop)"
   f.writeLine "  --threads INT                   number of worker threads (default: 1)"
   f.writeLine "  --tmp-dir PATH                  temp directory (default: system temp)"
   f.writeLine "  --use-shm                       write temp BCFs to /dev/shm (RAM); faster if $TMPDIR"

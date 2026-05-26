@@ -956,7 +956,8 @@ type
     sampleIdByCaller*:  seq[string]   ## merge mode: SID value for caller ci
     preserveBndAlt*:    bool          ## merge mode: keep source BND ALT verbatim
     preserveInsAlt*:    bool          ## keep source INS REF/ALT verbatim (sequence-resolved)
-    keptChrs*:          HashSet[string] ## --chrs filter; empty = no filter
+    keptChrs*:          HashSet[string] ## --chrs: active set (records); empty = all
+    chrSet*:            HashSet[string] ## --chr-set: universe (BND mates); empty = all
 
 # Header utility: collect ##FILTER=<...> lines from a header.
 proc collectFilterLines*(h: ptr bcf_hdr_t): seq[string] =
@@ -1227,6 +1228,15 @@ proc runShardPass(bucket: seq[CallerBucketEntry]; mh: MergedHeader;
     raise newException(IOError, "bcf_sr_init failed")
   discard bcf_sr_set_opt(sr, BCF_SR_REQUIRE_IDX)
 
+  # Restrict the synced scan to the active set when --chrs is given. Each
+  # reader requires an index (BCF_SR_REQUIRE_IDX above), so the region jump
+  # skips records on non-active chroms instead of reading them.
+  if cfg.keptChrs.len > 0:
+    let regions = toSeq(cfg.keptChrs).join(",")
+    if bcf_sr_set_regions(sr, regions.cstring, 0.cint) != 0:
+      bcf_sr_destroy(sr)
+      raise newException(IOError, "bcf_sr_set_regions failed for: " & regions)
+
   for entry in bucket:
     if bcf_sr_add_reader(sr, entry.caller.path.cstring) == 0:
       let msg = $bcf_sr_strerror(srs_errnum(sr))
@@ -1291,11 +1301,6 @@ proc runShardPass(bucket: seq[CallerBucketEntry]; mh: MergedHeader;
         let srcHdr = srs_get_header(sr, ci.cint)
         let rawRec = srs_get_line(sr, ci.cint)
 
-        if cfg.keptChrs.len > 0 and
-           getChromName(srcHdr, rawRec.rid) notin cfg.keptChrs:
-          inc result.wsList[ci].nRead
-          inc result.wsList[ci].skipped[skChromFiltered]
-          continue
 
         let rec = bcf_dup(rawRec)
         inc perCallerLineno[ci]
@@ -1308,8 +1313,8 @@ proc runShardPass(bucket: seq[CallerBucketEntry]; mh: MergedHeader;
         if not nr.ok:
           bcf_destroy(rec)
           continue
-        if cfg.keptChrs.len > 0 and nr.svt == svBND and
-           nr.bndChr2 notin cfg.keptChrs:
+        if cfg.chrSet.len > 0 and nr.svt == svBND and
+           nr.bndChr2 notin cfg.chrSet:
           inc result.wsList[ci].skipped[skChromFiltered]
           dec result.wsList[ci].nKept
           bcf_destroy(rec)
