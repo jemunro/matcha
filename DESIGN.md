@@ -249,6 +249,7 @@ callsets (typically `matcha collapse` outputs). Steps (see
 | [src/matcha/matchcore.nim](src/matcha/matchcore.nim) | Three streamers (interval / BND / INS) returning `seq[MatchPair]`; slim-BCF decode helpers |
 | [src/matcha/match.nim](src/matcha/match.nim) | match-mode driver: pair-only pool, chr:pos CSI resolution, TSV output |
 | [src/matcha/anno.nim](src/matcha/anno.nim) | anno-mode driver: expression parser, aggregation, phase-3 join, VCF assembly |
+| [src/matcha/setops.nim](src/matcha/setops.nim) | intersect / setdiff drivers: collect matched A indices, re-emit A records verbatim |
 | [src/matcha/mergecore.nim](src/matcha/mergecore.nim) | Header merge, clustering, representative selection; `selfMatchAndCluster` shared pipeline |
 | [src/matcha/collapse.nim](src/matcha/collapse.nim) | collapse-mode driver: `integratedMerge`, `selfMatchAndCluster`, output assembly |
 | [src/matcha/merge.nim](src/matcha/merge.nim) | merge-mode driver: cohort pVCF assembly, per-sample FORMAT routing via `FORMAT/SID`, AC/AN/AF computation |

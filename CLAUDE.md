@@ -4,7 +4,7 @@ Compiled SV matching and annotation tool (Nim + hts-nim). See [README.md](README
 
 ## Scope
 
-All four subcommands (`match`, `anno`, `collapse`, `merge`) support DEL/DUP/INV/BND/INS. TRA is warned and skipped.
+All six subcommands (`match`, `anno`, `intersect`, `setdiff`, `collapse`, `merge`) support DEL/DUP/INV/BND/INS. TRA is warned and skipped.
 
 ## Build & test
 
@@ -18,4 +18,4 @@ Run `nimble test` **once** per change; capture the full output and read it. Do n
 
 ## Code layout
 
-`main.nim` parses CLI args and dispatches to one of four per-mode drivers (`match.nim`, `anno.nim`, `collapse.nim`, `merge.nim`). All four call into shared `preproc.nim` (normalize + slim each input into per-(svtype, bin) temp BCFs) and `matchcore.nim` (three streamers — interval / BND / INS — each returning `seq[MatchPair]`). `mergecore.nim` provides header merging and agglomerative clustering shared by `collapse` and `merge`. See [DESIGN.md](DESIGN.md) for the full module map and architecture notes.
+`main.nim` parses CLI args and dispatches to one of the per-mode drivers (`match.nim`, `anno.nim`, `setops.nim`, `collapse.nim`, `merge.nim`). All call into shared `preproc.nim` (normalize + slim each input into per-(svtype, bin) temp BCFs) and `matchcore.nim` (three streamers — interval / BND / INS — each returning `seq[MatchPair]`). `setops.nim` provides both `intersect` and `setdiff` (record-level A-vs-B filters reusing `match.nim`'s job pool). `mergecore.nim` provides header merging and agglomerative clustering shared by `collapse` and `merge`. See [DESIGN.md](DESIGN.md) for the full module map and architecture notes.

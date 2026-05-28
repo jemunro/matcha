@@ -554,7 +554,6 @@ proc runAnno*(cfg: var AnnoConfig) =
   var vcfA: VCF
   if not open(vcfA, cfg.callsetA, threads = if cfg.nThreads >= 2: 2 else: 0):
     raise newException(IOError, "cannot reopen input: " & cfg.callsetA)
-  vcfA.set_samples(@["^"])
   # Register new INFO fields on the SOURCE header. info.set() resolves field
   # IDs via the variant's source-header pointer; the writer then copies the
   # already-augmented header so reader and writer share the same ID space.

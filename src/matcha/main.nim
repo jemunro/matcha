@@ -2,7 +2,7 @@
 ## Entry point is src/matcha.nim which includes this file.
 
 import std/[os, parseopt, sequtils, sets, strutils]
-import utils, match, anno, collapse, merge, mergecore, preproc, log
+import utils, match, anno, collapse, merge, mergecore, preproc, setops, log
 
 const VERSION = MatchaVersion
 
@@ -254,6 +254,8 @@ proc usage(code: int = 1) =
   f.writeLine "Subcommands:"
   f.writeLine "  match      Find pairwise matches between two SV callsets"
   f.writeLine "  anno       Annotate a callset with INFO fields from a database VCF"
+  f.writeLine "  intersect  Keep A records that match >=1 record in B"
+  f.writeLine "  setdiff    Keep A records that match no record in B"
   f.writeLine "  collapse   Cluster equivalent SVs from multiple callers, emit one representative"
   f.writeLine "  merge      Merge per-sample SV callsets into a cohort multi-sample pVCF"
   f.writeLine ""
@@ -497,6 +499,69 @@ proc runAnnoCli(rawArgs: seq[string]) =
   applySharedOpts(s, cfg)
   runAnno(cfg)
 
+proc setOpUsage(name: string; code: int = 1) =
+  let f = if code == 0: stdout else: stderr
+  let verb = if name == "intersect": "match >=1 record in" else: "match no record in"
+  f.writeLine "Usage:"
+  f.writeLine "  matcha " & name & " [options] A B"
+  f.writeLine ""
+  f.writeLine "Re-emit each record of A iff it " & verb & " B. Output records are"
+  f.writeLine "verbatim (genotypes/FORMAT preserved); no INFO is added or removed."
+  f.writeLine "Inputs may be VCF.gz (.vcf.gz) or BCF (.bcf); format is detected automatically."
+  f.writeLine ""
+  f.writeLine "Options:"
+  writeMetricUsageLines(f)
+  f.writeLine "  -o, --output PATH               output (.vcf | .vcf.gz | .bcf); default stdout VCF"
+  f.writeLine "  --write-index                   emit CSI index alongside .bcf / .vcf.gz output"
+  writePreprocUsageLines(f)
+  writeVerboseHelpLines(f)
+  f.writeLine ""
+  f.writeLine "Default metric: --min-jaccard 0.75. Specify --min-overlap or --min-jaccard to override."
+  f.writeLine "BND rows use --bnd-slop; INS rows use --min-ins-sim with --ins-slop."
+  quit(code)
+
+proc runSetOpCli(name: string; keepMatched: bool; rawArgs: seq[string]) =
+  if rawArgs.len == 0: setOpUsage(name, 0)
+  var cfg = SetOpConfig(keepMatched: keepMatched)
+  var s = initSharedOpts()
+  var positionals: seq[string]
+  var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
+  while true:
+    p.next()
+    case p.kind
+    of cmdEnd: break
+    of cmdShortOption, cmdLongOption:
+      if parseSharedOpt(s, p, p.key): continue
+      case p.key
+      of "o", "output":
+        cfg.outputPath = nextVal(p, "o")
+      of "write-index":
+        cfg.writeIndex = true
+      of "h", "help":
+        setOpUsage(name, 0)
+      else:
+        logError("unknown option: --" & p.key)
+        setOpUsage(name)
+    of cmdArgument:
+      positionals.add(p.key)
+
+  if s.overlapSet and s.jaccardSet:
+    logError("--min-overlap and --min-jaccard are mutually exclusive")
+    setOpUsage(name)
+  if positionals.len != 2:
+    logError("expected 2 input files (A B), got " & $positionals.len)
+    setOpUsage(name)
+  cfg.callsetA = positionals[0]
+  cfg.callsetB = positionals[1]
+  if not fileExists(cfg.callsetA):
+    logError("input file not found: " & cfg.callsetA)
+    quit(1)
+  if not fileExists(cfg.callsetB):
+    logError("input file not found: " & cfg.callsetB)
+    quit(1)
+  applySharedOpts(s, cfg)
+  runSetOp(cfg)
+
 proc collapseUsage(code: int = 1) =
   let f = if code == 0: stdout else: stderr
   f.writeLine "Usage:"
@@ -669,6 +734,10 @@ proc mainEntry*() =
     runMatch(args[1 .. ^1])
   of "anno":
     runAnnoCli(args[1 .. ^1])
+  of "intersect":
+    runSetOpCli("intersect", keepMatched = true, args[1 .. ^1])
+  of "setdiff":
+    runSetOpCli("setdiff", keepMatched = false, args[1 .. ^1])
   of "collapse":
     runCollapseCli(args[1 .. ^1])
   of "merge":

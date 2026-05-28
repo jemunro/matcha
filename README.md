@@ -10,6 +10,8 @@ Compiled, efficient structural variant (SV) matching and annotation tool written
 |---|---|---|
 | [`matcha match`](#matcha-match) | Pairwise matching between two SV callsets; emits a TSV of matched pairs | `matcha match truth.vcf.gz calls.vcf.gz > pairs.tsv` |
 | [`matcha anno`](#matcha-anno) | Annotate a query callset with INFO fields from a population database VCF | `matcha anno -a AF=max(AF) calls.bcf gnomad-sv.bcf -o annotated.bcf` |
+| [`matcha intersect`](#matcha-intersect--matcha-setdiff) | Keep records of A that match ≥1 record in B (verbatim) | `matcha intersect calls.bcf known.bcf -o shared.bcf` |
+| [`matcha setdiff`](#matcha-intersect--matcha-setdiff) | Keep records of A that match no record in B (verbatim) | `matcha setdiff calls.bcf known.bcf -o novel.bcf` |
 | [`matcha collapse`](#matcha-collapse) | Cluster SVs from multiple callers run on one sample; emit one representative per cluster | `matcha collapse Delly:delly.bcf Manta:manta.bcf CNVnator:cnvnator.bcf -o sample.bcf` |
 | [`matcha merge`](#matcha-merge) | Merge per-sample SV callsets into a multi-sample cohort pVCF with AC/AN/AF | `matcha merge sample1.bcf sample2.bcf sample3.bcf -o cohort.bcf` |
 
@@ -19,7 +21,7 @@ Compiled, efficient structural variant (SV) matching and annotation tool written
 
 Matcha decides which structural variants from different callsets refer to the same underlying event. Two records match when they share SVTYPE and CHROM and their coordinates and sizes agree closely enough — reciprocal overlap or Jaccard for DEL/DUP/INV, breakend proximity for BND, position and size similarity for INS. Genotypes are ignored.
 
-`match` and `anno` emit those pairwise matches directly. `collapse` and `merge` go further: they group records into clusters by agglomerative linkage, then pick one representative per cluster.
+`match` and `anno` emit those pairwise matches directly. `intersect` and `setdiff` use the same matching to filter one callset against another, re-emitting records verbatim. `collapse` and `merge` go further: they group records into clusters by agglomerative linkage, then pick one representative per cluster.
 
 Inputs are streamed and indexed lazily, so memory stays flat in callset size and the work parallelises over chromosomes and size bins. See [DESIGN.md](DESIGN.md) for the architecture.
 
@@ -68,6 +70,9 @@ matcha match --min-jaccard 0.75 truth.vcf.gz calls.vcf.gz > pairs.tsv
 # 2. Annotate calls with population AF from a database VCF
 matcha anno -a AF=max(AF) -a AC=first(AC) calls.bcf gnomad-sv.bcf -o annotated.bcf
 
+# 2b. Keep only calls absent from a known-SV panel (verbatim records)
+matcha setdiff calls.bcf known-sv.bcf -o novel.bcf
+
 # 3. Collapse three caller outputs from the same sample into a unified callset
 matcha collapse \
   Delly:delly.bcf Manta:manta.bcf CNVnator:cnvnator.bcf \
@@ -81,7 +86,7 @@ matcha merge sample1.bcf sample2.bcf sample3.bcf --missing-to-ref -o cohort.bcf
 
 ## Matching semantics
 
-All four subcommands share the same matching engine and the same threshold options. SVTYPE-specific rules:
+All subcommands share the same matching engine and the same threshold options. SVTYPE-specific rules:
 
 **DEL / DUP / INV** — candidates share CHROM and SVTYPE with sizes within the active threshold ratio.
 - **Reciprocal overlap** (`--min-overlap`): `overlap / max(lenA, lenB)` — the standard truvari/bedtools definition.
@@ -194,6 +199,27 @@ Available as SRCFIELD in any `-a` expression:
 - `MATCHA_SIMILARITY` — Float vector, one value per match (interval metric or BND proximity score).
 
 A `##matcha_metric=<overlap|jaccard>` line is written to the output header.
+
+---
+
+## matcha intersect / matcha setdiff
+
+Filter callset `A` against callset `B` using the same matching engine, re-emitting `A` records **verbatim** — header, INFO, FORMAT, and genotypes are all preserved unchanged. These are the record-level set operations analogous to `bcftools isec`:
+
+- `matcha intersect A B` — keep each record of `A` that matches **≥1** record in `B`.
+- `matcha setdiff A B` — keep each record of `A` that matches **no** record in `B`.
+
+For any A, B and threshold, `intersect` and `setdiff` partition the records of `A` exactly (their outputs are disjoint and together reproduce `A`).
+
+```
+matcha intersect [options] A B
+matcha setdiff   [options] A B
+
+  -o, --output PATH             output (.vcf | .vcf.gz | .bcf); default stdout VCF
+  --write-index                 emit CSI index alongside .bcf / .vcf.gz output
+```
+
+Both accept the shared [matching](#matching-semantics) options (`--min-overlap` / `--min-jaccard`, `--bnd-slop`, `--ins-slop`, `--min-ins-sim`) and the shared preprocessing options (`--threads`, `--tmp-dir`, `--use-shm`, `--chrs`, `--chr-set`, `--chunk-size`). Inputs may be `.vcf.gz` or `.bcf`.
 
 ---
 
